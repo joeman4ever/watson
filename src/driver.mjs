@@ -67,7 +67,7 @@ export async function openIdentity(browser, { baseUrl, token, viewport }) {
 export const STEPS = [
   'goto', 'reload', 'back', 'click', 'fill', 'select', 'wait_for_text',
   'expect_text', 'expect_no_text', 'expect_no_uuid', 'expect_url_contains',
-  'expect_api', 'expect_denied', 'expect_count_at_most', 'expect_count_at_least',
+  'expect_api', 'expect_denied', 'expect_allowed', 'expect_count_at_most', 'expect_count_at_least',
   'set_viewport', 'expect_no_overflow',
 ];
 
@@ -200,6 +200,21 @@ export async function runStep(step, ctx) {
       }
       evidence.requests.push({ path: want, status: res.status(), method: 'GET' });
       return `${want} denied ${res.status()}`;
+    }
+    case 'expect_allowed': {
+      // The mirror of expect_denied, and the positive control a denial journey
+      // needs. A map made only of denials passes perfectly against an application
+      // that denies this identity EVERYTHING — including what it should be allowed
+      // — which is a broken product, not a secure one. Without a step like this
+      // there is no way to say "and this one must answer" except by driving the UI,
+      // which conflates the authorization question with a rendering one.
+      const want = interp(arg.path ?? arg, vars);
+      const res = await page.request.get(want, { failOnStatusCode: false });
+      evidence.requests.push({ path: want, status: res.status(), method: 'GET' });
+      if (!isAuthorized(res.status())) {
+        throw new Error(`expected ${want} to be allowed, got ${res.status()}${note}`);
+      }
+      return `${want} allowed ${res.status()}`;
     }
     case 'expect_count_at_most': {
       const n = await locator(page, interp(arg.selector, vars)).count();
