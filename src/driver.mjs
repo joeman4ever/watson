@@ -162,8 +162,22 @@ export async function runStep(step, ctx) {
     }
     case 'expect_api': {
       const want = interp(arg.path, vars);
-      const hits = evidence.requests.filter((r) => r.path.split('?')[0] === want.split('?')[0]);
-      if (!hits.length) throw new Error(`expected an API call to ${want}, saw none${note}`);
+      // Eventual state, like expect_url_contains: an in-page fetch triggered by a click has
+      // no navigation for `networkidle` to wait on, so sampling once races the request. A
+      // call that never happens still fails at the deadline.
+      const match = () => evidence.requests.filter((r) => r.path.split('?')[0] === want.split('?')[0]);
+      const deadline = Date.now() + timeout;
+      while (!match().length && Date.now() < deadline) await page.waitForTimeout(100);
+      const hits = match();
+      if (!hits.length) {
+        // Name what WAS seen — "saw none" alone sends the reader hunting for a cause the
+        // evidence already has.
+        const seen = evidence.requests.map((r) => `${r.path} ${r.status}`);
+        throw new Error(
+          `expected an API call to ${want}, saw none${note}. Observed ${seen.length} API call(s): ` +
+            (seen.length ? seen.join(', ') : '(none at all)'),
+        );
+      }
       const bad = hits.filter((h) => !isAuthorized(h.status));
       if (bad.length) throw new Error(`${want} returned ${bad.map((b) => b.status).join(', ')}${note}`);
       return `${want} authorized (${[...new Set(hits.map((h) => h.status))].join(', ')})`;
