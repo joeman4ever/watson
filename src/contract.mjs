@@ -40,8 +40,24 @@ export function parseFrontmatter(text, sourceLabel) {
  *
  * So: an unknown version stops the run rather than guessing. Widen this list in
  * the same change that teaches the engine the new shape.
+ *
+ * ## Versions
+ *
+ * - **1** — the Phase-0 shape: the original step vocabulary, no profile
+ *   `preconditions`.
+ * - **2** — adds the `expect_allowed`, `expect_json` and `expect_count_at_least`
+ *   steps, and profile-level `preconditions` (ADR-039 D8).
+ *
+ * The bump exists because of `preconditions` specifically. An unknown *step*
+ * fails loudly — `runStep` throws rather than skipping — which is wrong in its
+ * own way (the failure lands on the product) but is at least visible.
+ * `preconditions` is a key an older engine simply does not read: `doctor()`
+ * iterates `preconditions ?? []`, finds nothing, proves nothing, and the run
+ * goes on to report a PASS over a world that was never established. That is the
+ * silent under-verification this list exists to make impossible, and nothing but
+ * a version refusal catches it.
  */
-export const SUPPORTED_CONTRACT_VERSIONS = Object.freeze([1]);
+export const SUPPORTED_CONTRACT_VERSIONS = Object.freeze([1, 2]);
 
 /** Problems with a contract's declared version. Checked before anything is provisioned. */
 export function validateContractVersion(config, supported = SUPPORTED_CONTRACT_VERSIONS) {

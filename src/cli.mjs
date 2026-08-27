@@ -11,7 +11,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import url from 'node:url';
-import { execFileSync } from 'node:child_process';
 
 import {
   loadContract, loadContractAt, selectByProfile, withDependencies,
@@ -21,7 +20,7 @@ import { productFingerprint, contractFingerprint, resolveSha, contractChange, wo
 import * as env from './environment.mjs';
 import * as drive from './driver.mjs';
 import { evaluate, featureVerdict } from './checks.mjs';
-import { buildEnvelope, rollUp, writeResult, summary } from './result.mjs';
+import { buildEnvelope, rollUp, writeResult, summary, downgradeForInexactHead } from './result.mjs';
 
 const HERE = path.dirname(url.fileURLToPath(import.meta.url));
 const ROOT = path.join(HERE, '..');
@@ -212,6 +211,7 @@ async function cmdVerify(args) {
     // Recorded on EVERY result, pass or fail. A run that reports a SHA it did not
     // actually verify is worse than one that reports nothing.
     workingTree: workingTreeState(repoRoot),
+    repoRoot,
     profile, selection, startedAt, shadow: true,
     fixtureProfile: contract.config.launch.fixture_profile,
     viewports: ['1280x800'],
@@ -270,6 +270,11 @@ async function cmdVerify(args) {
       baseUrl: up.baseUrl, dbName: up.dbName, databaseUrl: up.databaseUrl,
       adminToken: up.tokens[adminIdentity?.id], expectSeasons: contract.config.launch.expect_seasons,
       identity: up.identity,
+      // W5: what the seeded rows must RESOLVE TO through the product's own read
+      // paths, declared by the profile that seeded them.
+      preconditions: contract.fixtures.profiles?.[contract.config.launch.fixture_profile]?.preconditions,
+      tokens: up.tokens,
+      vars: up.vars,
     });
     for (const p of dr.probes) step(`doctor ${p.ok ? '✓' : '✗'} ${p.name} — ${p.detail}`);
     if (!dr.ok) {
@@ -402,6 +407,35 @@ function accumulate(sig, evidence, pageText) {
 }
 
 function finish(runDir, run) {
+  // EXACT-HEAD GATE (W2). The last thing that happens before a verdict is written:
+  // re-read the working tree and refuse to make a claim ABOUT THE COMMIT unless the
+  // checkout still is that commit.
+  //
+  // Re-read rather than reuse the value captured at start-up, because the tree can
+  // change WHILE a run is in flight — that is how runs 4-10 of a campaign silently
+  // began verifying a journey that runs 1-3 had never seen. A run that started clean
+  // and ended dirty drove some mixture of the two, and cannot honestly speak for
+  // either.
+  if (run.repoRoot && run.verdict) {
+    const at_end = workingTreeState(run.repoRoot);
+    const at_start = run.workingTree ?? at_end;
+    const changed_mid_run =
+      at_start.exact_head !== at_end.exact_head || at_start.dirty_count !== at_end.dirty_count;
+
+    run.workingTree = { ...at_end, at_start_exact_head: at_start.exact_head, changed_mid_run };
+
+    const gate = downgradeForInexactHead(
+      run.verdict,
+      changed_mid_run ? { ...at_end, exact_head: false } : at_end,
+    );
+    if (gate.verdict !== run.verdict) {
+      log('');
+      log(`  ⚠ ${gate.reason}`);
+      run.verdictReason = gate.reason;
+      run.verdict = gate.verdict;
+    }
+  }
+
   const envlp = buildEnvelope(run);
   const { jsonPath, mdPath } = writeResult(runDir, envlp);
   log('');
@@ -426,6 +460,11 @@ async function cmdDoctor(args) {
       baseUrl: up.baseUrl, dbName: up.dbName, databaseUrl: up.databaseUrl,
       adminToken: up.tokens[adminIdentity?.id], expectSeasons: contract.config.launch.expect_seasons,
       identity: up.identity,
+      // W5: what the seeded rows must RESOLVE TO through the product's own read
+      // paths, declared by the profile that seeded them.
+      preconditions: contract.fixtures.profiles?.[contract.config.launch.fixture_profile]?.preconditions,
+      tokens: up.tokens,
+      vars: up.vars,
     });
     for (const p of dr.probes) log(`  ${p.ok ? '✓' : '✗'} ${p.name} — ${p.detail}`);
     log(`\n  doctor: ${dr.ok ? 'OK' : 'FAILED'}\n`);
