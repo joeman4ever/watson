@@ -34,6 +34,50 @@ const OBLIGATION = {
   CONTRACT_CHANGE_REVIEW_REQUIRED: ['not_satisfied', 'action_required'],
 };
 
+/**
+ * The three verdicts that are CLAIMS ABOUT A PRODUCT REVISION.
+ *
+ * Everything else says something about Watson (FAIL_CONTRACT), the environment
+ * (BLOCKED_ENVIRONMENT), or the run's own inability to conclude — none of which
+ * asserts anything about the commit.
+ */
+export const PRODUCT_CLAIMS = new Set(['PASS', 'PASS_WITH_ADVISORIES', 'FAIL_PRODUCT']);
+
+/**
+ * A product claim requires that the checkout driven actually IS the revision
+ * reported (Phase-1 defect W2, now a standing invariant).
+ *
+ * Reporting the dirt was not enough. Every result carries a 40-char SHA and two
+ * fingerprints computed from git, while the contract that executed and the product
+ * that was built came from the working tree — so on a dirty checkout a PASS is a
+ * statement about a commit that was never run. Observed rather than reasoned about:
+ * a feature file written mid-campaign was picked up by runs already in flight, all
+ * reporting the same SHA.
+ *
+ * FAIL_PRODUCT is downgraded for the same reason PASS is, and it matters more.
+ * Accusing a commit of a defect that was never observed on it is the same error as
+ * absolving one, and it costs more to unwind.
+ *
+ * An UNKNOWN tree state (git unavailable) is treated as inexact. Not being able to
+ * check is not evidence of cleanliness.
+ */
+export function downgradeForInexactHead(verdict, workingTree) {
+  if (!PRODUCT_CLAIMS.has(verdict)) return { verdict, reason: null };
+  if (workingTree?.exact_head === true) return { verdict, reason: null };
+
+  const what = workingTree?.contract_dirty
+    ? 'the CONTRACT that executed is not the one at the reported SHA'
+    : workingTree?.clean === null
+      ? 'the checkout could not be compared against the reported SHA'
+      : 'the checkout is not the revision it reports';
+  return {
+    verdict: 'INDETERMINATE',
+    reason:
+      `${verdict} withheld: ${what}. A verdict about a commit requires that the commit ` +
+      'is what was actually driven.',
+  };
+}
+
 export function checkFor(verdict, { shadow = true } = {}) {
   const [obligation, conclusion] = OBLIGATION[verdict] ?? ['not_satisfied', 'action_required'];
   // In shadow mode every conclusion is informational.

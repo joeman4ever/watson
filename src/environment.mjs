@@ -16,6 +16,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import net from 'node:net';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import crypto from 'node:crypto';
 import pg from 'pg';
 import { generateKeyPair, exportJWK, SignJWT } from 'jose';
@@ -75,10 +76,20 @@ export function runStep(cmd, { cwd, env, label, timeoutMs = 900_000 }) {
  * Refusing is the honest fix. Isolating properly means building each run from its
  * own export of the tree, which is a real change and belongs in its own phase.
  */
-export function acquireRunLock(repoRoot, runId) {
-  const lockPath = path.join(repoRoot, '.watson-run.lock');
+export function acquireRunLock(repoRoot, runId, lockDir = path.join(os.tmpdir(), 'watson-locks')) {
+  // The lock lives OUTSIDE the product checkout, keyed on its absolute path.
+  //
+  // It used to live at `<repoRoot>/.watson-run.lock`, which was wrong twice over.
+  // ADR-039 D6 says Watson never writes to the product repository during a run, and
+  // this wrote to it. And because the file was untracked, it made the working tree
+  // dirty — so the very lock that stops runs corrupting each other tripped the
+  // exact-HEAD gate and withheld every verdict. A verifier that cannot run without
+  // dirtying the thing it verifies has no business claiming exactness.
+  fs.mkdirSync(lockDir, { recursive: true });
+  const key = crypto.createHash('sha256').update(path.resolve(repoRoot)).digest('hex').slice(0, 16);
+  const lockPath = path.join(lockDir, `${key}.lock`);
   try {
-    fs.writeFileSync(lockPath, JSON.stringify({ runId, pid: process.pid }), { flag: 'wx' });
+    fs.writeFileSync(lockPath, JSON.stringify({ runId, pid: process.pid, repoRoot }), { flag: 'wx' });
   } catch (err) {
     if (err.code !== 'EEXIST') throw err;
     let held = {};
@@ -92,7 +103,7 @@ export function acquireRunLock(repoRoot, runId) {
           'the running server and produce findings that belong to Watson, not the product.',
       );
     }
-    fs.writeFileSync(lockPath, JSON.stringify({ runId, pid: process.pid }));
+    fs.writeFileSync(lockPath, JSON.stringify({ runId, pid: process.pid, repoRoot }));
   }
   return () => { try { fs.unlinkSync(lockPath); } catch { /* already gone */ } };
 }

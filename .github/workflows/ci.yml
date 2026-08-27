@@ -1,0 +1,38 @@
+# Deterministic validation for the Watson engine.
+#
+# Watson is part of the verification trust chain, not a test script beside it: a
+# broken classifier waves a privacy regression through, a broken fixture makes an
+# invalid world look green, and broken exact-HEAD handling produces a PASS about
+# code that was never executed. So the engine gets the same discipline the
+# contract does.
+#
+# Deliberately small. This is not a release system — no publishing, no matrix, no
+# browser download. The end-to-end proof that Watson can drive a real product is
+# a Watson run against nsc-eval, which needs a database and a built application
+# and belongs in that repository's lane, not here.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ci:
+    name: Lint, parse, unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      # `npm ci` would pull Playwright's browser download for a job that never
+      # opens one. The engine's unit tests are pure functions over pure inputs.
+      - run: npm install --ignore-scripts
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+      - run: npm run lint
+      - run: npm run check
+      - run: npm test
