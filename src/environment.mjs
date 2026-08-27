@@ -152,24 +152,76 @@ export async function dropDatabase({ adminUrl, dbName }) {
   }
 }
 
-/** Drop orphaned watson_* databases older than maxAgeMs. A crashed run must
- *  degrade disk, never the environment. */
-export async function reap({ adminUrl, prefix = 'watson_', maxAgeHours = 2 }) {
+/**
+ * Drop watson_* databases left behind by crashed runs. A crash must degrade disk,
+ * never the environment.
+ *
+ * Three things it refuses to drop, because `reap` is destructive and was previously
+ * indiscriminate — it declared a `maxAgeHours` parameter and never read it, so it
+ * dropped every watson_* database it could see, including live ones:
+ *   - anything with an open connection (a run in progress)
+ *   - anything younger than maxAgeHours, read from its own provisioning marker
+ *   - anything with no marker at all, which Watson did not create
+ *
+ * Returns { dropped, kept } — kept carries a reason per database, so a reap that
+ * removes nothing explains itself instead of looking broken.
+ */
+export async function reap({ adminUrl, prefix = 'watson_', maxAgeHours = 2, now = Date.now() }) {
   const client = new pg.Client({ connectionString: adminUrl });
   await client.connect();
   const dropped = [];
+  const kept = [];
   try {
+    // Skip any database with a live backend. `DROP ... WITH (FORCE)` would happily
+    // terminate those connections, which is precisely the accident this guards:
+    // reaping while a verification is running would kill that run's database
+    // mid-journey and the run would report a product failure.
     const { rows } = await client.query(
-      `SELECT datname FROM pg_database WHERE datname LIKE $1 || '%'`, [prefix],
+      `SELECT d.datname,
+              (SELECT count(*) FROM pg_stat_activity a WHERE a.datname = d.datname) AS conns
+         FROM pg_database d
+        WHERE d.datname LIKE $1 || '%'`,
+      [prefix],
     );
-    for (const { datname } of rows) {
-      try { await client.query(`DROP DATABASE IF EXISTS "${datname}" WITH (FORCE)`); dropped.push(datname); }
-      catch { /* in use */ }
+    for (const { datname, conns } of rows) {
+      if (Number(conns) > 0) { kept.push({ datname, why: `${conns} live connection(s)` }); continue; }
+
+      // Age comes from the run's own provisioning marker. Postgres does not record
+      // a database's creation time, so without the marker there is nothing to
+      // compare against — and a database with no marker was not created by Watson,
+      // which is reason to leave it alone rather than reason to drop it.
+      let provisionedAt = null;
+      const probe = new pg.Client({ connectionString: adminUrl.replace(/\/[^/]*$/, `/${datname}`) });
+      try {
+        await probe.connect();
+        const m = await probe.query(
+          `SELECT provisioned_at FROM ${MARKER_TABLE} ORDER BY provisioned_at LIMIT 1`,
+        );
+        provisionedAt = m.rows[0]?.provisioned_at ?? null;
+      } catch {
+        provisionedAt = null;
+      } finally {
+        await probe.end().catch(() => {});
+      }
+
+      if (!provisionedAt) { kept.push({ datname, why: 'no Watson provisioning marker' }); continue; }
+      const ageHours = (now - new Date(provisionedAt).getTime()) / 3_600_000;
+      if (ageHours < maxAgeHours) {
+        kept.push({ datname, why: `only ${ageHours.toFixed(1)}h old (threshold ${maxAgeHours}h)` });
+        continue;
+      }
+
+      try {
+        await client.query(`DROP DATABASE IF EXISTS "${datname}" WITH (FORCE)`);
+        dropped.push(datname);
+      } catch (err) {
+        kept.push({ datname, why: err.message });
+      }
     }
   } finally {
     await client.end();
   }
-  return dropped;
+  return { dropped, kept };
 }
 
 // ----------------------------------------------------------------- identity --

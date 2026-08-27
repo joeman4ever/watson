@@ -444,8 +444,13 @@ try {
   } else if (cmd === 'doctor') {
     process.exit(await cmdDoctor(args));
   } else if (cmd === 'reap') {
-    const dropped = await env.reap({ adminUrl: args['db-url'] ?? process.env.WATSON_ADMIN_DB_URL ?? 'postgres://watson:watson@127.0.0.1:5432/postgres' });
+    const { dropped, kept } = await env.reap({
+      adminUrl: args['db-url'] ?? process.env.WATSON_ADMIN_DB_URL ?? 'postgres://watson:watson@127.0.0.1:5432/postgres',
+      maxAgeHours: args['max-age-hours'] ? Number(args['max-age-hours']) : 2,
+    });
     log(`reaped ${dropped.length} orphaned database(s): ${dropped.join(', ') || 'none'}`);
+    // A reap that removes nothing should say why, or it reads as broken.
+    for (const k of kept) log(`  kept ${k.datname} — ${k.why}`);
     process.exit(0);
   } else {
     log(`watson ${VERSION}\n\n  watson verify --repo <path> [--sha <ref>] [--base <ref>] [--profile poc] [--pr N]\n  watson doctor --repo <path>\n  watson reap\n`);
