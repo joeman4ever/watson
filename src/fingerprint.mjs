@@ -46,6 +46,48 @@ export function contractFingerprint(repoRoot, sha) {
   return digest(repoRoot, sha, CONTRACT_PATHS);
 }
 
+/**
+ * Whether the checkout matches the commit it claims to be.
+ *
+ * This matters more than it looks. Every result carries a 40-char SHA and two
+ * fingerprints computed FROM GIT — but the contract that executes, and the product
+ * that gets built and launched, both come from the WORKING TREE. When the tree is
+ * dirty those are different things, and the run reports a SHA it did not actually
+ * verify.
+ *
+ * That is not hypothetical: during the Phase-1 campaign a feature file written while
+ * a campaign was running was picked up mid-campaign, so runs 1-3 verified two
+ * journeys and runs 4-10 verified three, all reporting the same SHA.
+ *
+ * Watson does not refuse a dirty tree — developing against one is the normal way to
+ * work — but it must never claim exact-HEAD when it cannot honour it.
+ */
+export function workingTreeState(repoRoot) {
+  let porcelain = '';
+  try {
+    porcelain = execFileSync('git', ['status', '--porcelain'], {
+      cwd: repoRoot, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024,
+    });
+  } catch {
+    return { clean: null, exact_head: false, dirty_paths: [], contract_dirty: false,
+      note: 'git status failed; exact-HEAD cannot be established' };
+  }
+  const paths = porcelain.split('\n').map((l) => l.slice(3).trim()).filter(Boolean);
+  const contractDirty = paths.some((p) => p.startsWith('.watson/'));
+  return {
+    clean: paths.length === 0,
+    exact_head: paths.length === 0,
+    dirty_paths: paths.slice(0, 20),
+    dirty_count: paths.length,
+    contract_dirty: contractDirty,
+    note: paths.length === 0
+      ? 'checkout matches the reported SHA'
+      : contractDirty
+        ? 'the CONTRACT differs from the reported SHA — this run verified something else'
+        : 'the product tree differs from the reported SHA',
+  };
+}
+
 /** Full 40-char lowercase hex, as the marker protocol requires. */
 export function resolveSha(repoRoot, ref = 'HEAD') {
   const sha = execFileSync('git', ['rev-parse', ref], { cwd: repoRoot, encoding: 'utf8' }).trim();

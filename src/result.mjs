@@ -62,6 +62,8 @@ export function buildEnvelope(run) {
     pull_request: run.pullRequest ?? null,
     head_sha: run.headSha,
     base_sha: run.baseSha ?? null,
+    // Whether the checkout actually matched the SHA above.
+    working_tree: run.workingTree ?? null,
 
     // Recorded ALWAYS; NOT consulted for carry-forward in phase 0/1.
     product_fingerprint: run.productFingerprint,
@@ -213,6 +215,22 @@ export function summary(env) {
     }
     L.push('');
     L.push('_A PR must not be able to weaken its own verification expectation and thereby manufacture its own PASS. Sherlock is the independent reviewer of whether this change is legitimate. Watson REPORTS this in Phase 0/1; it does not gate on it._');
+    L.push('');
+  }
+
+  const wt = env.working_tree;
+  if (wt && wt.exact_head === false) {
+    L.push('### ⚠ This run is NOT bound to the SHA it reports');
+    L.push(
+      `The checkout differs from \`${(env.head_sha ?? '').slice(0, 7)}\` in ${wt.dirty_count} path(s). ` +
+        'The fingerprints above come from git; the contract that ran and the product that was built ' +
+        'came from the working tree. Those are different things right now.',
+    );
+    if (wt.contract_dirty) {
+      L.push('');
+      L.push('**The contract itself is modified.** This run verified expectations that do not exist at that SHA, so its result cannot be cited for that commit.');
+    }
+    if (wt.dirty_paths?.length) L.push('', 'Modified: ' + wt.dirty_paths.map((p) => `\`${p}\``).join(', '));
     L.push('');
   }
 

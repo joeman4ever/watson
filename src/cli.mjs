@@ -17,7 +17,7 @@ import {
   loadContract, loadContractAt, selectByProfile, withDependencies,
   validateFeatureVars, validateEnvOwnership, validateContractVersion, validateStepOrder,
 } from './contract.mjs';
-import { productFingerprint, contractFingerprint, resolveSha, contractChange } from './fingerprint.mjs';
+import { productFingerprint, contractFingerprint, resolveSha, contractChange, workingTreeState } from './fingerprint.mjs';
 import * as env from './environment.mjs';
 import * as drive from './driver.mjs';
 import { evaluate, featureVerdict } from './checks.mjs';
@@ -56,9 +56,18 @@ async function bringUp({ repoRoot, contract, runDir, runId, adminUrl }) {
     if (started.app) env.killGroup(started.app.pid);
     if (started.identity) await started.identity.close().catch(() => {});
     if (started.dbCreated) await env.dropDatabase({ adminUrl, dbName }).catch(() => {});
+    // Released LAST: the lock must outlive the server it protects, or the next
+    // run's build can start while this one is still shutting down.
+    if (started.releaseLock) started.releaseLock();
   };
 
   try {
+    // 0. LOCK ------------------------------------------------------------------
+    // Before anything: runs share the product working tree, so two at once
+    // corrupt each other's build. Refuse rather than produce findings that
+    // belong to Watson rather than to the product.
+    started.releaseLock = env.acquireRunLock(repoRoot, runId);
+
     // 1. PROVISION -------------------------------------------------------------
     let t = Date.now();
     await env.provisionDatabase({ adminUrl, dbName, runId });
@@ -200,6 +209,9 @@ async function cmdVerify(args) {
     // or invalid base, which the diff reports as `base_contract_available: false`.
     contractChange: contractChange(repoRoot, baseSha, headSha, (sha) =>
       sha === headSha ? contract : loadContractAt(repoRoot, sha)),
+    // Recorded on EVERY result, pass or fail. A run that reports a SHA it did not
+    // actually verify is worse than one that reports nothing.
+    workingTree: workingTreeState(repoRoot),
     profile, selection, startedAt, shadow: true,
     fixtureProfile: contract.config.launch.fixture_profile,
     viewports: ['1280x800'],

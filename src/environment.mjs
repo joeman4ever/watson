@@ -56,6 +56,47 @@ export function runStep(cmd, { cwd, env, label, timeoutMs = 900_000 }) {
   });
 }
 
+// --------------------------------------------------------------------- lock --
+
+/**
+ * One run at a time per product checkout.
+ *
+ * Each run gets its own database, its own port and its own browser, which made it
+ * look isolated. It is not: every run BUILDS and SERVES the product from the same
+ * working tree. A second run's `npm run build` empties and rewrites `client/dist`
+ * underneath the first run's already-running server, and the first run then serves
+ * the SPA fallback for files that momentarily do not exist.
+ *
+ * Observed, not theorised: a concurrent campaign produced
+ *   "Failed to register a ServiceWorker ... unsupported MIME type ('text/html')"
+ * on `/sw.js`, reported as a console error against the PRODUCT. The product was
+ * fine. Watson was standing on its own foot, and blaming the application for it.
+ *
+ * Refusing is the honest fix. Isolating properly means building each run from its
+ * own export of the tree, which is a real change and belongs in its own phase.
+ */
+export function acquireRunLock(repoRoot, runId) {
+  const lockPath = path.join(repoRoot, '.watson-run.lock');
+  try {
+    fs.writeFileSync(lockPath, JSON.stringify({ runId, pid: process.pid }), { flag: 'wx' });
+  } catch (err) {
+    if (err.code !== 'EEXIST') throw err;
+    let held = {};
+    try { held = JSON.parse(fs.readFileSync(lockPath, 'utf8')); } catch { /* unreadable */ }
+    // A crashed run leaves a stale lock. Reclaim it rather than wedging the repo.
+    const alive = held.pid && (() => { try { process.kill(held.pid, 0); return true; } catch { return false; } })();
+    if (alive) {
+      throw new Error(
+        `another Watson run (${held.runId ?? 'unknown'}, pid ${held.pid}) is already using ${repoRoot}. ` +
+          'Runs share the product working tree — a concurrent build would rewrite client/dist under ' +
+          'the running server and produce findings that belong to Watson, not the product.',
+      );
+    }
+    fs.writeFileSync(lockPath, JSON.stringify({ runId, pid: process.pid }));
+  }
+  return () => { try { fs.unlinkSync(lockPath); } catch { /* already gone */ } };
+}
+
 // ---------------------------------------------------------------- provision --
 
 /** Stamped into every run database at creation; the product's fixture requires it. */
