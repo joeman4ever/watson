@@ -1,0 +1,19 @@
+{
+  "name": "@joeman4ever/watson",
+  "version": "0.1.0-phase0",
+  "private": true,
+  "type": "module",
+  "description": "Watson — Workflow-Aware Testing, Simulation, Observation & Navigation. An independent runtime verifier that drives a running product like a user and returns exact-HEAD evidence.",
+  "bin": { "watson": "./src/cli.mjs" },
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "verify": "node src/cli.mjs verify",
+    "doctor": "node src/cli.mjs doctor"
+  },
+  "dependencies": {
+    "jose": "^5.10.0",
+    "pg": "^8.13.1",
+    "playwright": "1.49.1",
+    "yaml": "^2.6.1"
+  }
+}
