@@ -206,6 +206,10 @@ export function summary(env) {
     if (ce.invariants_added?.length) L.push(`Invariants added: ${ce.invariants_added.map((f) => `\`${f}\``).join(', ')}`);
     if (ce.base_contract_available === false) {
       L.push('The base contract could not be read, so only the FACT of a change is reported — review the `.watson/` diff directly.');
+    } else if (!ce.expectations_weakened?.length && !ce.features_removed?.length) {
+      // Say this explicitly. A bare heading with nothing under it reads as
+      // "something was weakened and Watson could not name it".
+      L.push('No expectation was removed or weakened: every feature, step and invariant present at the base is still present and still in scope.');
     }
     L.push('');
     L.push('_A PR must not be able to weaken its own verification expectation and thereby manufacture its own PASS. Sherlock is the independent reviewer of whether this change is legitimate. Watson REPORTS this in Phase 0/1; it does not gate on it._');
