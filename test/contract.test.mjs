@@ -13,17 +13,40 @@ import {
   validateStepOrder,
   validateFeatureVars,
   ENGINE_OWNED_ENV,
+  SUPPORTED_CONTRACT_VERSIONS,
 } from '../src/contract.mjs';
 
 describe('validateContractVersion', () => {
-  test('accepts a supported version', () => {
-    assert.deepEqual(validateContractVersion({ contract_version: 1 }), []);
+  test('accepts every supported version', () => {
+    for (const v of SUPPORTED_CONTRACT_VERSIONS) {
+      assert.deepEqual(validateContractVersion({ contract_version: v }), [], String(v));
+    }
+  });
+
+  test('version 2 — the constructs nsc-eval’s contract now uses — is understood', () => {
+    // The bump that made this necessary: profile `preconditions` (ADR-039 D8).
+    // An engine without it reads no preconditions, proves nothing, and reports a
+    // PASS over a world that was never established. Sherlock caught that the
+    // contract had grown the construct without ever declaring a version that an
+    // older engine would refuse.
+    assert.ok(SUPPORTED_CONTRACT_VERSIONS.includes(2));
+    assert.deepEqual(validateContractVersion({ contract_version: 2 }), []);
   });
 
   test('refuses a contract NEWER than the engine, and says which way to fix it', () => {
-    const [p] = validateContractVersion({ contract_version: 2 });
+    // The whole point of the version gate: an engine that cannot run a contract
+    // must say so before provisioning, not discover it mid-run or — worse — not
+    // discover it at all.
+    const [p] = validateContractVersion({ contract_version: 3 });
     assert.match(p, /NEWER than the engine/);
     assert.match(p, /Update Watson/);
+  });
+
+  test('an engine that predates a construct refuses the contract that uses it', () => {
+    // Simulates the real skew: this contract (v2, with preconditions) handed to an
+    // engine that only knows v1. It must refuse rather than silently under-verify.
+    const [p] = validateContractVersion({ contract_version: 2 }, Object.freeze([1]));
+    assert.match(p, /NEWER than the engine/);
   });
 
   test('refuses a contract OLDER than anything supported', () => {
