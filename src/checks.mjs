@@ -99,16 +99,33 @@ export function evaluate({ featureId, evidence, invariants, pageText }) {
 }
 
 /**
- * Steps that ADDRESS a named handle. If one of these cannot find its target,
- * the most likely explanation is that the MAP names something that no longer
- * exists — contract drift, which is Watson's own defect and must not be
- * reported as a broken product.
+ * Steps that ADDRESS a named handle: they pick an element out of the DOM in order
+ * to ACT on it. If one cannot find its target, the likeliest explanation is that
+ * the MAP names something that no longer exists — contract drift, which is
+ * Watson's own defect and must not be reported as a broken product.
  *
- * Steps that ASSERT observable behavior (expect_text, expect_api, ...) are the
- * opposite: when they fail, the app did something the contract says it should
- * not, and that is a product failure.
+ * Everything else ASSERTS observable behavior. When one of those fails the
+ * application did something the contract says it should not, and that is a
+ * product failure.
+ *
+ * `wait_for_text` and `expect_count_at_most` used to be in this set and are
+ * deliberately not any more. A negative control found the cost: with small-cohort
+ * suppression disabled — a privacy regression — the prospective journey's
+ * `wait_for_text: "too small to report"` failed and was reported as FAIL_CONTRACT,
+ * i.e. "Watson's map is wrong". A real disclosure defect, filed as the verifier's
+ * own paperwork problem, is exactly how a finding gets dismissed.
+ *
+ * Neither belongs here on its own terms either. `wait_for_text` asserts what the
+ * application eventually SAYS; it addresses nothing. `expect_count_at_most` cannot
+ * even fail on a missing handle — a selector that matches nothing counts zero,
+ * which satisfies any maximum. It fails only when there is MORE than expected,
+ * which is always behavioral.
+ *
+ * The tradeoff is real and accepted: text the product legitimately renames now
+ * reads as FAIL_PRODUCT rather than drift. That direction is recoverable — a human
+ * reads the diff and fixes the map. The other direction hides privacy regressions.
  */
-const ADDRESSING_STEPS = new Set(['click', 'fill', 'select', 'wait_for_text', 'expect_count_at_most']);
+const ADDRESSING_STEPS = new Set(['click', 'fill', 'select']);
 
 /** Playwright's shape for "I could not find/act on that element". */
 function isTargetMiss(message = '') {
