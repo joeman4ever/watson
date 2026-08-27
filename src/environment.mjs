@@ -179,7 +179,23 @@ export async function startIdentityService({ issuer, clientId, identities }) {
 
   return {
     jwksUri: `http://127.0.0.1:${port}/jwks.json`,
+    issuer,
+    clientId,
     tokens,
+    /**
+     * Mint a correctly SIGNED token that deliberately carries a different issuer or
+     * client id. The signature is valid and the key is published, so the only thing
+     * that can reject it is the application verifying against the values Watson
+     * actually injected — which is exactly what the `identity-binding` probe asserts.
+     */
+    mintAs: ({ issuer: iss = issuer, clientId: cid = clientId, subject }) =>
+      new SignJWT({ client_id: cid })
+        .setProtectedHeader({ alg: 'RS256', kid: JWKS_KID })
+        .setIssuer(iss)
+        .setSubject(subject)
+        .setIssuedAt()
+        .setExpirationTime('2h')
+        .sign(privateKey),
     close: () => new Promise((r) => server.close(r)),
   };
 }
@@ -238,7 +254,7 @@ export async function waitForHealth(url, timeoutMs = 60_000) {
  * Probe 5 is the production-safety interlock and is a HARD REFUSAL: Watson will
  * not drive a database it did not create.
  */
-export async function doctor({ baseUrl, dbName, databaseUrl, adminToken, expectSeasons }) {
+export async function doctor({ baseUrl, dbName, databaseUrl, adminToken, expectSeasons, identity }) {
   const probes = [];
   const add = (name, ok, detail) => probes.push({ name, ok, detail });
 
@@ -268,6 +284,24 @@ export async function doctor({ baseUrl, dbName, databaseUrl, adminToken, expectS
       add('identity-chain', me.status === 200 && !!me.body?.appUserId,
         `/api/me -> ${me.status}${me.body?.subject ? ` subject=${me.body.subject}` : ''}`);
     } catch (e) { add('identity-chain', false, e.message); }
+  }
+
+  // The launch binding, proved rather than assumed: the application must verify
+  // against the SAME issuer and client id Watson mints with. A correctly signed
+  // token that names a different issuer or client id has to be rejected — if either
+  // were accepted, the app is trusting something Watson does not control; if the
+  // correct one failed, `identity-chain` above would already be red.
+  if (identity?.mintAs) {
+    for (const [label, claims] of [
+      ['issuer', { issuer: 'https://watson.local/user_management/not-this-run', subject: 'watson_admin' }],
+      ['client id', { clientId: 'client_watson_not_this_run', subject: 'watson_admin' }],
+    ]) {
+      try {
+        const r = await get('/api/me', await identity.mintAs(claims));
+        add(`identity-binding (${label})`, r.status === 401,
+          `token with a foreign ${label} -> ${r.status}, expected 401`);
+      } catch (e) { add(`identity-binding (${label})`, false, e.message); }
+    }
   }
 
   // Production-safety interlock: refuse any database Watson did not create.

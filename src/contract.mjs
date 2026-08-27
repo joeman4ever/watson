@@ -179,3 +179,28 @@ export function loadContractAt(repoRoot, sha) {
     if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
   }
 }
+
+/**
+ * Environment keys the ENGINE owns. A contract that set one of these could point the
+ * launched application at an issuer or client id other than the ones Watson mints
+ * with — the app would then verify against something Watson does not control — or,
+ * by dropping one, leave the identity seam unconfigured so no guarded route mounts
+ * and the run "verifies" an application that never enforced anything.
+ *
+ * DATABASE_URL and PORT are here for the same reason in a different register: the
+ * run's isolation is not the contract's to redefine.
+ */
+export const ENGINE_OWNED_ENV = Object.freeze([
+  'WORKOS_ISSUER', 'WORKOS_CLIENT_ID', 'WORKOS_JWKS_URI', 'DATABASE_URL', 'PORT',
+]);
+
+/** Problems with a contract's `env` block. Checked BEFORE anything is provisioned. */
+export function validateEnvOwnership(config) {
+  const reserved = Object.keys(config?.env ?? {}).filter((k) => ENGINE_OWNED_ENV.includes(k));
+  if (!reserved.length) return [];
+  return [
+    `.watson/config.yaml env sets engine-owned key(s): ${reserved.join(', ')}. ` +
+      'These are injected by the engine and bind the identity seam to the tokens it mints; ' +
+      'a contract cannot redefine them.',
+  ];
+}

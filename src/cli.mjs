@@ -13,7 +13,10 @@ import path from 'node:path';
 import url from 'node:url';
 import { execFileSync } from 'node:child_process';
 
-import { loadContract, loadContractAt, selectByProfile, withDependencies, validateFeatureVars } from './contract.mjs';
+import {
+  loadContract, loadContractAt, selectByProfile, withDependencies,
+  validateFeatureVars, validateEnvOwnership,
+} from './contract.mjs';
 import { productFingerprint, contractFingerprint, resolveSha, contractChange } from './fingerprint.mjs';
 import * as env from './environment.mjs';
 import * as drive from './driver.mjs';
@@ -150,7 +153,7 @@ async function bringUp({ repoRoot, contract, runDir, runId, adminUrl }) {
     step(`seeded: ${Object.keys(vars).join(', ')}`);
     timings.seed_ms = Date.now() - t;
 
-    return { dbName, databaseUrl, baseUrl, appPort, vars, timings, tokens: started.identity.tokens, teardown };
+    return { dbName, databaseUrl, baseUrl, appPort, vars, timings, tokens: started.identity.tokens, identity: started.identity, teardown };
   } catch (err) {
     await teardown();
     throw err;
@@ -205,18 +208,24 @@ async function cmdVerify(args) {
 
   // Fail fast on an undeclared variable: an unresolved `${name}` would otherwise
   // interpolate as a literal and surface later as a misleading product failure.
-  const varProblems = validateFeatureVars(
-    plan.map((p) => p.feature),
-    contract.fixtures.profiles?.[contract.config.launch.fixture_profile],
-  );
+  // Alongside it, refuse a contract that tries to redefine an engine-owned key.
+  // Both are pure contract checks, so they run BEFORE a database is created or a
+  // single provisioning command is executed.
+  const varProblems = [
+    ...validateEnvOwnership(contract.config),
+    ...validateFeatureVars(
+      plan.map((p) => p.feature),
+      contract.fixtures.profiles?.[contract.config.launch.fixture_profile],
+    ),
+  ];
   if (varProblems.length) {
     log('');
     for (const p of varProblems) log(`  ✗ ${p}`);
     return finish(runDir, {
       ...base, dbName: 'n/a', baseUrl: 'n/a',
       verdict: 'FAIL_CONTRACT',
-      verdictReason: `${varProblems.length} feature(s) reference variables the fixture does not declare`,
-      doctor: { ok: false, probes: varProblems.map((p, i) => ({ name: `contract-vars-${i + 1}`, ok: false, detail: p })) },
+      verdictReason: `${varProblems.length} contract problem(s) found before bring-up`,
+      doctor: { ok: false, probes: varProblems.map((p, i) => ({ name: `contract-preflight-${i + 1}`, ok: false, detail: p })) },
       features: [], findings: [], qualitySignals: zeroSignals(),
       evidence: { bundle: path.relative(ROOT, runDir), retention_days: 7 },
       timings: { total_ms: Date.now() - t0 },
@@ -246,6 +255,7 @@ async function cmdVerify(args) {
     const dr = await env.doctor({
       baseUrl: up.baseUrl, dbName: up.dbName, databaseUrl: up.databaseUrl,
       adminToken: up.tokens[adminIdentity?.id], expectSeasons: contract.config.launch.expect_seasons,
+      identity: up.identity,
     });
     for (const p of dr.probes) step(`doctor ${p.ok ? '✓' : '✗'} ${p.name} — ${p.detail}`);
     if (!dr.ok) {
@@ -401,6 +411,7 @@ async function cmdDoctor(args) {
     const dr = await env.doctor({
       baseUrl: up.baseUrl, dbName: up.dbName, databaseUrl: up.databaseUrl,
       adminToken: up.tokens[adminIdentity?.id], expectSeasons: contract.config.launch.expect_seasons,
+      identity: up.identity,
     });
     for (const p of dr.probes) log(`  ${p.ok ? '✓' : '✗'} ${p.name} — ${p.detail}`);
     log(`\n  doctor: ${dr.ok ? 'OK' : 'FAILED'}\n`);
