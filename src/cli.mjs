@@ -270,6 +270,11 @@ async function cmdVerify(args) {
       baseUrl: up.baseUrl, dbName: up.dbName, databaseUrl: up.databaseUrl,
       adminToken: up.tokens[adminIdentity?.id], expectSeasons: contract.config.launch.expect_seasons,
       identity: up.identity,
+      // W5: what the seeded rows must RESOLVE TO through the product's own read
+      // paths, declared by the profile that seeded them.
+      preconditions: contract.fixtures.profiles?.[contract.config.launch.fixture_profile]?.preconditions,
+      tokens: up.tokens,
+      vars: up.vars,
     });
     for (const p of dr.probes) step(`doctor ${p.ok ? '✓' : '✗'} ${p.name} — ${p.detail}`);
     if (!dr.ok) {
@@ -455,6 +460,11 @@ async function cmdDoctor(args) {
       baseUrl: up.baseUrl, dbName: up.dbName, databaseUrl: up.databaseUrl,
       adminToken: up.tokens[adminIdentity?.id], expectSeasons: contract.config.launch.expect_seasons,
       identity: up.identity,
+      // W5: what the seeded rows must RESOLVE TO through the product's own read
+      // paths, declared by the profile that seeded them.
+      preconditions: contract.fixtures.profiles?.[contract.config.launch.fixture_profile]?.preconditions,
+      tokens: up.tokens,
+      vars: up.vars,
     });
     for (const p of dr.probes) log(`  ${p.ok ? '✓' : '✗'} ${p.name} — ${p.detail}`);
     log(`\n  doctor: ${dr.ok ? 'OK' : 'FAILED'}\n`);

@@ -18,6 +18,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
+import { isAuthorized as isAuthorizedStatus } from './driver.mjs';
 import pg from 'pg';
 import { generateKeyPair, exportJWK, SignJWT } from 'jose';
 import http from 'node:http';
@@ -358,7 +359,7 @@ export async function waitForHealth(url, timeoutMs = 60_000) {
  * Probe 5 is the production-safety interlock and is a HARD REFUSAL: Watson will
  * not drive a database it did not create.
  */
-export async function doctor({ baseUrl, dbName, databaseUrl, adminToken, expectSeasons, identity }) {
+export async function doctor({ baseUrl, dbName, databaseUrl, adminToken, expectSeasons, identity, preconditions, tokens, vars }) {
   const probes = [];
   const add = (name, ok, detail) => probes.push({ name, ok, detail });
 
@@ -388,6 +389,48 @@ export async function doctor({ baseUrl, dbName, databaseUrl, adminToken, expectS
       add('identity-chain', me.status === 200 && !!me.body?.appUserId,
         `/api/me -> ${me.status}${me.body?.subject ? ` subject=${me.body.subject}` : ''}`);
     } catch (e) { add('identity-chain', false, e.message); }
+  }
+
+  // FIXTURE PRECONDITION PROOF (Phase-1 defect W5).
+  //
+  // Seeding rows successfully is not proof that the fixture represents a valid,
+  // REACHABLE product state. The scoring fixture wrote a session, groups, members,
+  // a form version and a scoring rule — every insert succeeded — and the feature
+  // still did not work, because EF-05 also needs a route. The journey asserting
+  // that endpoint was reachable stayed green over a world where it resolved to
+  // nothing.
+  //
+  // So each named profile declares what its rows must RESOLVE TO through the
+  // application's own read paths, and those are checked here, before any journey
+  // runs. A failure is BLOCKED_ENVIRONMENT: the world the contract asked for could
+  // not be established. That is deliberately not FAIL_PRODUCT — the fixture is
+  // Watson's — and deliberately not silence.
+  for (const [i, pre] of (preconditions ?? []).entries()) {
+    const label = `precondition ${i + 1}: ${pre.note ?? pre.get}`;
+    try {
+      const token = pre.as ? tokens?.[pre.as] : adminToken;
+      if (pre.as && !token) { add(label, false, `no token for identity ${pre.as}`); continue; }
+      const r = await get(interpolate(pre.get, vars ?? {}), token);
+      if (pre.expect?.authorized !== undefined) {
+        const ok = isAuthorizedStatus(r.status) === pre.expect.authorized;
+        add(label, ok, `${r.status} (expected ${pre.expect.authorized ? 'authorized' : 'denied'})`);
+        continue;
+      }
+      if (pre.expect?.json) {
+        const bad = Object.entries(pre.expect.json)
+          .filter(([k, v]) => String(r.body?.[k]) !== String(interpolate(String(v), vars ?? {})));
+        add(label, bad.length === 0,
+          bad.length ? bad.map(([k, v]) => `${k}: wanted ${v}, got ${JSON.stringify(r.body?.[k])}`).join('; ')
+                     : Object.keys(pre.expect.json).map((k) => `${k}=${r.body?.[k]}`).join(', '));
+        continue;
+      }
+      if (pre.expect?.count_at) {
+        const n = Array.isArray(r.body?.[pre.expect.count_at]) ? r.body[pre.expect.count_at].length : -1;
+        add(label, n === pre.expect.equals, `${pre.expect.count_at} -> ${n}, expected ${pre.expect.equals}`);
+        continue;
+      }
+      add(label, false, 'precondition declares no expectation');
+    } catch (e) { add(label, false, e.message); }
   }
 
   // The launch binding, proved rather than assumed: the application must verify
