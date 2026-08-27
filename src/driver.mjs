@@ -67,7 +67,8 @@ export async function openIdentity(browser, { baseUrl, token, viewport }) {
 export const STEPS = [
   'goto', 'reload', 'back', 'click', 'fill', 'select', 'wait_for_text',
   'expect_text', 'expect_no_text', 'expect_no_uuid', 'expect_url_contains',
-  'expect_api', 'expect_denied', 'expect_count_at_most', 'set_viewport', 'expect_no_overflow',
+  'expect_api', 'expect_denied', 'expect_count_at_most', 'expect_count_at_least',
+  'set_viewport', 'expect_no_overflow',
 ];
 
 function locator(page, sel) {
@@ -204,6 +205,23 @@ export async function runStep(step, ctx) {
       const n = await locator(page, interp(arg.selector, vars)).count();
       if (n > arg.max) throw new Error(`expected at most ${arg.max} of ${arg.selector}, found ${n}${note}`);
       return `${arg.selector} count ${n} <= ${arg.max}`;
+    }
+    case 'expect_count_at_least': {
+      // The other half of at_most, and the one that catches a screen rendering
+      // NOTHING. A route whose component throws renders an error boundary or an
+      // empty shell and still returns 200 with a quiet console, so "did not error"
+      // is not evidence that anything was drawn. Polls, because the assertion is
+      // about eventual state: a screen that fetches before it renders its heading
+      // would otherwise fail on timing rather than on substance.
+      const sel = interp(arg.selector, vars);
+      const deadline = Date.now() + timeout;
+      let n = 0;
+      do {
+        n = await locator(page, sel).count();
+        if (n >= arg.min) return `${sel} count ${n} >= ${arg.min}`;
+        await page.waitForTimeout(250);
+      } while (Date.now() < deadline);
+      throw new Error(`expected at least ${arg.min} of ${sel}, found ${n}${note}`);
     }
     case 'set_viewport': {
       await page.setViewportSize({ width: arg.width, height: arg.height });

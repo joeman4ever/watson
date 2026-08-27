@@ -245,3 +245,44 @@ export function validateEnvOwnership(config) {
       'a contract cannot redefine them.',
   ];
 }
+
+/** Steps that can only be true of a page the browser has actually loaded. */
+const REQUIRES_A_LOADED_PAGE = new Set([
+  'expect_api', 'expect_text', 'expect_no_text', 'expect_no_uuid',
+  'expect_count_at_most', 'expect_count_at_least', 'expect_url_contains',
+  'wait_for_text', 'click', 'fill', 'select', 'expect_no_overflow',
+]);
+const NAVIGATES = new Set(['goto', 'reload', 'back']);
+
+/**
+ * Refuse a journey that asserts about the page before it has loaded one.
+ *
+ * `expect_api` reads the traffic the BROWSER made. Placed before any navigation it
+ * observes an empty list and fails — and it fails as a behavioral assertion, so the
+ * triage reads FAIL_PRODUCT and the run accuses the application of a defect that is
+ * really a typo in the map. That is the most expensive kind of false positive this
+ * system can produce, so it is refused up front rather than triaged after.
+ *
+ * `expect_denied` is deliberately absent: it issues its own request and does not
+ * depend on the page.
+ */
+export function validateStepOrder(features) {
+  const problems = [];
+  for (const f of features) {
+    let navigated = false;
+    for (const [i, step] of (f.steps ?? []).entries()) {
+      const kind = Object.keys(step).find((k) => NAVIGATES.has(k) || REQUIRES_A_LOADED_PAGE.has(k));
+      if (!kind) continue;
+      if (NAVIGATES.has(kind)) { navigated = true; continue; }
+      if (!navigated) {
+        problems.push(
+          `${f.__file ?? f.id}: step ${i + 1} \`${kind}\` asserts about a page, but the journey ` +
+            'has not navigated yet. Add a `goto` first — otherwise this fails as a product defect ' +
+            'when it is a map defect.',
+        );
+        break;
+      }
+    }
+  }
+  return problems;
+}

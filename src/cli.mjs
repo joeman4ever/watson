@@ -15,7 +15,7 @@ import { execFileSync } from 'node:child_process';
 
 import {
   loadContract, loadContractAt, selectByProfile, withDependencies,
-  validateFeatureVars, validateEnvOwnership, validateContractVersion,
+  validateFeatureVars, validateEnvOwnership, validateContractVersion, validateStepOrder,
 } from './contract.mjs';
 import { productFingerprint, contractFingerprint, resolveSha, contractChange } from './fingerprint.mjs';
 import * as env from './environment.mjs';
@@ -213,6 +213,7 @@ async function cmdVerify(args) {
   // single provisioning command is executed.
   const varProblems = [
     ...validateContractVersion(contract.config),
+    ...validateStepOrder(plan.map((p) => p.feature)),
     ...validateEnvOwnership(contract.config),
     ...validateFeatureVars(
       plan.map((p) => p.feature),
