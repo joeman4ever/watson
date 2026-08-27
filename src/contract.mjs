@@ -91,6 +91,44 @@ export function selectByProfile(features, profile) {
   return features.filter((f) => f.status === 'mapped' && (f.profiles ?? []).includes(profile));
 }
 
+/** Every `${name}` a value references, at any depth. */
+export function referencedVars(value, into = new Set()) {
+  if (typeof value === 'string') {
+    for (const m of value.matchAll(/\$\{(\w+)\}/g)) into.add(m[1]);
+  } else if (Array.isArray(value)) {
+    for (const v of value) referencedVars(v, into);
+  } else if (value && typeof value === 'object') {
+    for (const v of Object.values(value)) referencedVars(v, into);
+  }
+  return into;
+}
+
+/**
+ * Check every variable a feature interpolates against the fixture profile's declared
+ * `emits`, BEFORE anything is driven.
+ *
+ * Without this an undeclared name interpolates to the literal `${name}` and the run fails
+ * somewhere later with a misleading message — a typo in the map reads as a broken product.
+ * Failing here instead makes it unambiguously a contract problem.
+ *
+ * `alwaysAvailable` are names the engine itself supplies (not the fixture).
+ */
+export function validateFeatureVars(features, fixtureProfile, alwaysAvailable = ['runId']) {
+  const declared = new Set([...(fixtureProfile?.emits ?? []), ...alwaysAvailable]);
+  const problems = [];
+  for (const f of features) {
+    const used = referencedVars(f.steps ?? []);
+    const missing = [...used].filter((v) => !declared.has(v)).sort();
+    if (missing.length) {
+      problems.push(
+        `${f.__file ?? f.id}: interpolates ${missing.map((m) => `\`\${${m}}\``).join(', ')}, ` +
+          'which the fixture profile does not declare in `emits`',
+      );
+    }
+  }
+  return problems;
+}
+
 /**
  * Expand `depends_on` into an ordered setup list. A prerequisite runs as SETUP,
  * not as its own verdict — a failing prerequisite blocks its dependants rather

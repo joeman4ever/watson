@@ -13,7 +13,7 @@ import path from 'node:path';
 import url from 'node:url';
 import { execFileSync } from 'node:child_process';
 
-import { loadContract, selectByProfile, withDependencies } from './contract.mjs';
+import { loadContract, selectByProfile, withDependencies, validateFeatureVars } from './contract.mjs';
 import { productFingerprint, contractFingerprint, resolveSha, contractChange } from './fingerprint.mjs';
 import * as env from './environment.mjs';
 import * as drive from './driver.mjs';
@@ -148,6 +148,7 @@ async function cmdVerify(args) {
 
   const selected = selectByProfile(contract.features, profile);
   const plan = withDependencies(selected, contract.features);
+
   const selection = {
     method: 'profile',
     profile,
@@ -170,6 +171,26 @@ async function cmdVerify(args) {
     browser: 'chromium/playwright-1.49.1',
   };
 
+  // Fail fast on an undeclared variable: an unresolved `${name}` would otherwise
+  // interpolate as a literal and surface later as a misleading product failure.
+  const varProblems = validateFeatureVars(
+    plan.map((p) => p.feature),
+    contract.fixtures.profiles?.[contract.config.launch.fixture_profile],
+  );
+  if (varProblems.length) {
+    log('');
+    for (const p of varProblems) log(`  ✗ ${p}`);
+    return finish(runDir, {
+      ...base, dbName: 'n/a', baseUrl: 'n/a',
+      verdict: 'FAIL_CONTRACT',
+      verdictReason: `${varProblems.length} feature(s) reference variables the fixture does not declare`,
+      doctor: { ok: false, probes: varProblems.map((p, i) => ({ name: `contract-vars-${i + 1}`, ok: false, detail: p })) },
+      features: [], findings: [], qualitySignals: zeroSignals(),
+      evidence: { bundle: path.relative(ROOT, runDir), retention_days: 7 },
+      timings: { total_ms: Date.now() - t0 },
+      finishedAt: new Date().toISOString(),
+    });
+  }
   // --- bring the environment up ------------------------------------------------
   let up;
   try {
