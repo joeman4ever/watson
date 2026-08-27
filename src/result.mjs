@@ -203,8 +203,12 @@ export function summary(env) {
     }
     if (ce.features_removed?.length) L.push(`Features removed: ${ce.features_removed.map((f) => `\`${f}\``).join(', ')}`);
     if (ce.features_added?.length) L.push(`Features added: ${ce.features_added.map((f) => `\`${f}\``).join(', ')}`);
+    if (ce.invariants_added?.length) L.push(`Invariants added: ${ce.invariants_added.map((f) => `\`${f}\``).join(', ')}`);
+    if (ce.base_contract_available === false) {
+      L.push('The base contract could not be read, so only the FACT of a change is reported — review the `.watson/` diff directly.');
+    }
     L.push('');
-    L.push('_A PR must not be able to weaken its own verification expectation and thereby manufacture its own PASS. Sherlock is the independent reviewer of whether this change is legitimate._');
+    L.push('_A PR must not be able to weaken its own verification expectation and thereby manufacture its own PASS. Sherlock is the independent reviewer of whether this change is legitimate. Watson REPORTS this in Phase 0/1; it does not gate on it._');
     L.push('');
   }
 

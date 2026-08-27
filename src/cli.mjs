@@ -13,7 +13,7 @@ import path from 'node:path';
 import url from 'node:url';
 import { execFileSync } from 'node:child_process';
 
-import { loadContract, selectByProfile, withDependencies, validateFeatureVars } from './contract.mjs';
+import { loadContract, loadContractAt, selectByProfile, withDependencies, validateFeatureVars } from './contract.mjs';
 import { productFingerprint, contractFingerprint, resolveSha, contractChange } from './fingerprint.mjs';
 import * as env from './environment.mjs';
 import * as drive from './driver.mjs';
@@ -58,7 +58,7 @@ async function bringUp({ repoRoot, contract, runDir, runId, adminUrl }) {
   try {
     // 1. PROVISION -------------------------------------------------------------
     let t = Date.now();
-    await env.provisionDatabase({ adminUrl, dbName });
+    await env.provisionDatabase({ adminUrl, dbName, runId });
     started.dbCreated = true;
     const databaseUrl = adminUrl.replace(/\/[^/]*$/, `/${dbName}`);
     step(`database ${dbName}`);
@@ -192,7 +192,11 @@ async function cmdVerify(args) {
     headSha, baseSha,
     productFingerprint: productFingerprint(repoRoot, headSha),
     contractFingerprint: contractFingerprint(repoRoot, headSha),
-    contractChange: contractChange(repoRoot, baseSha, headSha, () => null),
+    // Resolves the contract at BOTH SHAs so the diff can name what changed, not
+    // merely that something did. `loadContractAt` returns null for an unreadable
+    // or invalid base, which the diff reports as `base_contract_available: false`.
+    contractChange: contractChange(repoRoot, baseSha, headSha, (sha) =>
+      sha === headSha ? contract : loadContractAt(repoRoot, sha)),
     profile, selection, startedAt, shadow: true,
     fixtureProfile: contract.config.launch.fixture_profile,
     viewports: ['1280x800'],

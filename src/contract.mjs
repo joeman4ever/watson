@@ -5,7 +5,9 @@
 // code it describes.
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import YAML from 'yaml';
 
 /** Parse `---\nyaml\n---\nmarkdown` into { data, body }. */
@@ -149,4 +151,31 @@ export function withDependencies(selected, all) {
   };
   for (const f of selected) visit(f, false);
   return ordered;
+}
+
+/**
+ * Load the contract as it stood at an arbitrary SHA, by exporting just `.watson/`
+ * from that commit into a scratch directory.
+ *
+ * Used only for the base→head contract diff. It returns null rather than throwing
+ * when the base contract cannot be read or does not validate: a run must not die
+ * because a PREVIOUS commit's contract was malformed, and "unavailable" is already
+ * a reported outcome.
+ */
+export function loadContractAt(repoRoot, sha) {
+  let tmp;
+  try {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'watson-contract-'));
+    // `git archive` writes only what the commit contains — nothing from the
+    // working tree, so a dirty checkout cannot contaminate the base side.
+    const tar = execFileSync('git', ['archive', '--format=tar', sha, '.watson'], {
+      cwd: repoRoot, maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    execFileSync('tar', ['-x', '-C', tmp], { input: tar, stdio: ['pipe', 'ignore', 'ignore'] });
+    return loadContract(tmp);
+  } catch {
+    return null;
+  } finally {
+    if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
+  }
 }

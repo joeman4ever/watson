@@ -58,14 +58,44 @@ export function runStep(cmd, { cwd, env, label, timeoutMs = 900_000 }) {
 
 // ---------------------------------------------------------------- provision --
 
-export async function provisionDatabase({ adminUrl, dbName }) {
+/** Stamped into every run database at creation; the product's fixture requires it. */
+export const MARKER_TABLE = 'watson_run_marker';
+
+/**
+ * Create the run's database and stamp it with a provisioning marker.
+ *
+ * The marker is what lets the product's fixture POSITIVELY identify this
+ * database as Watson's own for this run, rather than trusting a name prefix or
+ * a connection string that could name anything. It is written here, at creation
+ * time, so a database that lacks it was demonstrably not created by Watson.
+ */
+export async function provisionDatabase({ adminUrl, dbName, runId }) {
+  if (!runId) throw new Error('provisionDatabase requires a runId to stamp the marker');
   const client = new pg.Client({ connectionString: adminUrl });
   await client.connect();
   try {
-    await client.query(`DROP DATABASE IF EXISTS ${JSON.stringify(dbName).replace(/"/g, '"')}`);
+    await client.query(`DROP DATABASE IF EXISTS "${dbName}" WITH (FORCE)`);
     await client.query(`CREATE DATABASE "${dbName}"`);
   } finally {
     await client.end();
+  }
+
+  const runClient = new pg.Client({ connectionString: adminUrl.replace(/\/[^/]*$/, `/${dbName}`) });
+  await runClient.connect();
+  try {
+    await runClient.query(
+      `CREATE TABLE ${MARKER_TABLE} (
+         run_id        text        PRIMARY KEY,
+         database_name text        NOT NULL,
+         provisioned_at timestamptz NOT NULL DEFAULT now()
+       )`,
+    );
+    await runClient.query(
+      `INSERT INTO ${MARKER_TABLE} (run_id, database_name) VALUES ($1, current_database())`,
+      [runId],
+    );
+  } finally {
+    await runClient.end();
   }
 }
 
