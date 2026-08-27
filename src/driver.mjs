@@ -67,7 +67,8 @@ export async function openIdentity(browser, { baseUrl, token, viewport }) {
 export const STEPS = [
   'goto', 'reload', 'back', 'click', 'fill', 'select', 'wait_for_text',
   'expect_text', 'expect_no_text', 'expect_no_uuid', 'expect_url_contains',
-  'expect_api', 'expect_denied', 'expect_allowed', 'expect_count_at_most', 'expect_count_at_least',
+  'expect_api', 'expect_denied', 'expect_allowed', 'expect_json',
+  'expect_count_at_most', 'expect_count_at_least',
   'set_viewport', 'expect_no_overflow',
 ];
 
@@ -215,6 +216,42 @@ export async function runStep(step, ctx) {
         throw new Error(`expected ${want} to be allowed, got ${res.status()}${note}`);
       }
       return `${want} allowed ${res.status()}`;
+    }
+    case 'expect_json': {
+      // Assert on what a route RESOLVED TO, not merely that it answered.
+      //
+      // The gap this closes is specific and was written down before it was built:
+      // nsc-eval's scoring-form returns `state: 'unassigned'` or `'ambiguous'`
+      // rather than erroring when routing cannot be determined — fail-closed, never
+      // a guess (EF-05/ADR-020). So a completely broken routing chain answers 200,
+      // and `expect_allowed` calls it healthy.
+      //
+      // Deliberately a SUBSET match on top-level keys rather than a full-body
+      // comparison. A journey that pinned an entire response would break on every
+      // additive field, and a contract that breaks on additions trains people to
+      // stop reading it.
+      const want = interp(arg.path ?? arg.url, vars);
+      const res = await page.request.get(want, { failOnStatusCode: false });
+      evidence.requests.push({ path: want, status: res.status(), method: 'GET' });
+      if (!isAuthorized(res.status())) {
+        throw new Error(`expected ${want} to answer, got ${res.status()}${note}`);
+      }
+      let body;
+      try {
+        body = await res.json();
+      } catch {
+        throw new Error(`expected ${want} to return JSON${note}`);
+      }
+      for (const [key, expected] of Object.entries(arg.contains ?? {})) {
+        const actual = body?.[key];
+        const want_ = interp(String(expected), vars);
+        if (String(actual) !== want_) {
+          throw new Error(
+            `expected ${want} to return \`${key}: ${want_}\`, got \`${key}: ${JSON.stringify(actual)}\`${note}`,
+          );
+        }
+      }
+      return `${want} returned ${Object.keys(arg.contains ?? {}).map((k) => `${k}=${body?.[k]}`).join(', ')}`;
     }
     case 'expect_count_at_most': {
       const n = await locator(page, interp(arg.selector, vars)).count();
