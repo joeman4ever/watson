@@ -89,8 +89,36 @@ async function bringUp({ repoRoot, contract, runDir, runId, adminUrl }) {
       WORKOS_REDIRECT_URI: `http://127.0.0.1:${appPort}/auth/callback`,
       SESSION_SEALING_KEY_CURRENT: 'w'.repeat(48),
       WORKOS_API_KEY: 'sk_watson_local_placeholder_not_a_real_key',
-      ...(cfg.env ?? {}),
     };
+
+    // The contract's `env` may reference run-scoped values the engine owns, as
+    // ${WATSON_*} placeholders. Substitute them and FAIL CLOSED on any that is
+    // left unresolved: launching a half-configured application would let the
+    // identity seam fall back to an ambient key source or stay unmounted, and
+    // the run would then "verify" an app whose guarded routes never mounted.
+    const injected = {
+      WATSON_JWKS_URI: started.identity.jwksUri,
+      WATSON_BASE_URL: `http://127.0.0.1:${appPort}`,
+      WATSON_DATABASE_URL: databaseUrl,
+      WATSON_PORT: String(appPort),
+      WATSON_RUN_ID: runId,
+    };
+    for (const [key, raw] of Object.entries(cfg.env ?? {})) {
+      // Deliberately NOT the general interpolate(): that substitutes an unknown
+      // name with an empty string, which here would hand the application an empty
+      // WORKOS_JWKS_URI. The identity seam would then read as "not configured",
+      // the guarded routes would never mount, and the run would fail much later
+      // with an unrelated-looking error. Resolve explicitly and throw on a miss.
+      appEnv[key] = String(raw).replace(/\$\{(WATSON_\w+)\}/g, (_, name) => {
+        if (!(name in injected)) {
+          throw new Error(
+            `.watson/config.yaml env.${key} references \${${name}}, which the engine does not supply. ` +
+              `Known injected values: ${Object.keys(injected).join(', ')}.`,
+          );
+        }
+        return injected[name];
+      });
+    }
     for (const cmd of cfg.build ?? []) {
       await env.runStep(cmd, { cwd: repoRoot, env: appEnv, label: 'build' });
     }
