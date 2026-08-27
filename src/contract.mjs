@@ -28,6 +28,47 @@ export function parseFrontmatter(text, sourceLabel) {
   return { data, body };
 }
 
+/**
+ * Contract schema versions this engine understands.
+ *
+ * The two repositories move independently: nsc-eval's `.watson/` is reviewed and
+ * merged on its own cadence, and this engine on another. Without a version check
+ * the failure mode of that skew is silent and misleading — an engine too old to
+ * understand a step simply does not run it, and the run reports a PASS that
+ * proves less than the contract asked for. A verifier that quietly under-verifies
+ * is worse than one that refuses.
+ *
+ * So: an unknown version stops the run rather than guessing. Widen this list in
+ * the same change that teaches the engine the new shape.
+ */
+export const SUPPORTED_CONTRACT_VERSIONS = Object.freeze([1]);
+
+/** Problems with a contract's declared version. Checked before anything is provisioned. */
+export function validateContractVersion(config, supported = SUPPORTED_CONTRACT_VERSIONS) {
+  const declared = config?.contract_version;
+  if (declared === undefined || declared === null) {
+    return [
+      '.watson/config.yaml does not declare `contract_version`. The engine cannot tell ' +
+        'whether it understands this contract, so it will not guess. ' +
+        `Add \`contract_version: ${supported[supported.length - 1]}\`.`,
+    ];
+  }
+  if (!Number.isInteger(declared)) {
+    return [`.watson/config.yaml \`contract_version: ${JSON.stringify(declared)}\` is not an integer.`];
+  }
+  if (!supported.includes(declared)) {
+    const newest = Math.max(...supported);
+    const direction = declared > newest
+      ? 'This contract is NEWER than the engine. Update Watson, or pin the run to an engine that understands it.'
+      : 'This contract is OLDER than any version the engine still supports. Migrate the contract.';
+    return [
+      `.watson/config.yaml declares \`contract_version: ${declared}\`, which this engine ` +
+        `(supports: ${supported.join(', ')}) does not understand. ${direction}`,
+    ];
+  }
+  return [];
+}
+
 const REQUIRED_FEATURE_FIELDS = ['id', 'title', 'status', 'personas', 'profiles'];
 
 /** Validate one feature entry. Returns an array of human-readable problems. */

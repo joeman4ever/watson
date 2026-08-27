@@ -122,11 +122,20 @@ export async function runStep(step, ctx) {
       const loc = locator(page, interp(arg.selector, vars));
       const before = page.url();
       await loc.first().selectOption(arg.label ? { label: interp(arg.label, vars) } : interp(String(arg.value), vars), { timeout });
-      // A control may trigger a FULL-DOCUMENT navigation (nsc-eval's season
-      // picker does). Give it a bounded window to start, then settle — a user
-      // waits for the page. If it never navigates, the assertion steps still
-      // fail; this waits for the app, it does not paper over a missing one.
-      await page.waitForURL((u) => u.toString() !== before, { timeout: 5000 }).catch(() => {});
+      // A control MAY trigger a full-document navigation (nsc-eval's season picker
+      // does) or may just update local state (its M3 grant picker does). We cannot
+      // know which in advance, and waiting a fixed window for a navigation that is
+      // never coming costs that window on every such step — 5s each, on every run of
+      // the shadow campaign.
+      //
+      // So race the two: whichever of "navigated" or "settled quietly" happens first
+      // ends the wait. Every downstream assertion (expect_url_contains, expect_api,
+      // wait_for_text) polls to its own deadline, so a slow navigation that loses the
+      // race is still caught there rather than papered over here.
+      await Promise.race([
+        page.waitForURL((u) => u.toString() !== before, { timeout: 5000 }).catch(() => {}),
+        page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {}),
+      ]);
       await page.waitForLoadState('networkidle', { timeout }).catch(() => {});
       return `selected ${arg.label ?? arg.value} in ${arg.selector}${note}`;
     }
