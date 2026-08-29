@@ -67,8 +67,25 @@ async function bringUp({ repoRoot, contract, runDir, runId, adminUrl }) {
     // belong to Watson rather than to the product.
     started.releaseLock = env.acquireRunLock(repoRoot, runId);
 
-    // 1. PROVISION -------------------------------------------------------------
+    // 0. INSTALL ---------------------------------------------------------------
+    // A PR-targeted run starts from a fresh detached worktree at the product's
+    // exact HEAD: no `node_modules`, nothing built. Phase-1 Observation 1 hit
+    // exactly this — `provision: exited 127`, because the runner for the migrate
+    // command was not installed. Borrowing another checkout's `node_modules`
+    // would defeat the point of verifying an exact HEAD, so the product declares
+    // its own dependency step and Watson runs it.
+    //
+    // Deliberately BEFORE the database is created: a failed install then cannot
+    // orphan a `watson_<runId>` database that `reap` has to clean up later.
     let t = Date.now();
+    for (const cmd of cfg.install ?? []) {
+      await env.runStep(cmd, { cwd: repoRoot, env: { ...process.env }, label: 'install' });
+    }
+    if ((cfg.install ?? []).length) step(`install commands: ${cfg.install.length}`);
+    timings.install_ms = Date.now() - t;
+
+    // 1. PROVISION -------------------------------------------------------------
+    t = Date.now();
     await env.provisionDatabase({ adminUrl, dbName, runId });
     started.dbCreated = true;
     const databaseUrl = adminUrl.replace(/\/[^/]*$/, `/${dbName}`);

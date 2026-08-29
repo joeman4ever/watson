@@ -37,9 +37,26 @@ describe('validateContractVersion', () => {
     // The whole point of the version gate: an engine that cannot run a contract
     // must say so before provisioning, not discover it mid-run or — worse — not
     // discover it at all.
-    const [p] = validateContractVersion({ contract_version: 3 });
+    // Deliberately one past the newest supported version, so this keeps testing the
+    // BOUNDARY rather than a number that a later bump quietly makes valid.
+    const newest = Math.max(...SUPPORTED_CONTRACT_VERSIONS);
+    const [p] = validateContractVersion({ contract_version: newest + 1 });
     assert.match(p, /NEWER than the engine/);
     assert.match(p, /Update Watson/);
+  });
+
+  test('version 3 — the `install` phase — is understood', () => {
+    // A fresh PR worktree has no node_modules. An engine that does not know
+    // `install` would not establish the product's dependencies, and bring-up
+    // would fail at whatever first needed them. The contract must be able to
+    // refuse such an engine outright.
+    assert.ok(SUPPORTED_CONTRACT_VERSIONS.includes(3));
+    assert.deepEqual(validateContractVersion({ contract_version: 3 }), []);
+  });
+
+  test('a v3 contract is refused by an engine that only knows 1 and 2', () => {
+    const [p] = validateContractVersion({ contract_version: 3 }, Object.freeze([1, 2]));
+    assert.match(p, /NEWER than the engine/);
   });
 
   test('an engine that predates a construct refuses the contract that uses it', () => {
