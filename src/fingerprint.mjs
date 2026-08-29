@@ -174,3 +174,32 @@ export function contractChange(repoRoot, baseSha, headSha, loadAt) {
     changed_sign: [],
   };
 }
+
+/**
+ * Files changed between base and head, as repo-relative paths.
+ *
+ * Uses the merge base rather than a straight `base..head` comparison, so that
+ * commits which merely arrived on the base branch after this branch was cut are
+ * not attributed to this change. Attributing them would inflate every diff on a
+ * long-lived branch and, worse, make selection depend on when someone last
+ * merged rather than on what this change actually does.
+ *
+ * Returns null — never an empty list — when the diff cannot be computed. Callers
+ * must treat null as "no knowledge" and refuse to skip on it; an empty array is
+ * the positive fact that the two trees are identical.
+ */
+export function changedPaths(repoRoot, baseSha, headSha) {
+  if (!baseSha || !headSha) return null;
+  try {
+    const mergeBase = execFileSync('git', ['merge-base', baseSha, headSha], {
+      cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    const out = execFileSync('git', ['diff', '--name-only', '-z', `${mergeBase}`, headSha], {
+      cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return out.split('\0').filter(Boolean);
+  } catch {
+    // An unreachable base, a shallow clone with no common ancestor, a bad ref.
+    return null;
+  }
+}
