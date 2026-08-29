@@ -544,7 +544,13 @@ const cmd = args._[0];
 try {
   if (cmd === 'verify') {
     const envlp = await cmdVerify(args);
-    process.exit(envlp.verdict === 'PASS' || envlp.verdict === 'PASS_WITH_ADVISORIES' ? 0 : 1);
+    // The exit code follows the OBLIGATION, not the verdict. Those are the two
+    // axes: the verdict says what Watson learned, the obligation says whether
+    // the verification duty was discharged. NOT_APPLICABLE discharges it —
+    // Watson established there was nothing here to verify — so it must exit 0.
+    // Keying on the verdict made it exit 1 and read as a failure to any CI
+    // system, which was latent until selection made NOT_APPLICABLE reachable.
+    process.exit(envlp.check?.obligation === 'satisfied' ? 0 : 1);
   } else if (cmd === 'doctor') {
     process.exit(await cmdDoctor(args));
   } else if (cmd === 'reap') {

@@ -263,3 +263,17 @@ describe('controlled case 6 — nsc-eval#448, the real diff', () => {
     assert.equal(r.applicable, true);
   });
 });
+
+describe('exit code follows the obligation, not the verdict', () => {
+  test('every satisfied-obligation verdict would exit 0', async () => {
+    const { checkFor } = await import('../src/result.mjs');
+    // The regression: NOT_APPLICABLE discharges the verification duty. Keying
+    // the exit code on the verdict made it exit 1 and read as a CI failure.
+    for (const v of ['PASS', 'PASS_WITH_ADVISORIES', 'NOT_APPLICABLE']) {
+      assert.equal(checkFor(v).obligation, 'satisfied', `${v} must satisfy the obligation`);
+    }
+    for (const v of ['FAIL_PRODUCT', 'FAIL_CONTRACT', 'BLOCKED_ENVIRONMENT', 'INDETERMINATE']) {
+      assert.notEqual(checkFor(v).obligation, 'satisfied', `${v} must not satisfy the obligation`);
+    }
+  });
+});
