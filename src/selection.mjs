@@ -27,13 +27,14 @@ export const CLASS = Object.freeze({
   IGNORABLE: 'ignorable',
   GOVERNANCE: 'governance',
   MAPPED: 'mapped',
+  GOVERNING: 'governing',
   CROSS_CUTTING: 'cross_cutting',
   UNMAPPED_RUNTIME: 'unmapped_runtime',
   UNCLASSIFIED: 'unclassified',
 });
 
 /** Classes that oblige Watson to run something beyond what the diff maps to. */
-const ESCALATING = new Set([CLASS.CROSS_CUTTING, CLASS.UNMAPPED_RUNTIME, CLASS.UNCLASSIFIED]);
+const ESCALATING = new Set([CLASS.CROSS_CUTTING, CLASS.GOVERNING, CLASS.UNMAPPED_RUNTIME, CLASS.UNCLASSIFIED]);
 
 /**
  * Translate a glob to a RegExp. `**` crosses directory separators, `*` does not,
@@ -115,23 +116,31 @@ function witnessPaths(rule, root) {
  * is rejected even if the author meant something narrower. The cost of a refusal
  * is one rewritten rule; the cost of a miss is silent non-verification.
  */
-export function assertIgnorableRules(ignorable = [], runtimeRoots = []) {
+export function assertIgnorableRules(ignorable = [], runtimeRoots = [], governingRoots = []) {
   const offending = [];
+  const families = [
+    ['runtime root', runtimeRoots],
+    ['governing-contract root', governingRoots],
+  ];
   for (const rule of ignorable) {
     const ruleRe = globToRegExp(rule);
-    for (const root of runtimeRoots) {
-      const witness = witnessPaths(rule, root).find((p) => ruleRe.test(p));
-      if (witness) offending.push({ rule, root, witness });
+    for (const [kind, roots] of families) {
+      for (const root of roots) {
+        const witness = witnessPaths(rule, root).find((p) => ruleRe.test(p));
+        if (witness) offending.push({ rule, kind, root, witness });
+      }
     }
   }
   if (offending.length) {
     const detail = offending
-      .map((o) => `\`${o.rule}\` reaches runtime root \`${o.root}\` (e.g. ${o.witness})`)
+      .map((o) => `\`${o.rule}\` reaches ${o.kind} \`${o.root}\` (e.g. ${o.witness})`)
       .join('; ');
     throw new Error(
-      `selection.ignorable may not cover runtime code — ${detail}. ` +
+      `selection.ignorable may not cover runtime or governing-contract paths — ${detail}. ` +
       'An ignorable rule is the only way a change can go unverified, so it may never reach ' +
-      'executable product code.',
+      'executable product code, nor the documents that define what Watson is expected to prove. ' +
+      'A broad ignore pattern must never override a runtime, ADR, requirement, or Watson-contract ' +
+      'signal.',
     );
   }
 }
@@ -164,7 +173,10 @@ function featuresGovernedBy(p, features, adrDir) {
   return { adr: id, features: citing.map((f) => f.id) };
 }
 
-export function classifyPath(p, { features = [], ignorable = [], crossCutting = [], runtimeRoots = [], adrDir = 'docs/adr' } = {}) {
+export function classifyPath(p, {
+  features = [], ignorable = [], crossCutting = [], runtimeRoots = [], governingRoots = [],
+  adrDir = 'docs/adr',
+} = {}) {
   // Cross-cutting is checked FIRST and beats a source_globs match. A migration
   // that some feature happens to claim still changes the schema every other
   // journey reads; narrowing to the claiming feature would be the wrong answer.
@@ -172,15 +184,34 @@ export function classifyPath(p, { features = [], ignorable = [], crossCutting = 
     return { path: p, class: CLASS.CROSS_CUTTING, reason: 'declared cross-cutting', features: [] };
   }
 
-  const governed = featuresGovernedBy(p, features, adrDir);
-  if (governed) {
+  // Governing-contract paths: documents that define what Watson is expected to
+  // prove, or the contract by which it proves it. They are not executable, which
+  // is exactly why a blanket `docs/**` ignore would swallow them — and a changed
+  // ADR or requirement can move the expected behaviour without moving a line of
+  // code. The question is not "is this file runnable?" but "does this file define
+  // what running proves?"
+  if (matchesAny(p, governingRoots)) {
+    const governed = featuresGovernedBy(p, features, adrDir);
+    if (governed?.features.length) {
+      // The ADR resolves to features that cite it: verify exactly those.
+      return {
+        path: p,
+        class: CLASS.GOVERNANCE,
+        reason: `${governed.adr} governs ${governed.features.length} mapped feature(s)`,
+        features: governed.features,
+      };
+    }
+    // A governing document that maps to nothing. This is the dangerous case, not
+    // the harmless one: "no feature cites this" is at least as likely to mean the
+    // map has not caught up with a new ADR or requirement as it is to mean the
+    // change is irrelevant. Escalate — a governing change is never skippable.
     return {
       path: p,
-      class: CLASS.GOVERNANCE,
-      reason: governed.features.length
-        ? `${governed.adr} governs ${governed.features.length} mapped feature(s)`
-        : `${governed.adr} is cited by no mapped feature`,
-      features: governed.features,
+      class: CLASS.GOVERNING,
+      reason: governed
+        ? `${governed.adr} is cited by no mapped feature — the map may not have caught up`
+        : 'governing-contract path with no feature mapping',
+      features: [],
     };
   }
 
@@ -221,10 +252,10 @@ export function selectByImpact({
 } = {}) {
   const {
     ignorable = [], cross_cutting: crossCutting = [], runtime_roots: runtimeRoots = [],
-    adr_dir: adrDir = 'docs/adr',
+    governing_roots: governingRoots = [], adr_dir: adrDir = 'docs/adr',
   } = rules;
 
-  assertIgnorableRules(ignorable, runtimeRoots);
+  assertIgnorableRules(ignorable, runtimeRoots, governingRoots);
 
   const mapped = (ids) => features.filter((f) => ids.includes(f.id));
   const inProfile = (name) => features.filter((f) => f.status === 'mapped' && (f.profiles ?? []).includes(name));
@@ -255,7 +286,7 @@ export function selectByImpact({
   }
 
   const classifications = changedPaths.map((p) =>
-    classifyPath(p, { features, ignorable, crossCutting, runtimeRoots, adrDir }));
+    classifyPath(p, { features, ignorable, crossCutting, runtimeRoots, governingRoots, adrDir }));
 
   const escalating = classifications.filter((c) => ESCALATING.has(c.class));
   if (escalating.length) {
