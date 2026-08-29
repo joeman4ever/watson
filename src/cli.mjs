@@ -16,7 +16,8 @@ import {
   loadContract, loadContractAt, selectByProfile, withDependencies,
   validateFeatureVars, validateEnvOwnership, validateContractVersion, validateStepOrder,
 } from './contract.mjs';
-import { productFingerprint, contractFingerprint, resolveSha, contractChange, workingTreeState } from './fingerprint.mjs';
+import { productFingerprint, contractFingerprint, resolveSha, contractChange, workingTreeState, changedPaths } from './fingerprint.mjs';
+import { selectByImpact } from './selection.mjs';
 import * as env from './environment.mjs';
 import * as drive from './driver.mjs';
 import { evaluate, featureVerdict } from './checks.mjs';
@@ -202,17 +203,41 @@ async function cmdVerify(args) {
   log(`  head   ${headSha}`);
   log(`  map    ${contract.features.length} feature(s), profile \`${profile}\`\n`);
 
-  const selected = selectByProfile(contract.features, profile);
-  const plan = withDependencies(selected, contract.features);
+  // Diff-driven impact selection when the contract declares rules AND a base
+  // resolves; declared profile otherwise. The fallback direction matters: an
+  // absent base or absent rules means MORE journeys run, never fewer.
+  const rules = contract.config.selection ?? null;
+  const changed = rules ? changedPaths(repoRoot, baseSha, headSha) : null;
+
+  const impact = rules
+    ? selectByImpact({
+        features: contract.features,
+        changedPaths: changed,
+        profile,
+        escalationProfile: rules.escalation_profile ?? 'smoke',
+        rules,
+      })
+    : { method: 'profile', applicable: true, reason: 'contract declares no selection rules',
+        features: selectByProfile(contract.features, profile),
+        classifications: [], escalated: false, escalation_reasons: [] };
+
+  const plan = withDependencies(impact.features, contract.features);
 
   const selection = {
-    method: 'profile',
+    method: impact.method,
     profile,
+    applicable: impact.applicable,
+    reason: impact.reason,
+    escalated: impact.escalated,
+    escalation_reasons: impact.escalation_reasons,
+    changed_paths: changed,
+    classifications: impact.classifications,
     selected: plan.filter((p) => p.role === 'verified').map((p) => p.feature.id),
     setup: plan.filter((p) => p.role === 'setup').map((p) => p.feature.id),
     deferred: contract.features.filter((f) => !plan.some((p) => p.feature.id === f.id)).map((f) => f.id),
-    note: 'Phase 0 selects by declared profile. Diff-driven impact selection is Phase 1.',
   };
+
+  log(`  select ${impact.method} — ${impact.reason}`);
 
   const base = {
     runId, watsonVersion: VERSION, repository: args.repository ?? path.basename(repoRoot),
@@ -263,6 +288,29 @@ async function cmdVerify(args) {
       finishedAt: new Date().toISOString(),
     });
   }
+  // --- nothing to verify -------------------------------------------------------
+  // Terminal NOT_APPLICABLE, decided BEFORE bring-up. A skipped run must be
+  // cheap, or the cost of skipping teaches the wrong lesson; and it must never
+  // create a database or a process it then has to reap.
+  //
+  // Reaching here required `selectByImpact` to positively establish that every
+  // changed path is unable to affect the running product. Every other route —
+  // an absent base, an unrecognised path, unmapped runtime code — escalates
+  // instead, so this branch cannot be reached by falling through.
+  if (!selection.applicable) {
+    log(`\n  – NOT_APPLICABLE — ${selection.reason}`);
+    return finish(runDir, {
+      ...base, dbName: 'n/a', baseUrl: 'n/a',
+      verdict: 'NOT_APPLICABLE',
+      verdictReason: selection.reason,
+      doctor: { ok: true, probes: [] },
+      features: [], findings: [], qualitySignals: zeroSignals(),
+      evidence: { bundle: path.relative(ROOT, runDir), retention_days: 7 },
+      timings: { total_ms: Date.now() - t0 },
+      finishedAt: new Date().toISOString(),
+    });
+  }
+
   // --- bring the environment up ------------------------------------------------
   let up;
   try {
