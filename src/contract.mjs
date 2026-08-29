@@ -47,6 +47,12 @@ export function parseFrontmatter(text, sourceLabel) {
  *   `preconditions`.
  * - **2** — adds the `expect_allowed`, `expect_json` and `expect_count_at_least`
  *   steps, and profile-level `preconditions` (ADR-039 D8).
+ * - **3** — adds the `install` phase: the product's own dependency-establishment
+ *   commands, run before anything else. A PR-targeted run starts from a fresh
+ *   worktree at an exact HEAD with no `node_modules`, and an engine that does
+ *   not know the key simply will not install — so the contract must be able to
+ *   say "this engine is too old for me" rather than have its dependencies
+ *   silently not established.
  *
  * The bump exists because of `preconditions` specifically. An unknown *step*
  * fails loudly — `runStep` throws rather than skipping — which is wrong in its
@@ -57,7 +63,7 @@ export function parseFrontmatter(text, sourceLabel) {
  * silent under-verification this list exists to make impossible, and nothing but
  * a version refusal catches it.
  */
-export const SUPPORTED_CONTRACT_VERSIONS = Object.freeze([1, 2]);
+export const SUPPORTED_CONTRACT_VERSIONS = Object.freeze([1, 2, 3]);
 
 /** Problems with a contract's declared version. Checked before anything is provisioned. */
 export function validateContractVersion(config, supported = SUPPORTED_CONTRACT_VERSIONS) {
