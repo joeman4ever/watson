@@ -39,9 +39,23 @@ export async function openIdentity(browser, { baseUrl, token, viewport }) {
   });
   const page = await ctx.newPage();
 
-  const evidence = { console: [], pageErrors: [], requests: [], failed: [] };
+  // `expectedDenials` holds the RESOLVED paths a journey explicitly asserted are
+  // denied for this identity. It is the declaration side of expected-denial
+  // correlation: nothing may be neutralized that the journey did not first
+  // positively declare here.
+  const evidence = { console: [], pageErrors: [], requests: [], failed: [], expectedDenials: [] };
   page.on('console', (m) => {
-    if (['error', 'warning'].includes(m.type())) evidence.console.push({ type: m.type(), text: m.text() });
+    if (!['error', 'warning'].includes(m.type())) return;
+    // The resource URL is what makes precise attribution possible: for a
+    // resource-load failure Chromium reports the FAILING RESOURCE's url here,
+    // while a product `console.error` reports the page's own url. Without it a
+    // console error can only be correlated by timing, which is not evidence.
+    let resourcePath = null;
+    try {
+      const u = new URL(m.location()?.url ?? '');
+      resourcePath = u.pathname + u.search;
+    } catch { /* no usable location — stays null, and stays a finding */ }
+    evidence.console.push({ type: m.type(), text: m.text(), resourcePath });
   });
   page.on('pageerror', (e) => evidence.pageErrors.push({ type: 'pageerror', text: e.message }));
   page.on('requestfailed', (r) => evidence.failed.push({ url: r.url(), error: r.failure()?.errorText }));
@@ -200,6 +214,11 @@ export async function runStep(step, ctx) {
         throw new Error(`expected ${want} to be denied (401/403), got ${res.status()}${note}`);
       }
       evidence.requests.push({ path: want, status: res.status(), method: 'GET' });
+      // Record the DECLARATION, not the probe's own traffic. The probe runs through
+      // Playwright's APIRequestContext, which never reaches the renderer and so
+      // never produces a console error itself. What this licenses is different: the
+      // product's OWN in-page fetch to this same path, whose denial Chromium logs.
+      evidence.expectedDenials.push({ path: want, status: res.status(), method: 'GET' });
       return `${want} denied ${res.status()}`;
     }
     case 'expect_allowed': {

@@ -39,6 +39,57 @@ function isEnabled(rule, invariants, featureId) {
  * Evaluate the rule set against one feature's collected evidence.
  * Returns findings; the caller decides how they roll into a verdict.
  */
+/** Statuses that count as an authorization denial for correlation purposes. */
+export const DENIAL_STATUSES = Object.freeze([401, 403]);
+
+/** Chromium's resource-load failure message, with the status it reports. */
+const RESOURCE_LOAD_FAILURE = /^Failed to load resource: the server responded with a status of (\d{3})/;
+
+/**
+ * Separate console errors that are artifacts of a denial the journey explicitly
+ * declared from console errors that are evidence about the product.
+ *
+ * A journey that proves an authorization boundary makes the product's own in-page
+ * fetches get denied on purpose, and Chromium logs each one. Those messages are
+ * caused by Watson proving the boundary; treating them as product findings makes
+ * every authorization journey permanently advisory, which teaches people to
+ * ignore the rule everywhere else.
+ *
+ * Neutralisation requires FOUR independent positive facts, never timing:
+ *
+ *   1. the message is a resource-load failure, not arbitrary product output
+ *   2. the status IN THAT MESSAGE is 401/403 — read from the very event being
+ *      neutralised, so a 500 on a declared path stays a finding
+ *   3. Chromium attributed the message to a resource URL
+ *   4. that exact path was declared by an `expect_denied` step in this journey
+ *
+ * Anything short of all four stays a finding. The asymmetry is deliberate and
+ * one-directional: uncertain correlation preserves evidence, only a confident
+ * exact match removes it.
+ */
+export function classifyConsoleErrors(consoleEntries = [], expectedDenials = []) {
+  const declared = new Set(expectedDenials.map((d) => d.path));
+  const product = [];
+  const expected = [];
+
+  for (const entry of consoleEntries) {
+    if (entry.type !== 'error') continue;
+    const m = RESOURCE_LOAD_FAILURE.exec(entry.text ?? '');
+    const status = m ? Number(m[1]) : null;
+    if (
+      status !== null
+      && DENIAL_STATUSES.includes(status)
+      && entry.resourcePath
+      && declared.has(entry.resourcePath)
+    ) {
+      expected.push({ ...entry, status, classification: 'expected_denial_console' });
+    } else {
+      product.push(entry);
+    }
+  }
+  return { product, expected };
+}
+
 export function evaluate({ featureId, evidence, invariants, pageText }) {
   const findings = [];
   const emit = (rule, summary, requiredAction, detail) => {
@@ -64,7 +115,15 @@ export function evaluate({ featureId, evidence, invariants, pageText }) {
   }
 
   // --- non-security detectors (advisory unless the product says otherwise) -----
-  const errs = [...evidence.pageErrors, ...evidence.console.filter((c) => c.type === 'error')];
+  // A page error is never neutralised: an uncaught exception is the product's
+  // own failure, not an artifact of a denial Watson asked for.
+  const { product: productConsole, expected: expectedConsole } =
+    classifyConsoleErrors(evidence.console, evidence.expectedDenials);
+  // Retained, not discarded. Watson observed these; they are simply not evidence
+  // of a product defect. Keeping them auditable is what separates "correlated and
+  // explained" from "quietly dropped".
+  evidence.expectedDenialConsole = expectedConsole;
+  const errs = [...evidence.pageErrors, ...productConsole];
   if (errs.length) {
     emit('console-errors',
       `${errs.length} uncaught console error(s)/page error(s).`,
