@@ -457,13 +457,21 @@ async function cmdVerify(args) {
 
 function zeroSignals() {
   return {
-    console_errors: 0, console_warnings: 0, http_5xx: 0,
+    console_errors: 0, console_warnings: 0, expected_denial_console: 0, http_5xx: 0,
     unexpected_4xx: 0, failed_requests: 0, raw_uuid_visible: 0,
   };
 }
 
 function accumulate(sig, evidence, pageText) {
-  sig.console_errors += evidence.pageErrors.length + evidence.console.filter((c) => c.type === 'error').length;
+  // Expected-denial artifacts are counted in their OWN signal, not in
+  // console_errors. A signal that mixes "the product logged an error" with
+  // "Watson provoked a denial on purpose" measures neither.
+  const expectedDenial = evidence.expectedDenialConsole ?? [];
+  const expectedTexts = new Set(expectedDenial.map((e) => `${e.resourcePath}\u0000${e.text}`));
+  sig.expected_denial_console += expectedDenial.length;
+  sig.console_errors += evidence.pageErrors.length
+    + evidence.console.filter((c) => c.type === 'error'
+        && !expectedTexts.has(`${c.resourcePath}\u0000${c.text}`)).length;
   sig.console_warnings += evidence.console.filter((c) => c.type === 'warning').length;
   sig.http_5xx += evidence.requests.filter((r) => r.status >= 500).length;
   sig.unexpected_4xx += evidence.requests.filter((r) => r.status >= 400 && r.status < 500 && ![401, 403, 404].includes(r.status)).length;
