@@ -63,7 +63,9 @@ function renderers() {
     let status = '';
     try { status = fs.readFileSync(`/proc/${pid}/status`, 'utf8'); } catch { continue; }
     const field = (name) => (status.match(new RegExp(`^${name}:\\s*(\\S+)`, 'm')) ?? [])[1] ?? null;
-    out.push({ pid, seccomp: field('Seccomp'), noNewPrivs: field('NoNewPrivs'), uid: field('Uid') });
+    let userns = null;
+    try { userns = fs.readlinkSync(`/proc/${pid}/ns/user`); } catch { /* not permitted to read */ }
+    out.push({ pid, seccomp: field('Seccomp'), noNewPrivs: field('NoNewPrivs'), uid: field('Uid'), userns });
   }
   return out;
 }
@@ -82,6 +84,20 @@ const nnp = sandboxed.filter((r) => r.noNewPrivs === '1');
 if (!nnp.length) fail('sandboxed renderers do not report NoNewPrivs: 1');
 ok('renderers report NoNewPrivs: 1');
 
+// LAYER 1. Seccomp-bpf is the second layer; the first is the namespace sandbox,
+// which puts the renderer in its own user namespace so a compromised renderer is
+// not merely syscall-filtered but unable to see the rest of the container. They
+// fail independently, so proving one is not proving the other.
+const ownUserns = (() => { try { return fs.readlinkSync('/proc/self/ns/user'); } catch { return null; } })();
+const isolated = sandboxed.filter((r) => r.userns && ownUserns && r.userns !== ownUserns);
+if (!isolated.length) {
+  fail(
+    `no renderer is in its own user namespace (verifier ${ownUserns}, renderers ` +
+    `${sandboxed.map((r) => r.userns ?? 'unreadable').join('/')}); the layer-1 namespace sandbox is NOT engaged`,
+  );
+}
+ok(`${isolated.length}/${sandboxed.length} renderer(s) are in their own user namespace (layer-1 sandbox)`);
+
 const probe = await probeSandbox(browser);
 if (probe.available) {
   ok(`chrome://sandbox: ${probe.effective ? 'adequately sandboxed' : 'NOT adequately sandboxed'}`);
@@ -94,4 +110,4 @@ if (probe.available) {
 
 await ctx.close();
 await browser.close();
-console.log('\n  SANDBOX PROVEN: non-root browser, seccomp-bpf engaged in the renderer.\n');
+console.log('\n  SANDBOX PROVEN: non-root browser; namespace sandbox and seccomp-bpf both engaged.\n');
