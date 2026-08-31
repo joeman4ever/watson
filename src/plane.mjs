@@ -23,10 +23,15 @@
 // product's own health endpoint across the network. That asymmetry is the point.
 
 import http from 'node:http';
+import nodeUrl from 'node:url';
 import path from 'node:path';
 import fs from 'node:fs';
 
-import { runStep, launchApp, interpolate, killGroup } from './environment.mjs';
+// From the DEPENDENCY-FREE module, deliberately. The plane runs in the untrusted
+// container from a read-only mount of the engine, with no install of its own —
+// importing environment.mjs here would drag in pg, jose and Playwright and make
+// the untrusted side depend on a node_modules tree somebody has to provide.
+import { runStep, launchApp, interpolate, killGroup } from './exec.mjs';
 
 export const PLANE_PROTOCOL = 'watson-product-plane/v1';
 
@@ -234,4 +239,36 @@ export function serve({ repoRoot, logDir, port, host = '0.0.0.0' }) {
       }),
     }));
   });
+}
+
+// ---------------------------------------------------------------------------
+// Runnable directly, and that is not a convenience.
+//
+// The untrusted container starts this from a READ-ONLY mount of the engine with
+// no install of its own. Going through the full CLI would pull in Playwright,
+// pg and jose — a node_modules tree the untrusted side would have to be given,
+// and a much larger surface than "run these commands and report".
+// ---------------------------------------------------------------------------
+if (import.meta.url === nodeUrl.pathToFileURL(process.argv[1] ?? '').href) {
+  const argv = process.argv.slice(2);
+  const arg = (name, fallback) => {
+    const i = argv.indexOf(`--${name}`);
+    return i >= 0 && argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : fallback;
+  };
+  const repoRoot = path.resolve(arg('repo', '.'));
+  const logDir = path.resolve(arg('log-dir', path.join(repoRoot, '..', 'plane-logs')));
+  const { port } = await serve({ repoRoot, logDir, port: Number(arg('port', 8079)) });
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 'n/a';
+  console.log(`\nwatson product plane ${PLANE_PROTOCOL}`);
+  console.log(`  repo   ${repoRoot}`);
+  console.log(`  listen 0.0.0.0:${port}`);
+  console.log(`  uid    ${uid}`);
+  if (uid === 0) {
+    // Not fatal — a caller may have its own isolation — but say it, because a
+    // plane running as root inside its container is a weaker boundary than the
+    // one the orchestration probably believes it configured.
+    console.log('  ::warning:: the product plane is running as root');
+  }
+  console.log('');
+  await new Promise(() => {});
 }

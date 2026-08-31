@@ -144,3 +144,28 @@ describe('the product plane executes; it does not decide', () => {
     });
   });
 });
+
+describe('the plane costs the untrusted side nothing to start', () => {
+  // A regression guard with real consequences. The product container runs the
+  // plane from a READ-ONLY engine mount with no install of its own. One
+  // third-party import here turns that into "the untrusted side needs a
+  // node_modules tree", which means somebody has to provide and maintain a
+  // writable dependency surface on the wrong side of the boundary.
+  const IMPORT_RE = /^\s*import\s+(?:[^'"]*?\sfrom\s+)?['"]([^'"]+)['"]/gm;
+
+  for (const file of ['../src/plane.mjs', '../src/exec.mjs']) {
+    test(`${file} imports only node built-ins and engine-local modules`, () => {
+      const src = fs.readFileSync(new URL(file, import.meta.url), 'utf8');
+      const specifiers = [...src.matchAll(IMPORT_RE)].map((m) => m[1]);
+      assert.ok(specifiers.length > 0, 'no imports found — the regex is probably wrong');
+      const foreign = specifiers.filter((sp) => !sp.startsWith('node:') && !sp.startsWith('./'));
+      assert.deepEqual(foreign, [], `third-party imports reached the untrusted plane: ${foreign.join(', ')}`);
+    });
+  }
+
+  test('exec.mjs, which the plane pulls in, is itself built-ins only', () => {
+    const src = fs.readFileSync(new URL('../src/exec.mjs', import.meta.url), 'utf8');
+    const specifiers = [...src.matchAll(IMPORT_RE)].map((m) => m[1]);
+    assert.deepEqual(specifiers.filter((sp) => !sp.startsWith('node:')), []);
+  });
+});
