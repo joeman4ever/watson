@@ -60,6 +60,30 @@ jobs:
         with:
           persist-credentials: false
 
+      # Diagnostic, printed before the proof so one CI round answers "which knob".
+      # Chromium's layer-1 sandbox needs to create an unprivileged user namespace;
+      # several container and host settings can block that, and guessing which
+      # one wastes rounds.
+      - name: Which container settings permit an unprivileged user namespace?
+        continue-on-error: true
+        env:
+          VERIFIER_IMAGE: node:22-bookworm@sha256:8a34c4ab3ea2c5cd194f07e317b2a8f09461d3c8b05c4e34c8ccd56d56024c4d
+        run: |
+          set -uo pipefail
+          echo "host: apparmor_restrict_unprivileged_userns = $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo '(absent)')"
+          echo "host: max_user_namespaces               = $(cat /proc/sys/user/max_user_namespaces 2>/dev/null || echo '(absent)')"
+          probe() {
+            label="$1"; shift
+            out=$(docker run --rm "$@" "$VERIFIER_IMAGE" \
+              bash -c 'unshare --user --map-root-user true 2>&1 && echo CREATED' 2>&1 || true)
+            printf '%-40s %s\n' "$label" "$(echo "$out" | tail -1)"
+          }
+          probe "default"                         --security-opt no-new-privileges --cap-drop=NET_RAW
+          probe "apparmor=unconfined"             --security-opt no-new-privileges --security-opt apparmor=unconfined --cap-drop=NET_RAW
+          probe "seccomp=unconfined"              --security-opt no-new-privileges --security-opt seccomp=unconfined --cap-drop=NET_RAW
+          probe "no no-new-privileges"            --cap-drop=NET_RAW
+          probe "cap SYS_ADMIN"                   --security-opt no-new-privileges --cap-add=SYS_ADMIN
+
       - name: Prove the sandbox engages for an unprivileged verifier
         env:
           # The verifier image, pinned by digest exactly as the observer pins it.
