@@ -133,15 +133,30 @@ export function buildEnvelope(run) {
       database: run.dbName,
       fixture_profile: run.fixtureProfile,
       node: process.version,
-      admin_mfa_enforced: false,
+
+      // Everything under this key describes WATSON'S OWN synthetic verification
+      // environment, never the product's production posture. It was previously a
+      // bare `admin_mfa_enforced: false` sitting beside the environment fields,
+      // which read out of context as a claim that the product does not enforce
+      // admin MFA. It never meant that. Nesting it makes the subject explicit
+      // rather than inferable from surrounding keys.
+      verification_environment: {
+        admin_mfa_enforced: false,
+      },
+
       // Stated in every result, not buried in docs: a verifier silent about its
       // blind spots invites people to assume it has none.
+      //
+      // Deliberately generic. The engine's semantics do not depend on which
+      // identity provider a product uses, so naming one would couple this
+      // engine to a particular deployment without making the statement any
+      // truer. A product contract can be specific where specificity helps.
       not_proven_by_this_run: [
-        'WorkOS hosted login',
-        'Magic Auth delivery',
+        'hosted identity-provider login',
+        'passwordless / magic-link-or-code delivery',
         'cookie/session lifetime',
         'session sealing and rotation',
-        'Admin-MFA step-up',
+        'step-up MFA',
       ],
       auth_seam: 'bearer-local-jwks',
     },

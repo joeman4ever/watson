@@ -233,30 +233,36 @@ describe('controlled case 5 — absent diff information never yields a skip', ()
   });
 });
 
-describe('controlled case 6 — nsc-eval#448, the real diff', () => {
-  // The regression this exists to prevent: #448 is 3 ADR/doc files plus a
-  // migration plus a test. A selector that weighed "mostly docs" would skip a
-  // change that rewrites foreign keys on every evaluation table. The correct
-  // answer is NOT NOT_APPLICABLE, and this asserts that directly rather than
-  // asserting whichever answer the implementation happens to give.
-  const PR_448 = [
-    'docs/adr/ADR-013-evaluation-domain-persistence-model.md',
-    'docs/adr/ADR-040-owner-privacy-readiness-decisions.md',
-    'docs/adr/ADR-041-least-privilege-erasure-authority.md',
-    'server/migrations/0023_erasure_authority.sql',
-    'server/src/__tests__/erasureAuthority.integration.test.ts',
+describe('controlled case 6 — the docs-heavy security migration', () => {
+  // Modelled on a real observed pull request, with synthetic filenames: three
+  // governing documents, one schema migration, one unmapped runtime test.
+  //
+  // The regression this exists to prevent: a selector that weighed "mostly
+  // docs" — 3 of 5 paths — would skip a change that rewires foreign keys across
+  // the persistence layer. The correct answer is NOT NOT_APPLICABLE, and the
+  // cases below assert that directly rather than asserting whichever answer the
+  // implementation happens to give.
+  //
+  // The shape is what carries the test; the real filenames added nothing to it,
+  // so they are not reproduced here.
+  const DOCS_HEAVY_MIGRATION = [
+    'docs/adr/ADR-101-persistence-model.md',
+    'docs/adr/ADR-102-privacy-readiness.md',
+    'docs/adr/ADR-103-security-boundary.md',
+    'server/migrations/0099_security_boundary.sql',
+    'server/src/__tests__/securityBoundary.integration.test.ts',
   ];
 
   test('is applicable — a schema migration is never skippable', () => {
-    const r = selectByImpact({ features: FEATURES, profile: 'poc', rules: RULES, changedPaths: PR_448 });
-    assert.equal(r.applicable, true, 'PR #448 must not be classified NOT_APPLICABLE');
+    const r = selectByImpact({ features: FEATURES, profile: 'poc', rules: RULES, changedPaths: DOCS_HEAVY_MIGRATION });
+    assert.equal(r.applicable, true, 'a docs-heavy security migration must not be classified NOT_APPLICABLE');
     assert.equal(r.escalated, true);
   });
 
   test('names the migration as the escalating path', () => {
-    const r = selectByImpact({ features: FEATURES, profile: 'poc', rules: RULES, changedPaths: PR_448 });
+    const r = selectByImpact({ features: FEATURES, profile: 'poc', rules: RULES, changedPaths: DOCS_HEAVY_MIGRATION });
     assert.ok(
-      r.escalation_reasons.some((x) => x.includes('0023_erasure_authority.sql')),
+      r.escalation_reasons.some((x) => x.includes('0099_security_boundary.sql')),
       `expected the migration to be named; got ${JSON.stringify(r.escalation_reasons)}`,
     );
   });
@@ -265,7 +271,7 @@ describe('controlled case 6 — nsc-eval#448, the real diff', () => {
     // Guards against someone later "fixing" this by special-casing migrations.
     const r = selectByImpact({
       features: FEATURES, profile: 'poc', rules: RULES,
-      changedPaths: PR_448.filter((p) => !p.startsWith('server/migrations/')),
+      changedPaths: DOCS_HEAVY_MIGRATION.filter((p) => !p.startsWith('server/migrations/')),
     });
     assert.equal(r.applicable, true);
   });
