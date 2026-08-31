@@ -39,7 +39,19 @@ export function browserSandbox() {
   return !(typeof process.getuid === 'function' && process.getuid() === 0);
 }
 
-export async function launchBrowser({ executablePath, cdpPort, headless = true, channel } = {}) {
+/**
+ * Chromium proper, not the headless shell.
+ *
+ * Playwright's default headless mode runs `chromium_headless_shell`, a separate
+ * binary. Measured on GitHub's runners, the two do not report the same sandbox
+ * state: full Chromium answers `chrome://sandbox` with "adequately sandboxed"
+ * and the headless shell does not answer at all. Watson cannot prove a property
+ * of a build that will not report it, and an unprovable sandbox is not one this
+ * design gets to claim — so it drives the build that reports.
+ */
+export const BROWSER_CHANNEL = 'chromium';
+
+export async function launchBrowser({ executablePath, cdpPort, headless = true, channel = BROWSER_CHANNEL } = {}) {
   if (!browserSandbox()) {
     throw new Error(
       'refusing to launch the browser as root: Chromium cannot enable its sandbox as root, and the ' +
@@ -50,9 +62,8 @@ export async function launchBrowser({ executablePath, cdpPort, headless = true, 
   return chromium.launch({
     executablePath,
     headless,
-    // Playwright's default headless mode runs the Chromium HEADLESS SHELL, a
-    // different binary from Chromium proper. `channel` selects explicitly, so a
-    // caller that needs to know WHICH build it measured can say so.
+    // Explicit, so a caller that needs to know WHICH build it measured can say
+    // so — and so nothing silently falls back to the headless shell.
     ...(channel ? { channel } : {}),
     args: [
       `--remote-debugging-port=${cdpPort}`,

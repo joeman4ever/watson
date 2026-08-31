@@ -281,6 +281,14 @@ describe('the browser is part of the verifier, not a lesser concern', () => {
     );
   });
 
+  test('the engine drives the build whose sandbox it can prove', async () => {
+    // Playwright's default headless mode runs a different binary that does not
+    // report its sandbox state. An unprovable sandbox is not one this design
+    // gets to claim, so the channel is explicit rather than defaulted.
+    const { BROWSER_CHANNEL } = await import('../src/driver.mjs');
+    assert.equal(BROWSER_CHANNEL, 'chromium');
+  });
+
   test('`--no-sandbox` does not appear anywhere in the driver', () => {
     // A grep, deliberately. The flag is one edit away from coming back for a
     // plausible-sounding reason, and this is the cheapest thing that notices.

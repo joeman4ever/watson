@@ -18,7 +18,7 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import url from 'node:url';
-import { isAuthorized as isAuthorizedStatus, browserSandbox } from './driver.mjs';
+import { isAuthorized as isAuthorizedStatus, browserSandbox, BROWSER_CHANNEL } from './driver.mjs';
 // Re-exported rather than redefined: product-command execution lives in a
 // dependency-free module so the product plane can run it from a read-only
 // engine mount without installing anything.
@@ -159,6 +159,7 @@ export function executionProvenance(policy = productExecution()) {
     // assessing an unexpected verdict deserves to know which protections the run
     // actually had. See `browserSandbox()` for why root implies false.
     browser_sandbox: browserSandbox(),
+    browser_channel: BROWSER_CHANNEL,
     database_server_version: null,
     // The security-relevant half: whether product-authored commands actually ran
     // as a different, unprivileged user, or as the verifier itself. A result that

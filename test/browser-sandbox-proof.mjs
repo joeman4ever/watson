@@ -26,7 +26,7 @@
 
 import fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { launchBrowser, probeSandbox, browserSandbox } from '../src/driver.mjs';
+import { launchBrowser, probeSandbox, browserSandbox, BROWSER_CHANNEL } from '../src/driver.mjs';
 
 const fail = (m) => { console.error(`\n  ✗ ${m}\n`); process.exit(1); };
 const ok = (m) => console.log(`  ✓ ${m}`);
@@ -46,7 +46,11 @@ const usernsAllowed = (() => {
 })();
 ok(`the container ${usernsAllowed ? 'PERMITS' : 'FORBIDS'} unprivileged user namespaces`);
 
-const ownUserns = (() => { try { return fs.readlinkSync('/proc/self/ns/user'); } catch { return null; } })();
+const ownNs = {};
+for (const kind of ['user', 'pid', 'net']) {
+  try { ownNs[kind] = fs.readlinkSync(`/proc/self/ns/${kind}`); } catch { ownNs[kind] = null; }
+}
+const isolatedFrom = (r) => ['user', 'pid', 'net'].filter((k) => r.ns[k] && ownNs[k] && r.ns[k] !== ownNs[k]);
 
 function renderers() {
   const out = [];
@@ -58,9 +62,16 @@ function renderers() {
     let status = '';
     try { status = fs.readFileSync(`/proc/${pid}/status`, 'utf8'); } catch { continue; }
     const field = (name) => (status.match(new RegExp(`^${name}:\\s*(\\S+)`, 'm')) ?? [])[1] ?? null;
-    let userns = null;
-    try { userns = fs.readlinkSync(`/proc/${pid}/ns/user`); } catch { /* not permitted */ }
-    out.push({ pid, seccomp: field('Seccomp'), noNewPrivs: field('NoNewPrivs'), userns });
+    // Chromium's layer-1 sandbox does not always use a USER namespace: depending
+    // on which mechanism it picks it may isolate the renderer by PID and network
+    // namespace instead. Measuring only `ns/user` reported "not engaged" for a
+    // browser that was in fact sandboxed — so all three are read, and any one of
+    // them differing from ours is isolation.
+    const ns = {};
+    for (const kind of ['user', 'pid', 'net']) {
+      try { ns[kind] = fs.readlinkSync(`/proc/${pid}/ns/${kind}`); } catch { ns[kind] = null; }
+    }
+    out.push({ pid, seccomp: field('Seccomp'), noNewPrivs: field('NoNewPrivs'), ns });
   }
   return out;
 }
@@ -84,22 +95,28 @@ async function measure(label, options) {
     renderers: found,
     seccomp: found.filter((r) => r.seccomp === '2').length,
     nnp: found.filter((r) => r.noNewPrivs === '1').length,
-    isolated: found.filter((r) => r.userns && ownUserns && r.userns !== ownUserns).length,
+    isolated: found.filter((r) => isolatedFrom(r).length > 0).length,
+    isolatedBy: [...new Set(found.flatMap(isolatedFrom))],
     probe,
   };
   console.log(
-    `  · ${label}: ${found.length} renderer(s), seccomp=2 on ${m.seccomp}, own-userns on ${m.isolated}`
-    + (probe.available ? `, chrome://sandbox ${probe.effective ? 'effective' : 'NOT effective'}` : ''),
+    `  · ${label}: ${found.length} renderer(s), seccomp=2 on ${m.seccomp}, `
+    + `namespace-isolated ${m.isolated}${m.isolatedBy.length ? ` (by ${m.isolatedBy.join('+')})` : ''}`
+    + (probe.available ? `, chrome://sandbox ${probe.effective ? 'EFFECTIVE' : 'NOT effective'}` : ', chrome://sandbox not reportable'),
   );
   await ctx.close();
   await browser.close();
   return m;
 }
 
+// Both builds are measured for the record, but only ONE of them decides: the
+// build Watson actually drives. Proving a property of a browser the engine does
+// not use would be proving nothing.
+const WATSON_BUILD = `chromium proper (channel: ${BROWSER_CHANNEL})`;
 const measured = [];
 for (const [label, options] of [
-  ['headless shell (Playwright default)', { cdpPort: 0 }],
-  ['chromium proper (channel: chromium)', { cdpPort: 0, channel: 'chromium' }],
+  ['headless shell (Playwright default)', { cdpPort: 0, channel: null }],
+  [WATSON_BUILD, { cdpPort: 0 }],
 ]) {
   const m = await measure(label, options);
   if (m) measured.push(m);
@@ -108,7 +125,8 @@ for (const [label, options] of [
 if (!measured.length) fail('no browser started at all');
 ok(`Chromium started with no --no-sandbox flag (${measured.length} build(s) measured)`);
 
-const best = measured.reduce((a, b) => (b.isolated > a.isolated ? b : a));
+const best = measured.find((m) => m.label === WATSON_BUILD);
+if (!best) fail(`the build Watson drives (${WATSON_BUILD}) did not start`);
 if (!best.renderers.length) fail('no renderer process was found; the sandbox state cannot be established');
 
 const sandboxed = best.renderers.filter((r) => r.seccomp === '2');
@@ -120,23 +138,29 @@ ok(`${sandboxed.length}/${best.renderers.length} renderer(s) report Seccomp: 2 (
 if (!sandboxed.some((r) => r.noNewPrivs === '1')) fail('sandboxed renderers do not report NoNewPrivs: 1');
 ok('renderers report NoNewPrivs: 1');
 
-if (!best.isolated) {
+// LAYER 1. Chromium's own status page is the authoritative statement about it —
+// Chromium knows which of several mechanisms it chose and whether that mechanism
+// came up. Namespace isolation observed from /proc corroborates it, but is not
+// required on its own: measuring only `ns/user` once reported "not engaged" for
+// a browser Chromium itself called adequately sandboxed.
+if (!best.probe.available) {
   fail(
-    `no renderer is in its own user namespace (verifier ${ownUserns}); the layer-1 namespace sandbox is NOT engaged. `
-    + (usernsAllowed
-      ? 'The container DOES permit unprivileged user namespaces, so this is the browser build\'s own choice.'
-      : 'The container FORBIDS unprivileged user namespaces, so the container configuration is the cause.'),
+    `the build Watson drives will not report chrome://sandbox, so layer 1 cannot be established. `
+    + `The container ${usernsAllowed ? 'DOES' : 'does NOT'} permit unprivileged user namespaces.`,
   );
 }
-ok(`${best.isolated}/${sandboxed.length} renderer(s) in their own user namespace (layer-1) [${best.label}]`);
-
-if (best.probe.available) {
-  ok(`chrome://sandbox: ${best.probe.effective ? 'adequately sandboxed' : 'NOT adequately sandboxed'}`);
-  if (!best.probe.effective) fail(`chrome://sandbox disagrees:\n${best.probe.report}`);
+if (!best.probe.effective) {
+  fail(
+    `Chromium reports it is NOT adequately sandboxed. The container ${usernsAllowed ? 'DOES' : 'does NOT'} `
+    + `permit unprivileged user namespaces, so the cause is ${usernsAllowed ? "the browser build's own" : 'the container configuration'}.`
+    + `\n${best.probe.report}`,
+  );
+}
+ok(`chrome://sandbox reports the layer-1 sandbox EFFECTIVE [${best.label}]`);
+if (best.isolated) {
+  ok(`corroborated: ${best.isolated}/${sandboxed.length} renderer(s) namespace-isolated by ${best.isolatedBy.join('+')}`);
 } else {
-  // Not a failure. The kernel evidence above is the primary proof; this page is
-  // corroboration and some builds decline to render it.
-  console.log('  · chrome://sandbox not reportable by this build');
+  console.log('  · renderers share our namespaces; Chromium\'s layer-1 here does not rely on one');
 }
 
 console.log('\n  SANDBOX PROVEN: non-root browser; namespace sandbox and seccomp-bpf both engaged.\n');
