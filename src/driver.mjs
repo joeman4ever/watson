@@ -18,7 +18,28 @@ import path from 'node:path';
 
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
+/**
+ * True when this process is root, in which case Chromium will not start with its
+ * own sandbox and must be told so explicitly.
+ *
+ * This is a REAL, RECORDED trade-off, not a workaround. Watson runs as root only
+ * where it has to drop privilege to run product code as a different user — and
+ * dropping privilege is what stops the product forging the verdict. Chromium's
+ * sandbox protects the browser process from a hostile PAGE; privilege separation
+ * protects the EVIDENCE from hostile product code. When the two cannot both be
+ * had in one process tree, the evidence wins: forging a verdict by writing a file
+ * is a one-line attack, and reaching the browser process from a page requires a
+ * Chromium exploit.
+ *
+ * `browserSandbox()` exists so the result can say which one this run had, rather
+ * than leaving a reader to infer it.
+ */
+export function browserSandbox() {
+  return !(typeof process.getuid === 'function' && process.getuid() === 0);
+}
+
 export async function launchBrowser({ executablePath, cdpPort, headless = true }) {
+  const sandboxed = browserSandbox();
   return chromium.launch({
     executablePath,
     headless,
@@ -26,6 +47,9 @@ export async function launchBrowser({ executablePath, cdpPort, headless = true }
       `--remote-debugging-port=${cdpPort}`,
       '--remote-debugging-address=127.0.0.1',
       '--disable-extensions',
+      // Chromium refuses to start as root with its sandbox enabled. Without this
+      // the run would not fail with a verdict, it would fail to start at all.
+      ...(sandboxed ? [] : ['--no-sandbox']),
     ],
   });
 }

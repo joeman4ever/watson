@@ -26,6 +26,7 @@ import { buildEnvelope, downgradeForInexactHead, writeResult } from '../src/resu
 import {
   scrubEnv, SCRUBBED_ENV_KEYS, productExecution, resetProductExecution, runStep,
 } from '../src/environment.mjs';
+import { browserSandbox } from '../src/driver.mjs';
 
 const IS_ROOT = typeof process.getuid === 'function' && process.getuid() === 0;
 const HAS_SETPRIV = (() => {
@@ -253,5 +254,15 @@ describe('a product command cannot forge, overwrite, or reach the evidence', () 
     assert.equal(fs.readFileSync(path.join(engine, 'result.mjs'), 'utf8'), 'export const REAL = true;\n');
 
     resetProductExecution();
+  });
+});
+
+describe('the run says which protections it actually had', () => {
+  test('browser sandbox state follows the uid, and is reported rather than assumed', () => {
+    // Chromium will not start as root with its sandbox on. Watson is root only
+    // where it must drop privilege to run product code as another user, so the
+    // two protections trade against each other and the result must say which one
+    // this run had — not leave a reader to guess from the environment.
+    assert.equal(browserSandbox(), !IS_ROOT);
   });
 });

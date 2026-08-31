@@ -19,7 +19,7 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import url from 'node:url';
-import { isAuthorized as isAuthorizedStatus } from './driver.mjs';
+import { isAuthorized as isAuthorizedStatus, browserSandbox } from './driver.mjs';
 import pg from 'pg';
 import { generateKeyPair, exportJWK, SignJWT } from 'jose';
 import http from 'node:http';
@@ -303,6 +303,10 @@ export function executionProvenance(policy = productExecution()) {
     platform: `${process.platform}/${process.arch}`,
     os_release: os.release(),
     playwright,
+    // Recorded because it varies with HOW Watson was deployed, and a reader
+    // assessing an unexpected verdict deserves to know which protections the run
+    // actually had. See `browserSandbox()` for why root implies false.
+    browser_sandbox: browserSandbox(),
     database_server_version: null,
     // The security-relevant half: whether product-authored commands actually ran
     // as a different, unprivileged user, or as the verifier itself. A result that
