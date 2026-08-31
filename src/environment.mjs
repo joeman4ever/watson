@@ -431,7 +431,14 @@ export async function reap({ adminUrl, prefix = 'watson_', maxAgeHours = 2, now 
  * verified. Named generically for the same reason as the result envelope: the
  * engine's semantics do not depend on which identity provider a product uses.
  */
-export async function startIdentityService({ issuer, clientId, identities }) {
+export async function startIdentityService({
+  issuer, clientId, identities,
+  // Loopback by default: in a single-process run nothing else should be able to
+  // reach the JWKS. When the product runs in a separate container it must, so
+  // the caller widens the bind and says which name to advertise. The SIGNING KEY
+  // never leaves this process either way — only the public JWK is served.
+  bindHost = '127.0.0.1', advertiseHost = '127.0.0.1',
+} = {}) {
   const { publicKey, privateKey } = await generateKeyPair('RS256', { extractable: true });
   const jwk = { ...(await exportJWK(publicKey)), kid: JWKS_KID, alg: 'RS256', use: 'sig' };
 
@@ -444,7 +451,7 @@ export async function startIdentityService({ issuer, clientId, identities }) {
       res.end();
     }
   });
-  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  await new Promise((r) => server.listen(0, bindHost, r));
   const port = server.address().port;
 
   const mint = (subject) =>
@@ -462,7 +469,7 @@ export async function startIdentityService({ issuer, clientId, identities }) {
   }
 
   return {
-    jwksUri: `http://127.0.0.1:${port}/jwks.json`,
+    jwksUri: `http://${advertiseHost}:${port}/jwks.json`,
     issuer,
     clientId,
     tokens,

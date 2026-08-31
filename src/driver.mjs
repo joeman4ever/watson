@@ -19,27 +19,34 @@ import path from 'node:path';
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
 /**
- * True when this process is root, in which case Chromium will not start with its
- * own sandbox and must be told so explicitly.
+ * The browser is part of the verifier, and the pages it loads come from the
+ * thing under verification.
  *
- * This is a REAL, RECORDED trade-off, not a workaround. Watson runs as root only
- * where it has to drop privilege to run product code as a different user — and
- * dropping privilege is what stops the product forging the verdict. Chromium's
- * sandbox protects the browser process from a hostile PAGE; privilege separation
- * protects the EVIDENCE from hostile product code. When the two cannot both be
- * had in one process tree, the evidence wins: forging a verdict by writing a file
- * is a one-line attack, and reaching the browser process from a page requires a
- * Chromium exploit.
+ * That single sentence decides this whole function. Under the threat model
+ * Watson operates in, the product controls the HTML and JavaScript Chromium
+ * executes, so an unsandboxed browser is a hole in the same boundary that
+ * protects the evidence — not a separate, lesser concern about the browser.
  *
- * `browserSandbox()` exists so the result can say which one this run had, rather
- * than leaving a reader to infer it.
+ * Chromium refuses to start as root with its sandbox enabled. The response is
+ * NOT to pass `--no-sandbox`: it is to refuse to be root. Watson's product
+ * execution lives in its own container with its own unprivileged user, so the
+ * verifier never needs root to do its own job.
+ *
+ * `--no-sandbox` is deliberately absent from this file. If it is ever needed
+ * again, it needs a decision record, not a flag.
  */
 export function browserSandbox() {
   return !(typeof process.getuid === 'function' && process.getuid() === 0);
 }
 
 export async function launchBrowser({ executablePath, cdpPort, headless = true }) {
-  const sandboxed = browserSandbox();
+  if (!browserSandbox()) {
+    throw new Error(
+      'refusing to launch the browser as root: Chromium cannot enable its sandbox as root, and the ' +
+        'pages it loads are served by the product under verification. Run the verifier as an ' +
+        'unprivileged user; product execution belongs in its own container, not in this process tree.',
+    );
+  }
   return chromium.launch({
     executablePath,
     headless,
@@ -47,11 +54,38 @@ export async function launchBrowser({ executablePath, cdpPort, headless = true }
       `--remote-debugging-port=${cdpPort}`,
       '--remote-debugging-address=127.0.0.1',
       '--disable-extensions',
-      // Chromium refuses to start as root with its sandbox enabled. Without this
-      // the run would not fail with a verdict, it would fail to start at all.
-      ...(sandboxed ? [] : ['--no-sandbox']),
     ],
   });
+}
+
+/**
+ * Ask Chromium what its own sandbox is doing, rather than inferring it from the
+ * absence of a flag.
+ *
+ * `chrome://sandbox` is Chromium's own status page; on Linux it reports the
+ * namespace and seccomp-bpf sandboxes and whether the layer-1 sandbox is
+ * effective. Best-effort: a Chromium build or headless mode that will not render
+ * it returns `available: false`, and the caller records that rather than
+ * inventing a claim. What the caller must NOT do is treat "no flag" as proof.
+ */
+export async function probeSandbox(browser) {
+  let ctx;
+  try {
+    ctx = await browser.newContext();
+    const page = await ctx.newPage();
+    await page.goto('chrome://sandbox', { timeout: 10_000 });
+    const text = (await page.evaluate(() => document.body.innerText)).trim();
+    return {
+      available: true,
+      // Chromium prints "You are adequately sandboxed." when layer 1 is effective.
+      effective: /adequately sandboxed/i.test(text),
+      report: text.slice(0, 2000),
+    };
+  } catch (err) {
+    return { available: false, effective: null, report: String(err.message ?? err).slice(0, 300) };
+  } finally {
+    await ctx?.close().catch(() => {});
+  }
 }
 
 /** An authenticated context + page, with always-on evidence collectors. */

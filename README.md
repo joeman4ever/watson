@@ -148,40 +148,88 @@ concerned, so the engine assumes it may be hostile and holds one invariant:
 > **The thing being verified must not be able to alter the verifier, the
 > orchestration that invokes it, or the evidence accepted as its result.**
 
-Three mechanisms, none of which is "put the files in different directories":
+### Two planes
 
-**Privilege separation (opt-in, fail-closed).** Set `WATSON_PRODUCT_UID`,
-`WATSON_PRODUCT_GID` and `WATSON_PRODUCT_HOME` and every product-authored
-command runs as that unprivileged user via `setpriv` — invoked with an argv
-array, so the product's command string is never interpolated into another shell.
-Point the engine's evidence directory somewhere that uid cannot write and the
-product cannot forge a result, overwrite one, or plant a newer file for a
-mtime-ordered harness to pick up. If separation is requested and cannot be
-established — not root, no `setpriv`, incomplete configuration — the run
-**refuses**. It never falls back to running product code with the verifier's own
-privileges, because a security property believed to hold and silently absent is
-worse than one that was never claimed.
+```text
+VERIFIER PLANE                          PRODUCT PLANE
+  engine, contract, selection             the exact PR checkout
+  database provisioning + marker          npm install / build / start
+  identity: signing key, JWKS             the fixture seed
+  Playwright + SANDBOXED Chromium
+  the evidence directory                  runs unprivileged
+  runs unprivileged                       holds no credential
+                    │                              │
+                    └──── isolated network ────────┘
+                          HTTP only, verifier → product
+```
 
-**Environment scrubbing.** A named set of variables is removed before the
-product's environment is handed over: CI bearer tokens
-(`ACTIONS_RUNTIME_TOKEN`, `GITHUB_TOKEN`, …) and, just as important, the runner's
-*command channels* — `GITHUB_ENV`, `GITHUB_PATH`, `GITHUB_OUTPUT`,
-`GITHUB_STATE`. Those name files the runner reads back after a step, so anything
-able to append to them can inject environment variables and PATH entries into the
-trusted side that follows.
+`watson verify --plane <url> --product-base-url <url>` splits them; without those
+flags everything runs in one process, which is right for local development —
+there is no boundary to enforce between you and your own code.
 
-**Positive HEAD identity.** The exact-HEAD gate asserts that `HEAD` *is* the SHA
-the run reports, not merely that the tree is clean. Cleanliness alone is forgeable
-in one command: modify the product, commit the modification, and `git status` is
-clean again at a commit nobody reviewed.
+The division of labour is the security property. **The verifier decides:** it
+reads the contract, provisions and stamps the database, mints the identity,
+chooses the port, resolves every command and environment variable, and confirms
+readiness itself by polling the product's own health endpoint. **The product
+plane executes:** it runs what it is handed and answers with what came back.
 
-`test/isolation.test.mjs` is the negative control for all three. Where a control
-needs real privilege separation and cannot have it (no root), it asserts the
-fail-closed contract instead and says so in its own name — it never silently
-skips, because a green tick on a security test that did nothing is read as proof.
+Nothing the plane says is trusted, and it has no endpoint that reports readiness
+— deliberately, and there is a test for it. A plane allowed to decide one small
+thing is a plane the product can use to make the verifier agree with it.
 
-Local development sets none of this, and should not: there is no boundary to
-enforce between you and your own code.
+### The browser is part of the verifier
+
+The pages Chromium loads are served by the product under verification, so an
+unsandboxed browser is a hole in the same boundary that protects the evidence.
+Chromium refuses to start as root with its sandbox on; the response is to refuse
+to be root, never to pass `--no-sandbox`. `launchBrowser` throws as root, the
+flag appears nowhere in `src/`, and a test greps for it.
+
+`test/browser-sandbox-proof.mjs` proves the sandbox rather than asserting it: it
+launches the real browser as an unprivileged user in the pinned container image
+and reads the kernel's account of the renderer processes Chromium forked —
+`Seccomp: 2` (seccomp-bpf filter mode) and `NoNewPrivs: 1` in
+`/proc/<pid>/status`, corroborated by `chrome://sandbox` where the build renders
+it. CI runs it on every change. If an image or runner cannot give us a sandboxed
+non-root browser, the right outcome is a red build and a conversation, not a
+quietly weakened threat model.
+
+### Within one process, when that is what you have
+
+Where a container boundary is not available, the same protection is approximated
+by uid separation: `WATSON_PRODUCT_UID` / `_GID` / `_HOME` run every
+product-authored command as an unprivileged user via `setpriv` — invoked with an
+argv array, so the product's command string is never interpolated into another
+shell. Requested-but-unavailable **refuses**; it never falls back to running
+product code with the verifier's own privileges, because a security property
+believed to hold and silently absent is worse than one never claimed.
+
+This is weaker than two planes and is not what CI uses: it shares a process tree
+with the browser.
+
+### Environment scrubbing
+
+A named set of variables is removed before the product's environment is handed
+over: CI bearer tokens (`ACTIONS_RUNTIME_TOKEN`, `GITHUB_TOKEN`, …) and, just as
+important, the runner's *command channels* — `GITHUB_ENV`, `GITHUB_PATH`,
+`GITHUB_OUTPUT`, `GITHUB_STATE`. Those name files the runner reads back after a
+step, so anything able to append to them can inject environment variables and
+PATH entries into the trusted side that follows. Across a plane boundary the
+verifier's environment is not sent at all.
+
+### Positive HEAD identity
+
+The exact-HEAD gate asserts that `HEAD` *is* the SHA the run reports, not merely
+that the tree is clean. Cleanliness alone is forgeable in one command: modify the
+product, commit the modification, and `git status` is clean again at a commit
+nobody reviewed.
+
+### The controls
+
+`test/isolation.test.mjs` and `test/plane.test.mjs`. Where a control needs real
+privilege separation and cannot have it (no root), it asserts the fail-closed
+contract instead and says so **in its own name** — it never silently skips,
+because a green tick on a security test that did nothing is read as proof.
 
 ## Deliberately not built yet
 

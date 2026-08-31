@@ -20,6 +20,7 @@ import { productFingerprint, contractFingerprint, resolveSha, contractChange, wo
 import { selectByImpact } from './selection.mjs';
 import * as env from './environment.mjs';
 import * as drive from './driver.mjs';
+import * as plane from './plane.mjs';
 import { evaluate, featureVerdict } from './checks.mjs';
 import { buildEnvelope, rollUp, writeResult, summary, downgradeForInexactHead } from './result.mjs';
 
@@ -42,6 +43,61 @@ function parseArgs(argv) {
 
 const log = (...a) => console.log(...a);
 const step = (m) => console.log(`  · ${m}`);
+
+/**
+ * The environment the product is launched with.
+ *
+ * `inherit` decides whether the verifier's own environment is passed through.
+ * In a single-process run it is, because the product legitimately needs the
+ * developer's PATH and toolchain. Across a plane boundary it is NOT: sending the
+ * verifier's environment over the network to the untrusted side would hand the
+ * product every variable the verifier happens to hold, which is the opposite of
+ * what the boundary is for. The product plane merges what it receives into its
+ * OWN environment, where the product's toolchain already lives.
+ */
+function buildAppEnv({ cfg, runId, databaseUrl, appPort, baseUrl, identity, inherit }) {
+  const appEnv = {
+    ...(inherit ? process.env : {}),
+    DATABASE_URL: databaseUrl,
+    PORT: String(appPort),
+    WORKOS_ISSUER: identity.issuer,
+    WORKOS_CLIENT_ID: identity.clientId,
+    WORKOS_JWKS_URI: identity.jwksUri,
+    WORKOS_REDIRECT_URI: `${baseUrl}/auth/callback`,
+    SESSION_SEALING_KEY_CURRENT: 'w'.repeat(48),
+    WORKOS_API_KEY: 'sk_watson_local_placeholder_not_a_real_key',
+  };
+
+  // The contract's `env` may reference run-scoped values the engine owns, as
+  // ${WATSON_*} placeholders. Substitute them and FAIL CLOSED on any that is
+  // left unresolved: launching a half-configured application would let the
+  // identity seam fall back to an ambient key source or stay unmounted, and the
+  // run would then "verify" an app whose guarded routes never mounted.
+  const injected = {
+    WATSON_JWKS_URI: identity.jwksUri,
+    WATSON_BASE_URL: baseUrl,
+    WATSON_DATABASE_URL: databaseUrl,
+    WATSON_PORT: String(appPort),
+    WATSON_RUN_ID: runId,
+  };
+  for (const [key, raw] of Object.entries(cfg.env ?? {})) {
+    // Deliberately NOT the general interpolate(): that substitutes an unknown
+    // name with an empty string, which here would hand the application an empty
+    // WORKOS_JWKS_URI. The identity seam would then read as "not configured",
+    // the guarded routes would never mount, and the run would fail much later
+    // with an unrelated-looking error. Resolve explicitly and throw on a miss.
+    appEnv[key] = String(raw).replace(/\$\{(WATSON_\w+)\}/g, (_, name) => {
+      if (!(name in injected)) {
+        throw new Error(
+          `.watson/config.yaml env.${key} references \${${name}}, which the engine does not supply. ` +
+            `Known injected values: ${Object.keys(injected).join(', ')}.`,
+        );
+      }
+      return injected[name];
+    });
+  }
+  return appEnv;
+}
 
 /** Bring the product up exactly as Watson will drive it. Returns a handle whose
  *  `teardown()` kills only what we started, by process group. */
@@ -110,46 +166,12 @@ async function bringUp({ repoRoot, contract, runDir, runId, adminUrl, policy }) 
     step(`local JWKS on ${started.identity.jwksUri}`);
 
     // 3. LAUNCH ----------------------------------------------------------------
-    const appEnv = {
-      ...process.env,
-      DATABASE_URL: databaseUrl,
-      PORT: String(appPort),
-      WORKOS_ISSUER: issuer,
-      WORKOS_CLIENT_ID: clientId,
-      WORKOS_JWKS_URI: started.identity.jwksUri,
-      WORKOS_REDIRECT_URI: `http://127.0.0.1:${appPort}/auth/callback`,
-      SESSION_SEALING_KEY_CURRENT: 'w'.repeat(48),
-      WORKOS_API_KEY: 'sk_watson_local_placeholder_not_a_real_key',
-    };
-
-    // The contract's `env` may reference run-scoped values the engine owns, as
-    // ${WATSON_*} placeholders. Substitute them and FAIL CLOSED on any that is
-    // left unresolved: launching a half-configured application would let the
-    // identity seam fall back to an ambient key source or stay unmounted, and
-    // the run would then "verify" an app whose guarded routes never mounted.
-    const injected = {
-      WATSON_JWKS_URI: started.identity.jwksUri,
-      WATSON_BASE_URL: `http://127.0.0.1:${appPort}`,
-      WATSON_DATABASE_URL: databaseUrl,
-      WATSON_PORT: String(appPort),
-      WATSON_RUN_ID: runId,
-    };
-    for (const [key, raw] of Object.entries(cfg.env ?? {})) {
-      // Deliberately NOT the general interpolate(): that substitutes an unknown
-      // name with an empty string, which here would hand the application an empty
-      // WORKOS_JWKS_URI. The identity seam would then read as "not configured",
-      // the guarded routes would never mount, and the run would fail much later
-      // with an unrelated-looking error. Resolve explicitly and throw on a miss.
-      appEnv[key] = String(raw).replace(/\$\{(WATSON_\w+)\}/g, (_, name) => {
-        if (!(name in injected)) {
-          throw new Error(
-            `.watson/config.yaml env.${key} references \${${name}}, which the engine does not supply. ` +
-              `Known injected values: ${Object.keys(injected).join(', ')}.`,
-          );
-        }
-        return injected[name];
-      });
-    }
+    const appEnv = buildAppEnv({
+      cfg, runId, databaseUrl, appPort,
+      baseUrl: `http://127.0.0.1:${appPort}`,
+      identity: { issuer, clientId, jwksUri: started.identity.jwksUri },
+      inherit: true,
+    });
     for (const cmd of cfg.build ?? []) {
       await env.runStep(cmd, { cwd: repoRoot, env: appEnv, label: 'build', policy });
     }
@@ -189,6 +211,141 @@ async function bringUp({ repoRoot, contract, runDir, runId, adminUrl, policy }) 
   }
 }
 
+/**
+ * Bring the product up ACROSS A BOUNDARY: the product runs somewhere this
+ * process cannot write, and this process runs somewhere the product cannot
+ * reach.
+ *
+ * The division of labour IS the security property, so it is worth stating
+ * exactly:
+ *
+ *   THE VERIFIER (here) decides. It reads the contract, provisions and stamps
+ *   the database, mints the identity and serves the JWKS, chooses the port,
+ *   resolves every command and every environment variable, and — critically —
+ *   confirms readiness itself by polling the product's own health endpoint.
+ *
+ *   THE PRODUCT PLANE (there) executes. It runs the commands it is handed, in
+ *   the product's checkout, and answers with what came back.
+ *
+ * Nothing the plane says is trusted. Readiness is never taken on its word, and
+ * the seed's variables are product-supplied data — exactly as they always were —
+ * used only as substitution values in journeys.
+ */
+async function bringUpRemote({ contract, runId, adminUrl, planeUrl, productBaseUrl, productPort }) {
+  const cfg = contract.config;
+  const dbName = `watson_${runId.replace(/[^a-z0-9]/gi, '').slice(-16).toLowerCase()}`;
+  const started = {};
+  const timings = {};
+
+  const plane = async (route, body) => {
+    const res = await fetch(`${planeUrl}${route}`, {
+      method: body === undefined ? 'GET' : 'POST',
+      headers: body === undefined ? {} : { 'content-type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(1_200_000),
+    });
+    return res.json();
+  };
+
+  const teardown = async () => {
+    try { await plane('/teardown', {}); } catch { /* the container is going away anyway */ }
+    if (started.identity) await started.identity.close().catch(() => {});
+    if (started.dbCreated) await env.dropDatabase({ adminUrl, dbName }).catch(() => {});
+  };
+
+  try {
+    // 0. REACHABILITY — fail here, with a clear message, rather than minutes
+    //    later inside a bring-up that was never going to be delivered.
+    const alive = await plane('/alive');
+    if (!alive?.ok) throw new Error(`product plane at ${planeUrl} did not answer /alive`);
+    step(`product plane ${alive.protocol} at ${planeUrl}`);
+
+    // 1. PROVISION — from the verifier side. The database is reachable from both
+    //    planes over the isolated network, but only the verifier may CREATE one,
+    //    and only the verifier stamps the marker the product's fixture requires.
+    //
+    //    This runs before install, which reverses the single-process ordering:
+    //    the environment carrying DATABASE_URL must exist before any command can
+    //    be sent. A failed install therefore leaves a database behind — harmless
+    //    here, because `teardown` drops it unconditionally and the server itself
+    //    is ephemeral.
+    let t = Date.now();
+    const provisioned = await env.provisionDatabase({ adminUrl, dbName, runId });
+    started.dbCreated = true;
+    const databaseUrl = adminUrl.replace(/\/[^/]*$/, `/${dbName}`);
+    timings.provision_ms = Date.now() - t;
+    step(`database ${dbName}`);
+
+    // 2. IDENTITY — served BY THE VERIFIER, bound so the other plane can reach
+    //    it. The signing key never leaves this process.
+    t = Date.now();
+    const issuer = cfg.identity.issuer;
+    const clientId = env.interpolate(cfg.identity.client_id, { RUN_ID: runId });
+    started.identity = await env.startIdentityService({
+      issuer, clientId, identities: contract.identities,
+      bindHost: '0.0.0.0',
+      advertiseHost: process.env.WATSON_ADVERTISE_HOST ?? 'watson-verifier',
+    });
+    step(`local JWKS on ${started.identity.jwksUri}`);
+
+    const appEnv = buildAppEnv({
+      cfg, runId, databaseUrl, appPort: productPort, baseUrl: productBaseUrl,
+      identity: { issuer, clientId, jwksUri: started.identity.jwksUri },
+      inherit: false,
+    });
+
+    // 3. LAUNCH — install, provision commands, build, start. Everything the pull
+    //    request wrote runs THERE, as an unprivileged user, in a container that
+    //    holds no credential and cannot see this process's filesystem.
+    const launched = await plane('/launch', {
+      runId,
+      install: cfg.install ?? [],
+      provision: cfg.provision ?? [],
+      build: cfg.build ?? [],
+      launch: cfg.launch.command,
+      env: appEnv,
+    });
+    if (!launched?.ok) {
+      throw new Error(
+        `product plane failed during ${launched?.phase ?? 'launch'}: ${launched?.message ?? 'no message'}\n` +
+        `${(launched?.log ?? '').slice(-1500)}`,
+      );
+    }
+    Object.assign(timings, launched.timings ?? {});
+    timings.launch_ms = Date.now() - t;
+
+    // 4. READINESS — proven by the verifier, across the network, against the
+    //    product's own endpoint. The plane's success response is not readiness.
+    await env.waitForHealth(`${productBaseUrl}${cfg.launch.health_path}`, 180_000);
+    step(`app answering on ${productBaseUrl}`);
+
+    // 5. SEED — after a LIVE application, because a product may create its
+    //    identity tables in its own startup bootstrap rather than in migrations.
+    t = Date.now();
+    const fixture = contract.fixtures.profiles?.[cfg.launch.fixture_profile];
+    if (!fixture) throw new Error(`fixture profile \`${cfg.launch.fixture_profile}\` not declared`);
+    const seeded = await plane('/seed', {
+      runId, seed: fixture.command, env: { ...appEnv, DATABASE_URL: databaseUrl },
+    });
+    if (!seeded?.ok) {
+      throw new Error(
+        `product plane failed during seed: ${seeded?.message ?? 'no message'}\n${(seeded?.log ?? '').slice(-1500)}`,
+      );
+    }
+    timings.seed_ms = Date.now() - t;
+    step(`seeded: ${Object.keys(seeded.vars ?? {}).join(', ')}`);
+
+    return {
+      dbName, databaseUrl, baseUrl: productBaseUrl, appPort: productPort,
+      vars: seeded.vars ?? {}, timings, dbServerVersion: provisioned?.serverVersion ?? null,
+      tokens: started.identity.tokens, identity: started.identity, teardown,
+    };
+  } catch (err) {
+    await teardown();
+    throw err;
+  }
+}
+
 async function cmdVerify(args) {
   const repoRoot = path.resolve(args.repo ?? '.');
   const adminUrl = args['db-url'] ?? process.env.WATSON_ADMIN_DB_URL ?? 'postgres://watson:watson@127.0.0.1:5432/postgres';
@@ -198,6 +355,15 @@ async function cmdVerify(args) {
   // not after the product's install script has already run as the verifier.
   const policy = env.productExecution();
   const outPath = typeof args.out === 'string' ? path.resolve(args.out) : null;
+  // When a plane URL is given, the product runs on the far side of a boundary
+  // and this process never executes a line of it. Both values come from trusted
+  // orchestration, never from the product.
+  const planeUrl = typeof args.plane === 'string' ? args.plane.replace(/\/$/, '') : null;
+  const productBaseUrl = typeof args['product-base-url'] === 'string'
+    ? args['product-base-url'].replace(/\/$/, '') : null;
+  if (planeUrl && !productBaseUrl) {
+    throw new Error('--plane requires --product-base-url: the verifier must know where to reach the running product');
+  }
   const runId = env.newRunId();
   const runDir = env.makeRunDir(ROOT, runId);
   const startedAt = new Date().toISOString();
@@ -329,7 +495,12 @@ async function cmdVerify(args) {
   // --- bring the environment up ------------------------------------------------
   let up;
   try {
-    up = await bringUp({ repoRoot, contract, runDir, runId, adminUrl, policy });
+    up = planeUrl
+      ? await bringUpRemote({
+          contract, runId, adminUrl, planeUrl, productBaseUrl,
+          productPort: Number(new URL(productBaseUrl).port || 80),
+        })
+      : await bringUp({ repoRoot, contract, runDir, runId, adminUrl, policy });
   } catch (err) {
     return finish(runDir, {
       ...base, dbName: 'n/a', baseUrl: 'n/a',
@@ -382,6 +553,15 @@ async function cmdVerify(args) {
       cdpPort,
     });
     step(`browser up, CDP on http://127.0.0.1:${cdpPort} (MCP layers attach here)`);
+
+    // Ask Chromium what its sandbox is doing rather than inferring it from the
+    // absence of a flag. The pages this browser loads are served by the product
+    // under verification, so "is the sandbox actually on" is a fact about the
+    // integrity of this run, and belongs in the evidence beside the verdict.
+    base.execution.browser_sandbox_probe = await drive.probeSandbox(browser);
+    step(`browser sandbox: ${base.execution.browser_sandbox_probe.available
+      ? (base.execution.browser_sandbox_probe.effective ? 'reported effective' : 'reported NOT effective')
+      : 'not reportable by this build'} (running as uid ${typeof process.getuid === 'function' ? process.getuid() : 'n/a'})`);
 
     const tDrive = Date.now();
     const features = [];
@@ -588,6 +768,20 @@ try {
     process.exit(envlp.check?.obligation === 'satisfied' ? 0 : 1);
   } else if (cmd === 'doctor') {
     process.exit(await cmdDoctor(args));
+  } else if (cmd === 'plane') {
+    // The product plane. Runs in the UNTRUSTED container, as an unprivileged
+    // user, and executes only what the verifier hands it. It never sees the
+    // evidence, the run bundle, or the browser.
+    const repoRoot = path.resolve(args.repo ?? '.');
+    const port = Number(args.port ?? 8079);
+    const logDir = path.resolve(args['log-dir'] ?? path.join(repoRoot, '..', 'plane-logs'));
+    const { port: bound } = await plane.serve({ repoRoot, logDir, port });
+    log(`\nwatson product plane ${plane.PLANE_PROTOCOL}`);
+    log(`  repo   ${repoRoot}`);
+    log(`  listen 0.0.0.0:${bound}`);
+    log(`  uid    ${typeof process.getuid === 'function' ? process.getuid() : 'n/a'}\n`);
+    // Deliberately never resolves: the container's lifetime is the plane's.
+    await new Promise(() => {});
   } else if (cmd === 'reap') {
     const { dropped, kept } = await env.reap({
       adminUrl: args['db-url'] ?? process.env.WATSON_ADMIN_DB_URL ?? 'postgres://watson:watson@127.0.0.1:5432/postgres',
@@ -598,7 +792,7 @@ try {
     for (const k of kept) log(`  kept ${k.datname} — ${k.why}`);
     process.exit(0);
   } else {
-    log(`watson ${VERSION}\n\n  watson verify --repo <path> [--sha <ref>] [--base <ref>] [--profile poc] [--pr N] [--out <file>]\n  watson doctor --repo <path>\n  watson reap\n`);
+    log(`watson ${VERSION}\n\n  watson verify --repo <path> [--sha <ref>] [--base <ref>] [--profile poc] [--pr N] [--out <file>]\n               [--plane <url> --product-base-url <url>]\n  watson doctor --repo <path>\n  watson plane --repo <path> [--port 8079]\n  watson reap\n`);
     process.exit(cmd ? 1 : 0);
   }
 } catch (err) {

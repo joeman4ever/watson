@@ -26,7 +26,7 @@ import { buildEnvelope, downgradeForInexactHead, writeResult } from '../src/resu
 import {
   scrubEnv, SCRUBBED_ENV_KEYS, productExecution, resetProductExecution, runStep,
 } from '../src/environment.mjs';
-import { browserSandbox } from '../src/driver.mjs';
+import { browserSandbox, launchBrowser } from '../src/driver.mjs';
 
 const IS_ROOT = typeof process.getuid === 'function' && process.getuid() === 0;
 const HAS_SETPRIV = (() => {
@@ -257,12 +257,35 @@ describe('a product command cannot forge, overwrite, or reach the evidence', () 
   });
 });
 
-describe('the run says which protections it actually had', () => {
-  test('browser sandbox state follows the uid, and is reported rather than assumed', () => {
-    // Chromium will not start as root with its sandbox on. Watson is root only
-    // where it must drop privilege to run product code as another user, so the
-    // two protections trade against each other and the result must say which one
-    // this run had — not leave a reader to guess from the environment.
+describe('the browser is part of the verifier, not a lesser concern', () => {
+  test('sandbox availability follows the uid', () => {
     assert.equal(browserSandbox(), !IS_ROOT);
+  });
+
+  test('launching the browser as root is REFUSED, not silently unsandboxed', async () => {
+    // The pages this browser loads are served by the product under
+    // verification. An unsandboxed browser is therefore a hole in the same
+    // boundary that protects the evidence — so the response to "Chromium will
+    // not start as root with its sandbox" is to refuse to be root, never to pass
+    // `--no-sandbox`.
+    if (!IS_ROOT) {
+      // Not root here, so the refusal cannot be provoked. Assert the property
+      // that makes the refusal meaningful instead, and say so in the name above
+      // rather than skipping.
+      assert.equal(browserSandbox(), true);
+      return;
+    }
+    await assert.rejects(
+      () => launchBrowser({ cdpPort: 0 }),
+      /refusing to launch the browser as root/,
+    );
+  });
+
+  test('`--no-sandbox` does not appear anywhere in the driver', () => {
+    // A grep, deliberately. The flag is one edit away from coming back for a
+    // plausible-sounding reason, and this is the cheapest thing that notices.
+    const src = fs.readFileSync(new URL('../src/driver.mjs', import.meta.url), 'utf8');
+    const uses = src.split('\n').filter((l) => l.includes('--no-sandbox') && !l.trim().startsWith('*') && !l.trim().startsWith('//'));
+    assert.deepEqual(uses, [], 'the browser must not be launched unsandboxed');
   });
 });

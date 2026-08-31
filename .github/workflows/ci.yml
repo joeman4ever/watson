@@ -36,3 +36,53 @@ jobs:
       - run: npm run lint
       - run: npm run check
       - run: npm test
+
+  # THE BROWSER IS PART OF THE VERIFIER.
+  #
+  # Watson drives pages served by the product under verification, so an
+  # unsandboxed browser is a hole in the same boundary that protects the
+  # evidence — not a lesser, separate concern about the browser.
+  #
+  # This job exists because "we removed --no-sandbox" is not evidence. It runs
+  # the real launch path in the same pinned image and under the same container
+  # settings the observer uses, as a non-root user, and then reads the kernel's
+  # own account of the renderer processes Chromium forked.
+  #
+  # If a runner or an image cannot give us a sandboxed non-root browser, the
+  # right outcome is a red build and a conversation — not a quietly weakened
+  # threat model.
+  sandbox:
+    name: Browser sandbox boundary (container, non-root)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Prove the sandbox engages for an unprivileged verifier
+        env:
+          # The verifier image, pinned by digest exactly as the observer pins it.
+          VERIFIER_IMAGE: node:22-bookworm@sha256:8a34c4ab3ea2c5cd194f07e317b2a8f09461d3c8b05c4e34c8ccd56d56024c4d
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --security-opt no-new-privileges \
+            --cap-drop=NET_RAW \
+            --shm-size=1g \
+            -e PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
+            -v "$PWD:/src:ro" \
+            "$VERIFIER_IMAGE" \
+            bash -c '
+              set -euo pipefail
+              # Root does the bootstrap — installs, ownership, users — and then
+              # gets out of the way. The verifier itself never runs as root.
+              cp -r /src /engine && cd /engine
+              npm ci --no-audit --no-fund
+              npx playwright install --with-deps chromium
+              chmod -R a+rX /opt/pw-browsers /engine
+              install -d -o 1000 -g 1000 /home/verifier
+              setpriv --reuid=1000 --regid=1000 --init-groups --no-new-privs -- \
+                env HOME=/home/verifier PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
+                node test/browser-sandbox-proof.mjs
+            '
