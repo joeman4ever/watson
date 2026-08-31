@@ -16,7 +16,7 @@
     "reap": "node src/cli.mjs reap",
     "lint": "eslint .",
     "test": "node --test test/*.test.mjs",
-    "check": "node --check src/cli.mjs && node --check src/checks.mjs && node --check src/contract.mjs && node --check src/driver.mjs && node --check src/environment.mjs && node --check src/exec.mjs && node --check src/fingerprint.mjs && node --check src/plane.mjs && node --check src/result.mjs && node --check src/selection.mjs",
+    "check": "node --check src/cli.mjs && node --check src/checks.mjs && node --check src/contract.mjs && node --check src/driver.mjs && node --check src/environment.mjs && node --check src/exec.mjs && node --check src/fingerprint.mjs && node --check src/plane.mjs && node --check src/result.mjs && node --check src/selection.mjs && node --check tools/seccomp-profile.mjs",
     "ci": "npm run lint && npm run check && npm test"
   },
   "dependencies": {
