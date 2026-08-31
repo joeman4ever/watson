@@ -248,6 +248,7 @@ async function cmdVerify(args) {
     repository: args.repository ?? path.basename(repoRoot),
     pullRequest: args.pr ? Number(args.pr) : null,
     headSha, baseSha,
+    contractVersion: contract.config?.contract_version ?? null,
     productFingerprint: productFingerprint(repoRoot, headSha),
     contractFingerprint: contractFingerprint(repoRoot, headSha),
     // Resolves the contract at BOTH SHAs so the diff can name what changed, not

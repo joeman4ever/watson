@@ -29,6 +29,7 @@
     "base_sha": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
     "product_fingerprint": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
     "contract_fingerprint": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "contract_version": { "type": ["integer", "null"], "description": "The contract generation the engine negotiated against, beside the fingerprint that pins its exact bytes." },
     "carried_forward_from": {
       "type": ["string", "null"],
       "description": "Always null in phase 0/1: a new HEAD is always re-verified."

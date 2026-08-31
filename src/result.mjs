@@ -118,6 +118,11 @@ export function buildEnvelope(run) {
     // Recorded ALWAYS; NOT consulted for carry-forward in phase 0/1.
     product_fingerprint: run.productFingerprint,
     contract_fingerprint: run.contractFingerprint,
+    // The fingerprint pins the exact contract BYTES, which is the stronger fact.
+    // The declared version is recorded beside it because it is what the engine
+    // negotiated against — a reader comparing two observations wants to know the
+    // contract generation changed, not only that some byte did.
+    contract_version: run.contractVersion ?? null,
     carried_forward_from: null,
 
     contract_change: !!run.contractChange,
