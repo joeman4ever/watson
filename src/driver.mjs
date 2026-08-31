@@ -39,7 +39,7 @@ export function browserSandbox() {
   return !(typeof process.getuid === 'function' && process.getuid() === 0);
 }
 
-export async function launchBrowser({ executablePath, cdpPort, headless = true }) {
+export async function launchBrowser({ executablePath, cdpPort, headless = true, channel } = {}) {
   if (!browserSandbox()) {
     throw new Error(
       'refusing to launch the browser as root: Chromium cannot enable its sandbox as root, and the ' +
@@ -50,6 +50,10 @@ export async function launchBrowser({ executablePath, cdpPort, headless = true }
   return chromium.launch({
     executablePath,
     headless,
+    // Playwright's default headless mode runs the Chromium HEADLESS SHELL, a
+    // different binary from Chromium proper. `channel` selects explicitly, so a
+    // caller that needs to know WHICH build it measured can say so.
+    ...(channel ? { channel } : {}),
     args: [
       `--remote-debugging-port=${cdpPort}`,
       '--remote-debugging-address=127.0.0.1',
