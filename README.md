@@ -32,7 +32,7 @@ writes it during a run.
 ## Usage
 
 ```bash
-watson verify --repo /path/to/product [--sha <ref>] [--base <ref>] [--profile poc] [--pr 123]
+watson verify --repo /path/to/product [--sha <ref>] [--base <ref>] [--profile poc] [--pr 123] [--out result.json]
 watson doctor --repo /path/to/product     # bring up, probe, tear down
 watson reap                               # drop orphaned watson_* databases
 ```
@@ -40,6 +40,11 @@ watson reap                               # drop orphaned watson_* databases
 Exit code is `0` for `PASS` / `PASS_WITH_ADVISORIES`, `1` otherwise. Every run
 writes `runs/<runId>/result.json` (machine) and `runs/<runId>/summary.md`
 (human, with a `WATSON_METADATA` marker).
+
+`--out` additionally writes the canonical result to a path **the caller names**.
+A harness should never have to find Watson's evidence by asking the filesystem
+which file is newest: that answer is influenced by every process that ran during
+the verification, the product's included.
 
 ## Lifecycle
 
@@ -131,6 +136,52 @@ network capture belongs in the library layer.
   repository write credential in the same process as the browser.
 - Contract commands come from reviewed product-repo content, never from a PR
   body or any untrusted input.
+
+## The verifier / product boundary
+
+Watson runs the product's own install, build, launch and seed commands. When the
+revision under verification is a pull request, those commands were written by the
+author whose work Watson is judging. It is inconsistent to call that code
+untrusted where credentials are concerned and trusted where the verdict is
+concerned, so the engine assumes it may be hostile and holds one invariant:
+
+> **The thing being verified must not be able to alter the verifier, the
+> orchestration that invokes it, or the evidence accepted as its result.**
+
+Three mechanisms, none of which is "put the files in different directories":
+
+**Privilege separation (opt-in, fail-closed).** Set `WATSON_PRODUCT_UID`,
+`WATSON_PRODUCT_GID` and `WATSON_PRODUCT_HOME` and every product-authored
+command runs as that unprivileged user via `setpriv` — invoked with an argv
+array, so the product's command string is never interpolated into another shell.
+Point the engine's evidence directory somewhere that uid cannot write and the
+product cannot forge a result, overwrite one, or plant a newer file for a
+mtime-ordered harness to pick up. If separation is requested and cannot be
+established — not root, no `setpriv`, incomplete configuration — the run
+**refuses**. It never falls back to running product code with the verifier's own
+privileges, because a security property believed to hold and silently absent is
+worse than one that was never claimed.
+
+**Environment scrubbing.** A named set of variables is removed before the
+product's environment is handed over: CI bearer tokens
+(`ACTIONS_RUNTIME_TOKEN`, `GITHUB_TOKEN`, …) and, just as important, the runner's
+*command channels* — `GITHUB_ENV`, `GITHUB_PATH`, `GITHUB_OUTPUT`,
+`GITHUB_STATE`. Those name files the runner reads back after a step, so anything
+able to append to them can inject environment variables and PATH entries into the
+trusted side that follows.
+
+**Positive HEAD identity.** The exact-HEAD gate asserts that `HEAD` *is* the SHA
+the run reports, not merely that the tree is clean. Cleanliness alone is forgeable
+in one command: modify the product, commit the modification, and `git status` is
+clean again at a commit nobody reviewed.
+
+`test/isolation.test.mjs` is the negative control for all three. Where a control
+needs real privilege separation and cannot have it (no root), it asserts the
+fail-closed contract instead and says so in its own name — it never silently
+skips, because a green tick on a security test that did nothing is read as proof.
+
+Local development sets none of this, and should not: there is no boundary to
+enforce between you and your own code.
 
 ## Deliberately not built yet
 

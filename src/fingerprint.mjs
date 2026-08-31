@@ -61,30 +61,55 @@ export function contractFingerprint(repoRoot, sha) {
  *
  * Watson does not refuse a dirty tree — developing against one is the normal way to
  * work — but it must never claim exact-HEAD when it cannot honour it.
+ *
+ * CLEANLINESS IS NOT IDENTITY. `git status` proves only that the tree matches
+ * whatever HEAD currently points at — it says nothing about WHICH commit that is.
+ * A tree that is modified and then committed is perfectly clean at a commit nobody
+ * reviewed, and the gate as originally written would have called that exact-HEAD
+ * and let a PASS through for the reported SHA.
+ *
+ * That is not a theoretical gap. Watson runs the product's own install, build and
+ * launch commands from this checkout, so under a threat model where product code
+ * may be hostile, `git commit -a` is a one-line forgery of the exact-HEAD property
+ * — the single property every product claim rests on. So identity is checked
+ * positively, against the SHA the caller says this run is about, and a mismatch is
+ * inexact for the same reason dirt is: the run cannot speak for that commit.
  */
-export function workingTreeState(repoRoot) {
+export function workingTreeState(repoRoot, expectedSha = null) {
   let porcelain = '';
+  let head = null;
   try {
     porcelain = execFileSync('git', ['status', '--porcelain'], {
       cwd: repoRoot, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024,
     });
+    head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoRoot, encoding: 'utf8' }).trim();
   } catch {
     return { clean: null, exact_head: false, dirty_paths: [], contract_dirty: false,
+      head_sha: null, expected_sha: expectedSha, head_matches: null,
       note: 'git status failed; exact-HEAD cannot be established' };
   }
   const paths = porcelain.split('\n').map((l) => l.slice(3).trim()).filter(Boolean);
   const contractDirty = paths.some((p) => p.startsWith('.watson/'));
+  const clean = paths.length === 0;
+  // `null` when the caller named no expectation: unknown, and unknown is not a
+  // failure. `false` is a positive contradiction and is fatal to any product claim.
+  const headMatches = expectedSha ? head === expectedSha : null;
   return {
-    clean: paths.length === 0,
-    exact_head: paths.length === 0,
+    clean,
+    exact_head: clean && headMatches !== false,
     dirty_paths: paths.slice(0, 20),
     dirty_count: paths.length,
     contract_dirty: contractDirty,
-    note: paths.length === 0
-      ? 'checkout matches the reported SHA'
-      : contractDirty
-        ? 'the CONTRACT differs from the reported SHA — this run verified something else'
-        : 'the product tree differs from the reported SHA',
+    head_sha: head,
+    expected_sha: expectedSha,
+    head_matches: headMatches,
+    note: headMatches === false
+      ? `the checkout is at ${head}, not the reported ${expectedSha} — this run verified a different commit`
+      : clean
+        ? 'checkout matches the reported SHA'
+        : contractDirty
+          ? 'the CONTRACT differs from the reported SHA — this run verified something else'
+          : 'the product tree differs from the reported SHA',
   };
 }
 

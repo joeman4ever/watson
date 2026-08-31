@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Watson CLI — Phase 0.
 //
-//   watson verify --repo <path> [--sha <ref>] [--profile poc] [--base <ref>]
+//   watson verify --repo <path> [--sha <ref>] [--profile poc] [--base <ref>] [--out <file>]
 //   watson doctor --repo <path>            (bring up, probe, tear down)
 //   watson reap                            (drop orphaned watson_* databases)
 //
@@ -45,12 +45,13 @@ const step = (m) => console.log(`  · ${m}`);
 
 /** Bring the product up exactly as Watson will drive it. Returns a handle whose
  *  `teardown()` kills only what we started, by process group. */
-async function bringUp({ repoRoot, contract, runDir, runId, adminUrl }) {
+async function bringUp({ repoRoot, contract, runDir, runId, adminUrl, policy }) {
   const cfg = contract.config;
   const dbName = `watson_${runId.replace(/[^a-z0-9]/gi, '').slice(-16).toLowerCase()}`;
   const appPort = await env.freePort();
   const started = {};
   const timings = {};
+  let dbServerVersion = null;
 
   const teardown = async () => {
     if (started.app) env.killGroup(started.app.pid);
@@ -80,21 +81,22 @@ async function bringUp({ repoRoot, contract, runDir, runId, adminUrl }) {
     // orphan a `watson_<runId>` database that `reap` has to clean up later.
     let t = Date.now();
     for (const cmd of cfg.install ?? []) {
-      await env.runStep(cmd, { cwd: repoRoot, env: { ...process.env }, label: 'install' });
+      await env.runStep(cmd, { cwd: repoRoot, env: { ...process.env }, label: 'install', policy });
     }
     if ((cfg.install ?? []).length) step(`install commands: ${cfg.install.length}`);
     timings.install_ms = Date.now() - t;
 
     // 1. PROVISION -------------------------------------------------------------
     t = Date.now();
-    await env.provisionDatabase({ adminUrl, dbName, runId });
+    const provisioned = await env.provisionDatabase({ adminUrl, dbName, runId });
     started.dbCreated = true;
+    dbServerVersion = provisioned?.serverVersion ?? null;
     const databaseUrl = adminUrl.replace(/\/[^/]*$/, `/${dbName}`);
     step(`database ${dbName}`);
 
     for (const cmd of cfg.provision ?? []) {
       await env.runStep(env.interpolate(cmd, { DATABASE_URL: databaseUrl }), {
-        cwd: repoRoot, env: { ...process.env, DATABASE_URL: databaseUrl }, label: 'provision',
+        cwd: repoRoot, env: { ...process.env, DATABASE_URL: databaseUrl }, label: 'provision', policy,
       });
     }
     step(`provision commands: ${(cfg.provision ?? []).length}`);
@@ -149,11 +151,11 @@ async function bringUp({ repoRoot, contract, runDir, runId, adminUrl }) {
       });
     }
     for (const cmd of cfg.build ?? []) {
-      await env.runStep(cmd, { cwd: repoRoot, env: appEnv, label: 'build' });
+      await env.runStep(cmd, { cwd: repoRoot, env: appEnv, label: 'build', policy });
     }
     started.app = env.launchApp({
       cmd: cfg.launch.command, cwd: repoRoot, env: appEnv,
-      logFile: path.join(runDir, 'logs', 'app.log'),
+      logFile: path.join(runDir, 'logs', 'app.log'), policy,
     });
     const baseUrl = `http://127.0.0.1:${appPort}`;
     await env.waitForHealth(`${baseUrl}${cfg.launch.health_path}`, 90_000);
@@ -168,7 +170,7 @@ async function bringUp({ repoRoot, contract, runDir, runId, adminUrl }) {
     if (!fixture) throw new Error(`fixture profile \`${cfg.launch.fixture_profile}\` not declared`);
     const seed = await env.runStep(
       env.interpolate(fixture.command, { RUN_ID: runId, DATABASE_URL: databaseUrl }),
-      { cwd: repoRoot, env: { ...appEnv, DATABASE_URL: databaseUrl }, label: 'seed' },
+      { cwd: repoRoot, env: { ...appEnv, DATABASE_URL: databaseUrl }, label: 'seed', policy },
     );
     let vars = {};
     try {
@@ -179,7 +181,8 @@ async function bringUp({ repoRoot, contract, runDir, runId, adminUrl }) {
     step(`seeded: ${Object.keys(vars).join(', ')}`);
     timings.seed_ms = Date.now() - t;
 
-    return { dbName, databaseUrl, baseUrl, appPort, vars, timings, tokens: started.identity.tokens, identity: started.identity, teardown };
+    return { dbName, databaseUrl, baseUrl, appPort, vars, timings, dbServerVersion,
+      tokens: started.identity.tokens, identity: started.identity, teardown };
   } catch (err) {
     await teardown();
     throw err;
@@ -190,6 +193,11 @@ async function cmdVerify(args) {
   const repoRoot = path.resolve(args.repo ?? '.');
   const adminUrl = args['db-url'] ?? process.env.WATSON_ADMIN_DB_URL ?? 'postgres://watson:watson@127.0.0.1:5432/postgres';
   const profile = args.profile ?? 'poc';
+  // Resolved ONCE, before anything runs, and before a database exists. A caller
+  // that asked for privilege separation and cannot have it must find out here —
+  // not after the product's install script has already run as the verifier.
+  const policy = env.productExecution();
+  const outPath = typeof args.out === 'string' ? path.resolve(args.out) : null;
   const runId = env.newRunId();
   const runDir = env.makeRunDir(ROOT, runId);
   const startedAt = new Date().toISOString();
@@ -258,9 +266,10 @@ async function cmdVerify(args) {
       sha === headSha ? contract : loadContractAt(repoRoot, sha)),
     // Recorded on EVERY result, pass or fail. A run that reports a SHA it did not
     // actually verify is worse than one that reports nothing.
-    workingTree: workingTreeState(repoRoot),
+    workingTree: workingTreeState(repoRoot, headSha),
     repoRoot,
-    profile, selection, startedAt, shadow: true,
+    profile, selection, startedAt, shadow: true, outPath,
+    execution: env.executionProvenance(policy),
     fixtureProfile: contract.config.launch.fixture_profile,
     viewports: ['1280x800'],
     browser: 'chromium/playwright-1.49.1',
@@ -320,7 +329,7 @@ async function cmdVerify(args) {
   // --- bring the environment up ------------------------------------------------
   let up;
   try {
-    up = await bringUp({ repoRoot, contract, runDir, runId, adminUrl });
+    up = await bringUp({ repoRoot, contract, runDir, runId, adminUrl, policy });
   } catch (err) {
     return finish(runDir, {
       ...base, dbName: 'n/a', baseUrl: 'n/a',
@@ -333,6 +342,12 @@ async function cmdVerify(args) {
       finishedAt: new Date().toISOString(),
     });
   }
+
+  // Filled in after provisioning rather than guessed before it: the version is a
+  // fact about the server that actually held the fixtures. `base.execution` is
+  // shared by reference with every envelope built below, which is exactly what is
+  // wanted — one record of one run's environment.
+  base.execution.database_server_version = up.dbServerVersion;
 
   try {
     // --- doctor ---------------------------------------------------------------
@@ -496,10 +511,15 @@ function finish(runDir, run) {
   // and ended dirty drove some mixture of the two, and cannot honestly speak for
   // either.
   if (run.repoRoot && run.verdict) {
-    const at_end = workingTreeState(run.repoRoot);
+    const at_end = workingTreeState(run.repoRoot, run.headSha ?? null);
     const at_start = run.workingTree ?? at_end;
     const changed_mid_run =
-      at_start.exact_head !== at_end.exact_head || at_start.dirty_count !== at_end.dirty_count;
+      at_start.exact_head !== at_end.exact_head
+      || at_start.dirty_count !== at_end.dirty_count
+      // A run that started at the reported commit and ended somewhere else moved
+      // under the verifier. `dirty_count` cannot see that: committing the change
+      // is what makes the count go back to zero.
+      || at_start.head_sha !== at_end.head_sha;
 
     run.workingTree = { ...at_end, at_start_exact_head: at_start.exact_head, changed_mid_run };
 
@@ -516,11 +536,12 @@ function finish(runDir, run) {
   }
 
   const envlp = buildEnvelope(run);
-  const { jsonPath, mdPath } = writeResult(runDir, envlp);
+  const { jsonPath, mdPath } = writeResult(runDir, envlp, run.outPath ?? null);
   log('');
   log(summary(envlp).split('\n').slice(0, 3).join('\n'));
   log('');
   log(`  result   ${path.relative(process.cwd(), jsonPath)}`);
+  if (run.outPath) log(`  canonical ${run.outPath}`);
   log(`  summary  ${path.relative(process.cwd(), mdPath)}`);
   log('');
   return envlp;
@@ -532,7 +553,7 @@ async function cmdDoctor(args) {
   const runId = env.newRunId();
   const runDir = env.makeRunDir(ROOT, runId);
   const contract = loadContract(repoRoot);
-  const up = await bringUp({ repoRoot, contract, runDir, runId, adminUrl });
+  const up = await bringUp({ repoRoot, contract, runDir, runId, adminUrl, policy: env.productExecution() });
   try {
     const adminIdentity = contract.identities.find((i) => i.role === 'admin' && i.doctor) ?? contract.identities[0];
     const dr = await env.doctor({
@@ -577,7 +598,7 @@ try {
     for (const k of kept) log(`  kept ${k.datname} — ${k.why}`);
     process.exit(0);
   } else {
-    log(`watson ${VERSION}\n\n  watson verify --repo <path> [--sha <ref>] [--base <ref>] [--profile poc] [--pr N]\n  watson doctor --repo <path>\n  watson reap\n`);
+    log(`watson ${VERSION}\n\n  watson verify --repo <path> [--sha <ref>] [--base <ref>] [--profile poc] [--pr N] [--out <file>]\n  watson doctor --repo <path>\n  watson reap\n`);
     process.exit(cmd ? 1 : 0);
   }
 } catch (err) {

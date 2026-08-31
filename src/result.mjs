@@ -65,11 +65,15 @@ export function downgradeForInexactHead(verdict, workingTree) {
   if (!PRODUCT_CLAIMS.has(verdict)) return { verdict, reason: null };
   if (workingTree?.exact_head === true) return { verdict, reason: null };
 
-  const what = workingTree?.contract_dirty
-    ? 'the CONTRACT that executed is not the one at the reported SHA'
-    : workingTree?.clean === null
-      ? 'the checkout could not be compared against the reported SHA'
-      : 'the checkout is not the revision it reports';
+  const what = workingTree?.head_matches === false
+    // Checked first: a clean tree at the WRONG commit would otherwise fall through
+    // to the dirt wording and describe the least important thing that is wrong.
+    ? `the checkout is at ${workingTree.head_sha ?? 'an unknown commit'}, not the reported commit`
+    : workingTree?.contract_dirty
+      ? 'the CONTRACT that executed is not the one at the reported SHA'
+      : workingTree?.clean === null
+        ? 'the checkout could not be compared against the reported SHA'
+        : 'the checkout is not the revision it reports';
   return {
     verdict: 'INDETERMINATE',
     reason:
@@ -144,6 +148,18 @@ export function buildEnvelope(run) {
       database: run.dbName,
       fixture_profile: run.fixtureProfile,
       node: process.version,
+
+      // What actually executed this run. Recorded because a runtime verdict is
+      // only as interpretable as the world it was produced in: "PASS on Node
+      // 22.11 / Ubuntu 24.04 / Chromium via Playwright 1.49.1" is a fact
+      // somebody can act on months later; "PASS" alone is not.
+      //
+      // This is PROVENANCE, not reproducibility. Nothing here claims the run
+      // could be reproduced bit-for-bit — it could not, and saying so would be
+      // the kind of overstatement this envelope exists to avoid. It records what
+      // was used, so that a difference between two results can be explained
+      // instead of argued about.
+      execution: run.execution ?? null,
 
       // Everything under this key describes WATSON'S OWN synthetic verification
       // environment, never the product's production posture. It was previously a
@@ -310,10 +326,29 @@ export function summary(env) {
   return L.join('\n');
 }
 
-export function writeResult(runDir, env) {
+/**
+ * Write the run's evidence, and — when the caller named one — the canonical
+ * result at an EXACT path the caller chose.
+ *
+ * `outPath` exists to delete a whole class of CI mistake. A harness that finds
+ * the result by listing the run directories newest-first is asking the
+ * filesystem which file is newest, and the answer is influenced by every process
+ * that ran during the verification — including the product's. The trusted side
+ * should not be discovering its own evidence; it should be naming it.
+ *
+ * Failure to write it is fatal on purpose. A run whose result did not reach the
+ * agreed path has produced no observation, and a harness that then finds a
+ * STALE file at that path would report the previous run's verdict as this one's.
+ */
+export function writeResult(runDir, env, outPath = null) {
   const jsonPath = path.join(runDir, 'result.json');
   const mdPath = path.join(runDir, 'summary.md');
-  fs.writeFileSync(jsonPath, JSON.stringify(env, null, 2));
+  const json = JSON.stringify(env, null, 2);
+  fs.writeFileSync(jsonPath, json);
   fs.writeFileSync(mdPath, summary(env));
-  return { jsonPath, mdPath };
+  if (outPath) {
+    fs.mkdirSync(path.dirname(path.resolve(outPath)), { recursive: true });
+    fs.writeFileSync(outPath, json);
+  }
+  return { jsonPath, mdPath, outPath };
 }
