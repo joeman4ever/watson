@@ -435,7 +435,16 @@ async function cmdVerify(args) {
     workingTree: workingTreeState(repoRoot, headSha),
     repoRoot,
     profile, selection, startedAt, shadow: true, outPath,
-    execution: env.executionProvenance(policy),
+    execution: {
+      ...env.executionProvenance(policy),
+      // Which boundary this run actually had between the verifier and the code
+      // it was verifying. A reader assessing a verdict needs to know whether the
+      // product ran in its own plane, was merely uid-separated in this process
+      // tree, or shared everything with the verifier — those are three different
+      // levels of confidence in the same JSON.
+      product_plane: planeUrl ? { url: planeUrl, product_base_url: productBaseUrl } : null,
+      product_isolation: planeUrl ? 'separate-plane' : (policy.drop ? 'uid-separated' : 'same-process'),
+    },
     fixtureProfile: contract.config.launch.fixture_profile,
     viewports: ['1280x800'],
     browser: 'chromium/playwright-1.49.1',
