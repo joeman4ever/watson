@@ -16,7 +16,7 @@ import {
   loadContract, loadContractAt, selectByProfile, withDependencies,
   validateFeatureVars, validateEnvOwnership, validateContractVersion, validateStepOrder,
 } from './contract.mjs';
-import { productFingerprint, contractFingerprint, resolveSha, contractChange, workingTreeState, changedPaths } from './fingerprint.mjs';
+import { productFingerprint, contractFingerprint, resolveSha, contractChange, workingTreeState, changedPaths, engineProvenance } from './fingerprint.mjs';
 import { selectByImpact } from './selection.mjs';
 import * as env from './environment.mjs';
 import * as drive from './driver.mjs';
@@ -240,9 +240,15 @@ async function cmdVerify(args) {
   log(`  select ${impact.method} — ${impact.reason}`);
 
   const base = {
-    runId, watsonVersion: VERSION, repository: args.repository ?? path.basename(repoRoot),
+    runId, watsonVersion: VERSION,
+    // Resolved from the engine's own checkout, not passed in by a caller: a
+    // verifier that accepted its own identity as an argument could be told to
+    // report any identity at all.
+    engine: engineProvenance(ROOT),
+    repository: args.repository ?? path.basename(repoRoot),
     pullRequest: args.pr ? Number(args.pr) : null,
     headSha, baseSha,
+    contractVersion: contract.config?.contract_version ?? null,
     productFingerprint: productFingerprint(repoRoot, headSha),
     contractFingerprint: contractFingerprint(repoRoot, headSha),
     // Resolves the contract at BOTH SHAs so the diff can name what changed, not

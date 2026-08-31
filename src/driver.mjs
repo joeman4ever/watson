@@ -160,11 +160,33 @@ export async function runStep(step, ctx) {
       return `saw "${arg}"${note}`;
     }
     case 'expect_text': {
-      const body = await page.evaluate(() => document.body.innerText);
-      if (!body.includes(arg)) throw new Error(`expected page text to contain "${arg}"${note}`);
+      // An assertion about EVENTUAL state, so it polls — same reasoning as
+      // `expect_url_contains` directly below, which this had simply never
+      // adopted.
+      //
+      // Sampling once raced the render and produced a FALSE FAIL_PRODUCT: a
+      // journey that selects a season sees the URL update synchronously via the
+      // router, then asserted the new name before React had re-rendered it.
+      // Render wins, PASS; assertion wins, the product is accused of a defect it
+      // does not have. Observed non-deterministically on one HEAD — a pass and a
+      // FAIL_PRODUCT from identical inputs.
+      //
+      // A product that never renders the text still fails, at the deadline.
+      const seen = async () => (await page.evaluate(() => document.body.innerText)).includes(arg);
+      const deadline = Date.now() + timeout;
+      while (!(await seen()) && Date.now() < deadline) {
+        await page.waitForTimeout(100);
+      }
+      if (!(await seen())) throw new Error(`expected page text to contain "${arg}"${note}`);
       return `page contains "${arg}"`;
     }
     case 'expect_no_text': {
+      // Deliberately does NOT poll, unlike `expect_text` above. The asymmetry is
+      // the point: polling a NEGATIVE assertion would mean "wait until the text
+      // is absent", so a screen that briefly showed forbidden data and then hid
+      // it would PASS. For a privacy assertion that is precisely backwards — the
+      // leak already happened. A negative samples once, after the preceding step
+      // has settled the page.
       const body = await page.evaluate(() => document.body.innerText);
       if (body.includes(arg)) throw new Error(`expected page text NOT to contain "${arg}"${note}`);
       return `page does not contain "${arg}"`;

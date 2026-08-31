@@ -100,7 +100,13 @@ export function buildEnvelope(run) {
   return {
     schema_version: SCHEMA_VERSION,
     run_id: run.runId,
-    watson: { version: run.watsonVersion, commit: run.watsonCommit ?? null },
+    watson: {
+      version: run.watsonVersion,
+      commit: run.engine?.commit ?? run.watsonCommit ?? null,
+      // False means the engine had uncommitted changes, so `commit` names a
+      // revision the running code is not. Null means it could not be determined.
+      clean: run.engine?.clean ?? null,
+    },
 
     repository: run.repository,
     pull_request: run.pullRequest ?? null,
@@ -112,6 +118,11 @@ export function buildEnvelope(run) {
     // Recorded ALWAYS; NOT consulted for carry-forward in phase 0/1.
     product_fingerprint: run.productFingerprint,
     contract_fingerprint: run.contractFingerprint,
+    // The fingerprint pins the exact contract BYTES, which is the stronger fact.
+    // The declared version is recorded beside it because it is what the engine
+    // negotiated against — a reader comparing two observations wants to know the
+    // contract generation changed, not only that some byte did.
+    contract_version: run.contractVersion ?? null,
     carried_forward_from: null,
 
     contract_change: !!run.contractChange,

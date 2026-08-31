@@ -89,3 +89,57 @@ describe('isAuthorized', () => {
     assert.equal(isAuthorized(304), true);
   });
 });
+
+/** Minimal run record: only the fields `buildEnvelope` needs to produce a result. */
+function baseRun() {
+  return {
+    runId: 'wtsn-test', watsonVersion: '0.0.0-test', repository: 'demo',
+    headSha: 'c'.repeat(40), verdict: 'PASS', shadow: true,
+    workingTree: { clean: true, exact_head: true },
+    productFingerprint: `sha256:${'0'.repeat(64)}`,
+    contractFingerprint: `sha256:${'0'.repeat(64)}`,
+    features: [], findings: [], timings: {},
+  };
+}
+
+describe('engine provenance — which verifier produced the result', () => {
+  test('a result carries the engine commit and its cleanliness', async () => {
+    const { buildEnvelope } = await import('../src/result.mjs');
+    const sha = 'a'.repeat(40);
+    const env = buildEnvelope({
+      ...baseRun(), engine: { commit: sha, clean: true },
+    });
+    assert.equal(env.watson.commit, sha);
+    assert.equal(env.watson.clean, true);
+  });
+
+  test('an undeterminable engine records nulls rather than guessing', async () => {
+    const { buildEnvelope } = await import('../src/result.mjs');
+    const env = buildEnvelope({ ...baseRun(), engine: { commit: null, clean: null } });
+    assert.equal(env.watson.commit, null);
+    assert.equal(env.watson.clean, null);
+  });
+
+  test('a DIRTY engine still reports its sha, flagged — the pair is the point', async () => {
+    // A sha from a modified tree is a more convincing lie than no sha at all, so
+    // the two travel together and neither is reported without the other.
+    const { buildEnvelope } = await import('../src/result.mjs');
+    const env = buildEnvelope({
+      ...baseRun(), engine: { commit: 'b'.repeat(40), clean: false },
+    });
+    assert.equal(env.watson.clean, false, 'a dirty engine must be visible, not silently trusted');
+    assert.equal(env.watson.commit, 'b'.repeat(40));
+  });
+
+  test('engineProvenance resolves this engine’s real commit from its own checkout', async () => {
+    const { engineProvenance } = await import('../src/fingerprint.mjs');
+    const p = engineProvenance(new URL('..', import.meta.url).pathname);
+    assert.match(p.commit, /^[0-9a-f]{40}$/, 'must resolve a real sha in a git checkout');
+    assert.equal(typeof p.clean, 'boolean');
+  });
+
+  test('engineProvenance fails closed on a non-repository', async () => {
+    const { engineProvenance } = await import('../src/fingerprint.mjs');
+    assert.deepEqual(engineProvenance('/'), { commit: null, clean: null });
+  });
+});
