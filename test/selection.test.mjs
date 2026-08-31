@@ -4,8 +4,19 @@ import {
   CLASS, assertIgnorableRules, classifyPath, globToRegExp, selectByImpact,
 } from '../src/selection.mjs';
 
-/** The rules as nsc-eval declares them. Kept close to the real contract so these
- *  cases exercise the shape the product actually ships, not a convenient one. */
+/**
+ * A synthetic product contract, shaped like a real one.
+ *
+ * Deliberately not simplified: the cases below only mean something if the rules
+ * they run against have the awkward properties real contracts have — runtime
+ * roots that cross-cutting paths sit INSIDE, a governing root that is not
+ * runtime, an ignorable list narrow enough to exclude governing documents, and
+ * features whose globs vary between an exact file and a directory.
+ *
+ * The identifiers are synthetic because this engine is product-agnostic; the
+ * SHAPE is realistic because the tests would otherwise prove nothing. A real
+ * product's feature map lives in that product's own `.watson/` contract.
+ */
 const RULES = {
   runtime_roots: ['client/src/**', 'server/src/**'],
   governing_roots: ['docs/adr/**', 'docs/requirements/**', '.watson/**'],
@@ -13,34 +24,34 @@ const RULES = {
     'package.json', 'package-lock.json', '*/package.json',
     'tsconfig*.json', '*/tsconfig*.json',
     'server/migrations/**',
-    'server/src/identity/**', 'server/src/db/**',
+    'server/src/authz/**', 'server/src/store/**',
   ],
   // Narrow and intentional, NOT a blanket `docs/**` — that would swallow ADRs
   // and requirements, which govern what Watson is expected to prove.
-  ignorable: ['docs/watson/**', 'README.md', '.github/**', 'LICENSE', '.gitignore'],
+  ignorable: ['docs/verifier/**', 'README.md', '.github/**', 'LICENSE', '.gitignore'],
   adr_dir: 'docs/adr',
 };
 
 const FEATURES = [
   {
-    id: 'prospective-report-boundary', status: 'mapped', profiles: ['poc', 'smoke'],
-    adrs: ['ADR-005', 'ADR-036'],
+    id: 'restricted-report-boundary', status: 'mapped', profiles: ['poc', 'smoke'],
+    adrs: ['ADR-201', 'ADR-202'],
     source_globs: [
-      'client/src/admin/ProspectiveReport.tsx',
-      'server/src/reporting/aggregateDisclosure.ts',
+      'client/src/console/RestrictedReport.tsx',
+      'server/src/reports/aggregate.ts',
     ],
   },
   {
-    id: 'admin-roster-manage', status: 'mapped', profiles: ['poc', 'smoke'],
-    adrs: ['ADR-008'],
-    source_globs: ['client/src/admin/Roster.tsx'],
+    id: 'admin-records-manage', status: 'mapped', profiles: ['poc', 'smoke'],
+    adrs: ['ADR-203'],
+    source_globs: ['client/src/console/Records.tsx'],
   },
   {
-    id: 'evaluator-tier-boundary', status: 'mapped', profiles: ['smoke'],
-    adrs: ['ADR-019'],
-    source_globs: ['server/src/assignments/**'],
+    id: 'operator-tier-boundary', status: 'mapped', profiles: ['smoke'],
+    adrs: ['ADR-204'],
+    source_globs: ['server/src/scoping/**'],
   },
-  { id: 'draft-thing', status: 'draft', profiles: ['smoke'], source_globs: ['client/src/poc/**'] },
+  { id: 'draft-thing', status: 'draft', profiles: ['smoke'], source_globs: ['client/src/sandbox/**'] },
 ];
 
 const ids = (r) => r.features.map((f) => f.id).sort();
@@ -80,7 +91,7 @@ describe('the anti-self-approval guard on ignorable rules', () => {
   test('selectByImpact refuses to run at all under a poisoned contract', () => {
     assert.throws(
       () => selectByImpact({
-        features: FEATURES, changedPaths: ['client/src/admin/Roster.tsx'], profile: 'poc',
+        features: FEATURES, changedPaths: ['client/src/console/Records.tsx'], profile: 'poc',
         rules: { ...RULES, ignorable: [...RULES.ignorable, 'client/src/**'] },
       }),
       /may not cover runtime or governing-contract paths/,
@@ -97,24 +108,24 @@ describe('path classification', () => {
 
   test('cross-cutting beats a source_globs match', () => {
     // Even if a feature claimed a migration, the schema is read by every journey.
-    assert.equal(c('server/migrations/0023_erasure_authority.sql').class, CLASS.CROSS_CUTTING);
+    assert.equal(c('server/migrations/0042_data_boundary.sql').class, CLASS.CROSS_CUTTING);
   });
 
   test('an ADR selects the features that cite it', () => {
-    const r = c('docs/adr/ADR-005-minor-data-policy.md');
+    const r = c('docs/adr/ADR-201-data-policy.md');
     assert.equal(r.class, CLASS.GOVERNANCE);
-    assert.deepEqual(r.features, ['prospective-report-boundary']);
+    assert.deepEqual(r.features, ['restricted-report-boundary']);
   });
 
   test('an ADR nothing cites ESCALATES — the map may simply not have caught up', () => {
-    const r = c('docs/adr/ADR-041-least-privilege-erasure-authority.md');
+    const r = c('docs/adr/ADR-299-uncited-decision.md');
     assert.equal(r.class, CLASS.GOVERNING);
     assert.deepEqual(r.features, []);
     assert.match(r.reason, /no mapped feature/);
   });
 
   test('unmapped runtime code is unmapped_runtime, not ignorable', () => {
-    assert.equal(c('server/src/privacy/retentionSweep.ts').class, CLASS.UNMAPPED_RUNTIME);
+    assert.equal(c('server/src/lifecycle/sweep.ts').class, CLASS.UNMAPPED_RUNTIME);
   });
 
   test('an unrecognised path is unclassified, never ignorable', () => {
@@ -130,7 +141,7 @@ describe('controlled case 1 — docs-only change is positively NOT_APPLICABLE', 
   test('skips, and says why', () => {
     const r = selectByImpact({
       features: FEATURES, profile: 'poc', rules: RULES,
-      changedPaths: ['README.md', 'docs/watson/phase-1-log.md', '.github/workflows/ci.yml'],
+      changedPaths: ['README.md', 'docs/verifier/run-log.md', '.github/workflows/ci.yml'],
       // NOTE: none of these is under a governing root. `docs/adr/**` and
       // `docs/requirements/**` deliberately cannot appear here.
     });
@@ -146,17 +157,17 @@ describe('controlled case 2 — a mapped source file selects exactly its feature
   test('one feature, not the whole profile', () => {
     const r = selectByImpact({
       features: FEATURES, profile: 'poc', rules: RULES,
-      changedPaths: ['client/src/admin/ProspectiveReport.tsx'],
+      changedPaths: ['client/src/console/RestrictedReport.tsx'],
     });
     assert.equal(r.applicable, true);
     assert.equal(r.escalated, false);
-    assert.deepEqual(ids(r), ['prospective-report-boundary']);
+    assert.deepEqual(ids(r), ['restricted-report-boundary']);
   });
 
   test('a draft feature is never selected even when it claims the path', () => {
     const r = selectByImpact({
       features: FEATURES, profile: 'poc', rules: RULES,
-      changedPaths: ['client/src/poc/Thing.tsx'],
+      changedPaths: ['client/src/sandbox/Thing.tsx'],
     });
     // A draft feature's claim is intent, not capability. The path is therefore
     // unclaimed by anything runnable, so it escalates rather than skipping — and
@@ -172,18 +183,18 @@ describe('controlled case 3 — unmapped runtime code escalates, it does not ski
   test('escalates to the smoke profile and names the reason', () => {
     const r = selectByImpact({
       features: FEATURES, profile: 'poc', rules: RULES,
-      changedPaths: ['server/src/privacy/retentionSweep.ts'],
+      changedPaths: ['server/src/lifecycle/sweep.ts'],
     });
     assert.equal(r.applicable, true);
     assert.equal(r.escalated, true);
-    assert.deepEqual(ids(r), ['admin-roster-manage', 'evaluator-tier-boundary', 'prospective-report-boundary']);
+    assert.deepEqual(ids(r), ['admin-records-manage', 'operator-tier-boundary', 'restricted-report-boundary']);
     assert.match(r.escalation_reasons[0], /claimed by no feature/);
   });
 
   test('one unmapped file escalates a diff that is otherwise fully mapped', () => {
     const r = selectByImpact({
       features: FEATURES, profile: 'poc', rules: RULES,
-      changedPaths: ['client/src/admin/ProspectiveReport.tsx', 'server/src/privacy/retentionSweep.ts'],
+      changedPaths: ['client/src/console/RestrictedReport.tsx', 'server/src/lifecycle/sweep.ts'],
     });
     assert.equal(r.escalated, true);
     assert.ok(r.features.length > 1, 'a single unbounded path must widen the whole run');
@@ -194,7 +205,7 @@ describe('controlled case 4 — cross-cutting change escalates without matching 
   test('a migration escalates', () => {
     const r = selectByImpact({
       features: FEATURES, profile: 'poc', rules: RULES,
-      changedPaths: ['server/migrations/0023_erasure_authority.sql'],
+      changedPaths: ['server/migrations/0042_data_boundary.sql'],
     });
     assert.equal(r.escalated, true);
     assert.equal(r.applicable, true);
@@ -222,7 +233,7 @@ describe('controlled case 5 — absent diff information never yields a skip', ()
     const r = selectByImpact({ features: FEATURES, profile: 'poc', rules: RULES, changedPaths: null });
     assert.equal(r.method, 'profile');
     assert.equal(r.applicable, true);
-    assert.deepEqual(ids(r), ['admin-roster-manage', 'prospective-report-boundary']);
+    assert.deepEqual(ids(r), ['admin-records-manage', 'restricted-report-boundary']);
     assert.match(r.reason, /no base SHA/);
   });
 
@@ -301,7 +312,7 @@ describe('governing-contract roots may not be ignored', () => {
   test('a requirements change is NOT ignorable — it escalates', () => {
     const r = selectByImpact({
       features: FEATURES, profile: 'poc', rules: RULES,
-      changedPaths: ['docs/requirements/nsc-evaluation-prd-v5.md'],
+      changedPaths: ['docs/requirements/product-spec-v5.md'],
     });
     assert.equal(r.applicable, true, 'a requirements change must never be NOT_APPLICABLE');
     assert.equal(r.escalated, true);
@@ -332,16 +343,16 @@ describe('governing-contract roots may not be ignored', () => {
   test('an ADR cited by features still selects exactly those features', () => {
     const r = selectByImpact({
       features: FEATURES, profile: 'poc', rules: RULES,
-      changedPaths: ['docs/adr/ADR-005-minor-data-policy.md'],
+      changedPaths: ['docs/adr/ADR-201-data-policy.md'],
     });
     assert.equal(r.escalated, false);
-    assert.deepEqual(ids(r), ['prospective-report-boundary']);
+    assert.deepEqual(ids(r), ['restricted-report-boundary']);
   });
 
   test('a docs-only change outside governing roots may still skip', () => {
     const r = selectByImpact({
       features: FEATURES, profile: 'poc', rules: RULES,
-      changedPaths: ['docs/watson/phase-1-log.md', 'README.md'],
+      changedPaths: ['docs/verifier/run-log.md', 'README.md'],
     });
     assert.equal(r.applicable, false);
   });
@@ -349,9 +360,9 @@ describe('governing-contract roots may not be ignored', () => {
 
 describe('security-sensitive changes escalate', () => {
   for (const [label, p] of [
-    ['authorization enforcement', 'server/src/identity/enforcement.ts'],
-    ['database authorization', 'server/src/db/seasonPlayerRepo.ts'],
-    ['a runtime-visible migration', 'server/migrations/0023_erasure_authority.sql'],
+    ['authorization enforcement', 'server/src/authz/enforcement.ts'],
+    ['database authorization', 'server/src/store/recordRepo.ts'],
+    ['a runtime-visible migration', 'server/migrations/0042_data_boundary.sql'],
   ]) {
     test(`${label} escalates rather than narrowing to a claiming feature`, () => {
       const r = selectByImpact({ features: FEATURES, profile: 'poc', rules: RULES, changedPaths: [p] });
@@ -364,12 +375,12 @@ describe('security-sensitive changes escalate', () => {
     // enforcement.ts is claimed by a feature in the real map AND is cross-cutting.
     // The broader requirement wins: an authorization change is not one journey's
     // business just because one journey happens to name the file.
-    const withClaim = FEATURES.map((f) => (f.id === 'prospective-report-boundary'
-      ? { ...f, source_globs: [...f.source_globs, 'server/src/identity/enforcement.ts'] }
+    const withClaim = FEATURES.map((f) => (f.id === 'restricted-report-boundary'
+      ? { ...f, source_globs: [...f.source_globs, 'server/src/authz/enforcement.ts'] }
       : f));
     const r = selectByImpact({
       features: withClaim, profile: 'poc', rules: RULES,
-      changedPaths: ['server/src/identity/enforcement.ts'],
+      changedPaths: ['server/src/authz/enforcement.ts'],
     });
     assert.equal(r.escalated, true);
     assert.ok(r.features.length > 1, 'must not narrow to the single claiming feature');
