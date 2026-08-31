@@ -249,8 +249,10 @@ export async function reap({ adminUrl, prefix = 'watson_', maxAgeHours = 2, now 
  * unmodified and rejects everything it should.
  *
  * WHAT THIS DOES NOT PROVE — stated in every result's environment block:
- * hosted login, Magic Auth delivery, cookie/session lifetime, sealing/rotation,
- * or Admin-MFA step-up. Those are separately verified.
+ * hosted identity-provider login, passwordless delivery, cookie/session
+ * lifetime, session sealing and rotation, or step-up MFA. Those are separately
+ * verified. Named generically for the same reason as the result envelope: the
+ * engine's semantics do not depend on which identity provider a product uses.
  */
 export async function startIdentityService({ issuer, clientId, identities }) {
   const { publicKey, privateKey } = await generateKeyPair('RS256', { extractable: true });
