@@ -185,14 +185,33 @@ Chromium refuses to start as root with its sandbox on; the response is to refuse
 to be root, never to pass `--no-sandbox`. `launchBrowser` throws as root, the
 flag appears nowhere in `src/`, and a test greps for it.
 
-`test/browser-sandbox-proof.mjs` proves the sandbox rather than asserting it: it
+`test/browser-sandbox-proof.mjs` proves the sandbox rather than asserting it. It
 launches the real browser as an unprivileged user in the pinned container image
-and reads the kernel's account of the renderer processes Chromium forked —
-`Seccomp: 2` (seccomp-bpf filter mode) and `NoNewPrivs: 1` in
-`/proc/<pid>/status`, corroborated by `chrome://sandbox` where the build renders
-it. CI runs it on every change. If an image or runner cannot give us a sandboxed
-non-root browser, the right outcome is a red build and a conversation, not a
-quietly weakened threat model.
+and establishes both of Chromium's layers, which fail independently:
+
+| layer | how it is established |
+| --- | --- |
+| seccomp-bpf | `Seccomp: 2` and `NoNewPrivs: 1` in the renderer's `/proc/<pid>/status` |
+| namespace sandbox | `chrome://sandbox` reporting *adequately sandboxed*, corroborated by the renderer's `/proc/<pid>/ns/{user,pid,net}` |
+
+Chromium's own status page is authoritative for layer 1 because Chromium knows
+which mechanism it chose. An earlier version of this proof demanded a separate
+*user* namespace and reported the sandbox missing on a browser Chromium itself
+called adequately sandboxed — the check was wrong, not the browser.
+
+Two things this proof had to learn the hard way, both now permanent:
+
+- **Docker's default seccomp profile forbids the namespace sandbox.** Measured on
+  the runners: not AppArmor, not `no-new-privileges`. `seccomp/` and
+  `tools/seccomp-profile.mjs` derive the smallest profile that permits it, and a
+  test asserts the delta from Docker's default is exactly two documented edits.
+- **Watson drives Chromium proper, not Playwright's default headless shell.** The
+  headless shell does not answer `chrome://sandbox` at all, and a sandbox this
+  design cannot prove is not one it gets to claim.
+
+CI runs the proof on every change. If an image or runner cannot give us a
+sandboxed non-root browser, the right outcome is a red build and a conversation,
+not a quietly weakened threat model.
 
 ### Within one process, when that is what you have
 
