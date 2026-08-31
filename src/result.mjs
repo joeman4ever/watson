@@ -100,7 +100,13 @@ export function buildEnvelope(run) {
   return {
     schema_version: SCHEMA_VERSION,
     run_id: run.runId,
-    watson: { version: run.watsonVersion, commit: run.watsonCommit ?? null },
+    watson: {
+      version: run.watsonVersion,
+      commit: run.engine?.commit ?? run.watsonCommit ?? null,
+      // False means the engine had uncommitted changes, so `commit` names a
+      // revision the running code is not. Null means it could not be determined.
+      clean: run.engine?.clean ?? null,
+    },
 
     repository: run.repository,
     pull_request: run.pullRequest ?? null,

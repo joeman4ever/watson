@@ -203,3 +203,34 @@ export function changedPaths(repoRoot, baseSha, headSha) {
     return null;
   }
 }
+
+/**
+ * The engine's OWN commit and tree state.
+ *
+ * A result records which product revision was verified; without this it does not
+ * record which VERIFIER produced that judgement. Those are different facts, and
+ * the second one decays fastest — an engine changes, and an observation recorded
+ * months earlier silently starts meaning something slightly different to whoever
+ * reads it.
+ *
+ * `clean` matters as much as the SHA. An engine running with local modifications
+ * is not the commit it names, for exactly the reason a dirty product checkout is
+ * not the revision it claims (ADR-039 D7). A SHA reported from a modified tree
+ * would be a more convincing lie than no SHA at all, so the two travel together.
+ *
+ * Returns nulls rather than throwing: not knowing the engine's provenance must
+ * never stop a verification, only be recorded honestly.
+ */
+export function engineProvenance(engineRoot) {
+  const git = (args) => execFileSync('git', args, {
+    cwd: engineRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+  }).trim();
+  try {
+    const commit = git(['rev-parse', 'HEAD']);
+    if (!/^[0-9a-f]{40}$/.test(commit)) return { commit: null, clean: null };
+    return { commit, clean: git(['status', '--porcelain']) === '' };
+  } catch {
+    // No git, or the engine was installed as a plain directory. Honest silence.
+    return { commit: null, clean: null };
+  }
+}
