@@ -133,6 +133,26 @@ describe('exact-HEAD is an identity claim, not a cleanliness claim', () => {
     assert.deepEqual(st.dirty_paths, ['evil.js']);
   });
 
+  test('a corrupt index makes the tree INEXACT, not clean', () => {
+    // Found by attacking the fixes for the previous round. The two listing
+    // helpers returned [] on failure, which is the opposite claim from the one
+    // they had evidence for: "there are no extra files" versus "I could not
+    // tell". One line — write garbage over .git/index — made both fail while the
+    // content hash carried on, and a staged backdoor read as a clean tree at
+    // exact_head: true.
+    const r = gitRepo();
+    const reported = r.head();
+    fs.writeFileSync(path.join(r.dir, 'evil.js'), 'backdoor\n');
+    r.git('add', '-A');
+    fs.writeFileSync(path.join(r.dir, '.git', 'index'), 'GARBAGE-NOT-AN-INDEX');
+
+    const st = workingTreeState(r.dir, reported);
+    assert.equal(st.clean, null, 'unknown, not clean');
+    assert.equal(st.exact_head, false);
+    assert.equal(st.method, 'failed');
+    assert.equal(downgradeForInexactHead('PASS', st).verdict, 'INDETERMINATE');
+  });
+
   test('a tracked file replaced by a symlink is divergent', () => {
     // Hashing the link TARGET rather than the link itself would let a symlink
     // into a file with identical bytes read as unmodified.

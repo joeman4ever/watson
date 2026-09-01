@@ -174,9 +174,16 @@ export function workingTreeState(repoRoot, expectedSha = null) {
   const headMatches = expectedSha ? head === expectedSha : null;
   const against = expectedSha ?? head;
 
+  // Every source below THROWS on failure rather than reporting nothing found, and
+  // this catch turns any of them into an inexact tree. "I could not establish
+  // this" must never be recorded as "there was nothing to find".
   let diverged;
+  let untracked;
+  let staged;
   try {
     diverged = divergedPaths(repoRoot, against);
+    untracked = untrackedPaths(repoRoot);
+    staged = stagedButUncommitted(repoRoot, against);
   } catch (err) {
     return {
       clean: null, exact_head: false, dirty_paths: [], dirty_count: 0, contract_dirty: false,
@@ -201,8 +208,6 @@ export function workingTreeState(repoRoot, expectedSha = null) {
   // The union is not defence in depth against an attacker: every source here
   // reads the same product-owned `.git`. It is coverage. What resists tampering
   // is the content hash, which asks git for the commit's tree and nothing else.
-  const untracked = untrackedPaths(repoRoot);
-  const staged = stagedButUncommitted(repoRoot, against);
   const all = [...new Set([...diverged, ...untracked, ...staged])].sort();
 
   const contractDirty = all.some((p) => p.startsWith('.watson/'));
@@ -308,19 +313,22 @@ export function divergedPaths(repoRoot, sha) {
 }
 
 /**
- * Untracked, non-ignored paths. Best-effort by construction: the ignore rules
- * come from the product's own `.gitignore`, so a file the product chooses to
- * ignore is invisible here. That is a known limit, not an oversight — a change
- * that hides itself in an ignored path is caught, if at all, by the fact that
- * the commit's own tracked content still has to match.
+ * Untracked, non-ignored paths.
+ *
+ * THROWS rather than returning an empty list. The two are opposite claims —
+ * "there are no extra files" and "I could not tell" — and returning `[]` for the
+ * second was a fail-open with a one-line trigger: corrupt `.git/index`, and both
+ * this and the staged listing failed while the content hash carried on, so a
+ * staged backdoor read as a clean tree at exact_head: true. Found by attacking
+ * the fixes for the previous round of attacks.
+ *
+ * The ignore rules still come from the product's own `.gitignore`, so a file the
+ * product chooses to ignore is invisible here. That is a stated limit of what
+ * this establishes, not a silent one.
  */
 function untrackedPaths(repoRoot) {
-  try {
-    return git(['ls-files', '--others', '--exclude-standard', '-z'], { cwd: repoRoot })
-      .split('\0').filter(Boolean);
-  } catch {
-    return [];
-  }
+  return git(['ls-files', '--others', '--exclude-standard', '-z'], { cwd: repoRoot })
+    .split('\0').filter(Boolean);
 }
 
 /**
@@ -329,19 +337,17 @@ function untrackedPaths(repoRoot) {
  *
  * Its own ignore rules do not apply: `git add` is an explicit act, so a path
  * here was deliberately staged and is deliberately not in the reviewed commit.
+ *
+ * THROWS rather than returning an empty list, for the reason given above.
  */
 function stagedButUncommitted(repoRoot, sha) {
-  try {
-    const cached = git(['ls-files', '--cached', '-z'], { cwd: repoRoot })
-      .split('\0').filter(Boolean);
-    const inCommit = new Set(
-      git(['ls-tree', '-r', '-z', '--name-only', sha], { cwd: repoRoot })
-        .split('\0').filter(Boolean),
-    );
-    return cached.filter((p) => !inCommit.has(p));
-  } catch {
-    return [];
-  }
+  const cached = git(['ls-files', '--cached', '-z'], { cwd: repoRoot })
+    .split('\0').filter(Boolean);
+  const inCommit = new Set(
+    git(['ls-tree', '-r', '-z', '--name-only', sha], { cwd: repoRoot })
+      .split('\0').filter(Boolean),
+  );
+  return cached.filter((p) => !inCommit.has(p));
 }
 
 /** git's object id for a blob: sha1("blob <len>\0" + content). */
