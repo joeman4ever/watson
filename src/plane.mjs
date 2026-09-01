@@ -12,12 +12,25 @@
 // and reports what came back. Every decision that could change a verdict stays
 // on the verifier side of the network.
 //
-// WHAT IT IS TRUSTED FOR: nothing. Its answers are product-supplied data, the
-// same as the product's HTTP responses. A product that subverts this process
-// entirely can lie about its own bring-up — which surfaces as a health timeout,
-// or as an application that behaves however it behaves, which is exactly what
-// Watson is there to observe. It cannot reach the evidence, because the evidence
-// is not in this container.
+// WHAT IT IS TRUSTED FOR. Almost nothing — and the "almost" is load-bearing, so
+// it is stated rather than rounded off. Readiness, timings, phase, error text and
+// the tree claim are all handled as untrusted data: checked, bounded, or acted on
+// only in the direction that incriminates the plane.
+//
+// The exception is the fixture's emitted `vars`. Those are product-authored and
+// they become ASSERTION OPERANDS — `expect_text: "${seasonName}"` asserts against
+// a string the product chose. `degenerateOperand` refuses values too unspecific
+// to prove anything, which raises the cost; it does not remove the ability to
+// choose. Closing it means the VERIFIER choosing those values and passing them
+// into the fixture, which is a contract change and is tracked, not done.
+//
+// So: "nothing the plane says is trusted" was the claim, and it was false. This
+// is the true version, and it is smaller.
+//
+// A product that subverts this process entirely can lie about its own bring-up —
+// which surfaces as a health timeout, or as an application that behaves however
+// it behaves, which is exactly what Watson is there to observe. It cannot reach
+// the evidence, because the evidence is not in this container.
 //
 // The verifier NEVER takes readiness from this process's word: it polls the
 // product's own health endpoint across the network. That asymmetry is the point.

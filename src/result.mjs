@@ -259,7 +259,7 @@ export function summary(env) {
     L.push('| | Feature | Role | Steps | Time |');
     L.push('| --- | --- | --- | --- | --- |');
     for (const f of env.features) {
-      L.push(`| ${ICON[f.verdict] ?? '·'} ${f.verdict} | ${f.title} | ${f.role} | ${f.steps.filter((s) => s.result === 'ok').length}/${f.steps.length} | ${(f.duration_ms / 1000).toFixed(1)}s |`);
+      L.push(`| ${ICON[f.verdict] ?? '·'} ${f.verdict} | ${safe(f.title)} | ${f.role} | ${f.steps.filter((s) => s.result === 'ok').length}/${f.steps.length} | ${(f.duration_ms / 1000).toFixed(1)}s |`);
     }
     L.push('');
   }
@@ -269,15 +269,15 @@ export function summary(env) {
   if (blocking.length) {
     L.push('### Blocking findings');
     for (const f of blocking) {
-      L.push(`- **${f.summary}** _(${f.rule}, ${f.feature})_`);
-      if (f.required_action) L.push(`  - Required: ${f.required_action}`);
+      L.push(`- **${safe(f.summary)}** _(${safe(f.rule)}, ${safe(f.feature)})_`);
+      if (f.required_action) L.push(`  - Required: ${safe(f.required_action)}`);
     }
     L.push('');
   }
   for (const f of env.features.filter((x) => x.verdict === 'FAIL_PRODUCT')) {
     const bad = f.steps.find((s) => s.result === 'fail');
     if (!bad) continue;
-    L.push(`### Failure detail — ${f.title}`);
+    L.push(`### Failure detail — ${safe(f.title)}`);
     L.push(`Step ${bad.n} (\`${safe(bad.action)}\`): ${safe(bad.observed)}`);
     if (bad.expected) L.push(`Expected: ${safe(bad.expected)}`);
     if (f.evidence?.length) L.push(`Evidence: ${f.evidence.map((e) => `\`${e}\``).join(', ')}`);
@@ -285,7 +285,7 @@ export function summary(env) {
   }
   if (advisory.length) {
     L.push('### Advisories');
-    for (const f of advisory) L.push(`- ${f.summary} _(${f.rule}, ${f.feature})_`);
+    for (const f of advisory) L.push(`- ${safe(f.summary)} _(${safe(f.rule)}, ${safe(f.feature)})_`);
     L.push('');
   }
 
@@ -327,7 +327,7 @@ export function summary(env) {
       L.push('');
       L.push('**The contract itself is modified.** This run verified expectations that do not exist at that SHA, so its result cannot be cited for that commit.');
     }
-    if (wt.dirty_paths?.length) L.push('', 'Modified: ' + wt.dirty_paths.map((p) => `\`${p}\``).join(', '));
+    if (wt.dirty_paths?.length) L.push('', 'Modified: ' + wt.dirty_paths.map((p) => `\`${safe(p)}\``).join(', '));
     L.push('');
   }
 

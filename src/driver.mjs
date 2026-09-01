@@ -15,6 +15,7 @@
 import { chromium } from 'playwright';
 import fs from 'node:fs';
 import path from 'node:path';
+import { degenerateOperand } from './contract.mjs';
 
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
@@ -418,12 +419,18 @@ export async function runStep(step, ctx) {
 export function interp(str, vars) {
   return String(str).replace(/\$\{(\w+)\}/g, (_, k) => {
     const v = vars?.[k];
-    if (v === undefined || v === null || String(v) === '') {
+    if (v === undefined) {
       throw new Error(
         `\${${k}} could not be resolved to a value. An unresolved operand is not an ` +
           'expectation; refusing to assert against it.',
       );
     }
+    // The SAME predicate `validateSeedValues` applies at the source. Two rules
+    // for one variable namespace is how a value rejected in one place arrives
+    // through the other — which is what happened when this accepted `" "` and
+    // the source check rejected it.
+    const bad = degenerateOperand(v);
+    if (bad) throw new Error(`\${${k}} ${bad}`);
     return String(v);
   });
 }

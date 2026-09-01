@@ -240,9 +240,13 @@ async function bringUpRemote({ contract, runId, adminUrl, planeUrl, productBaseU
   const cfg = contract.config;
   const dbName = `watson_${runId.replace(/[^a-z0-9]/gi, '').slice(-16).toLowerCase()}`;
   const started = {};
-  const timings = {};
+  let timings = {};
   let planeTree = null;
 
+  // The plane is untrusted and is on the other end of this read, so the response
+  // is treated as hostile input: status checked, size bounded, parsed by hand.
+  // `res.json()` on an unbounded body is an invitation.
+  const MAX_PLANE_RESPONSE = 8 * 1024 * 1024;
   const plane = async (route, body) => {
     const res = await fetch(`${planeUrl}${route}`, {
       method: body === undefined ? 'GET' : 'POST',
@@ -250,7 +254,27 @@ async function bringUpRemote({ contract, runId, adminUrl, planeUrl, productBaseU
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: AbortSignal.timeout(1_200_000),
     });
-    return res.json();
+    const reader = res.body?.getReader();
+    if (!reader) throw new Error(`product plane ${route}: no response body`);
+    const chunks = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.length;
+      if (total > MAX_PLANE_RESPONSE) {
+        await reader.cancel();
+        throw new Error(`product plane ${route}: response exceeded ${MAX_PLANE_RESPONSE} bytes`);
+      }
+      chunks.push(value);
+    }
+    const text = Buffer.concat(chunks).toString('utf8');
+    if (!res.ok && !text) throw new Error(`product plane ${route}: HTTP ${res.status}`);
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new Error(`product plane ${route}: HTTP ${res.status}, response was not JSON: ${text.slice(0, 300)}`);
+    }
   };
 
   const teardown = async () => {
@@ -271,13 +295,28 @@ async function bringUpRemote({ contract, runId, adminUrl, planeUrl, productBaseU
     // about a commit that was never driven. The plane is untrusted, so a matching
     // answer proves little — but a MISMATCHING one is conclusive, and this is the
     // only thing that would notice an orchestration wired to two checkouts.
-    if (headSha && alive.tree?.head_sha && alive.tree.head_sha !== headSha) {
+    if (!alive.tree?.head_sha) {
+      throw new Error(
+        `the product plane did not say which checkout it is about to build. Silence and agreement `
+          + 'are not the same answer, and this check exists to tell them apart.',
+      );
+    }
+    if (headSha && alive.tree.head_sha !== headSha) {
       throw new Error(
         `the product plane is at ${alive.tree.head_sha}, but this run is about ${headSha}. `
           + 'The verifier and the plane are looking at different checkouts.',
       );
     }
-    planeTree = alive.tree ?? null;
+    // A peer reporting its OWN tree dirty is the one statement an untrusted
+    // party can usefully make against itself. Recording it and carrying on
+    // would waste the only self-incrimination available.
+    if (alive.tree.clean === false) {
+      throw new Error(
+        `the product plane reports its own checkout is not clean (${alive.tree.dirty_count} path(s)). `
+          + 'It is about to build something other than the commit this run is about.',
+      );
+    }
+    planeTree = alive.tree;
 
     // 1. PROVISION — from the verifier side. The database is reachable from both
     //    planes over the isolated network, but only the verifier may CREATE one,
@@ -330,9 +369,11 @@ async function bringUpRemote({ contract, runId, adminUrl, planeUrl, productBaseU
         `${(launched?.log ?? '').slice(-1500)}`,
       );
     }
-    // Spread, not Object.assign: the plane is untrusted, and `Object.assign`
-    // routes a `__proto__` key through the prototype setter.
-    Object.assign(timings, { ...(launched.timings ?? {}) });
+    // A PURE spread, reassigning. The previous attempt spread into
+    // `Object.assign`, which still writes each key with [[Set]] and so still
+    // invokes the prototype setter — the fix was on the wrong side of the call
+    // and did nothing.
+    timings = { ...timings, ...(launched.timings ?? {}) };
     timings.launch_ms = Date.now() - t;
 
     // 4. READINESS — proven by the verifier, across the network, against the
@@ -378,6 +419,15 @@ async function cmdVerify(args) {
   // Resolved ONCE, before anything runs, and before a database exists. A caller
   // that asked for privilege separation and cannot have it must find out here —
   // not after the product's install script has already run as the verifier.
+  // Cleared FIRST, before any refusal below can end the run. A stale file at the
+  // agreed path is read by a harness as this run's verdict, so removing it has to
+  // happen earlier than every exit — including the ones a few lines down, which
+  // is where it used to sit and therefore did not run.
+  const outPath = typeof args.out === 'string' ? path.resolve(args.out) : null;
+  if (outPath) {
+    try { fs.rmSync(outPath, { force: true, recursive: true }); } catch { /* nothing there */ }
+  }
+
   const policy = env.productExecution();
   // uid separation requires root; a sandboxed browser requires NOT root. A
   // `verify` asked for both would run the entire bring-up and then throw at the
@@ -390,11 +440,6 @@ async function cmdVerify(args) {
         + 'which is the stronger boundary anyway. uid separation remains available for `watson doctor`.',
     );
   }
-  const outPath = typeof args.out === 'string' ? path.resolve(args.out) : null;
-  // Removed BEFORE anything runs. A crash later would otherwise leave the
-  // PREVIOUS run's result sitting at the agreed path, where a harness would read
-  // it as this run's verdict — the exact hazard `--out` exists to remove.
-  if (outPath) { try { fs.rmSync(outPath, { force: true }); } catch { /* nothing there */ } }
   // When a plane URL is given, the product runs on the far side of a boundary
   // and this process never executes a line of it. Both values come from trusted
   // orchestration, never from the product.

@@ -99,6 +99,40 @@ describe('exact-HEAD is an identity claim, not a cleanliness claim', () => {
     assert.equal(downgradeForInexactHead('PASS', st).verdict, 'INDETERMINATE');
   });
 
+  test('`git replace` cannot rewrite the tree the gate reads', () => {
+    // refs/replace/ lives inside the .git the product owns, and git resolves
+    // objects through it by default. Three lines, no commit, no HEAD move —
+    // and `ls-tree` returns a tree the author wrote while `rev-parse HEAD`
+    // still reports the reviewed commit.
+    const r = gitRepo();
+    const reported = r.head();
+    fs.writeFileSync(path.join(r.dir, 'app.js'), 'console.log("tampered");\n');
+    r.git('add', '-A');
+    const forged = r.git('commit-tree', r.git('write-tree'), '-m', 'forged');
+    r.git('replace', '-f', reported, forged);
+
+    const st = workingTreeState(r.dir, reported);
+    assert.equal(st.head_matches, true, 'HEAD genuinely still reports the reviewed commit');
+    assert.equal(st.exact_head, false);
+    assert.deepEqual(st.dirty_paths, ['app.js']);
+  });
+
+  test('a staged-but-uncommitted file is divergent', () => {
+    // `ls-files --others` means "not in the index", so `git add` used to remove
+    // a new file from the untracked listing while it was never in the commit
+    // tree either — invisible to both halves of the union at once. The check
+    // this replaced caught it, so this was a regression, not a residual.
+    const r = gitRepo();
+    const reported = r.head();
+    fs.writeFileSync(path.join(r.dir, 'evil.js'), 'backdoor\n');
+    assert.deepEqual(workingTreeState(r.dir, reported).dirty_paths, ['evil.js'], 'unstaged control');
+    r.git('add', '-A');
+
+    const st = workingTreeState(r.dir, reported);
+    assert.equal(st.exact_head, false);
+    assert.deepEqual(st.dirty_paths, ['evil.js']);
+  });
+
   test('a tracked file replaced by a symlink is divergent', () => {
     // Hashing the link TARGET rather than the link itself would let a symlink
     // into a file with identical bytes read as unmodified.
@@ -423,5 +457,38 @@ describe('product-controlled text cannot forge the summary marker', () => {
     const body = doc.slice(0, doc.indexOf('WATSON_METADATA') >= 0 ? doc.lastIndexOf('<!--') : doc.length);
     assert.ok(!body.includes('-->'), 'a product string closed a comment in the summary body');
     assert.ok(!body.includes('WATSON_METADATA'), 'a product string reproduced the marker name');
+  });
+});
+
+
+describe('an assertion operand the product chose must at least be specific', () => {
+  test('short and single-character values are refused', async () => {
+    // The first version of this check rejected only the empty string, which is
+    // the one value an attacker would never have to use: `expect_text` and
+    // `expect_url_contains` are SUBSTRING tests, so "a" and "/" are exactly as
+    // vacuous. A heuristic, and named as one — the structural fix is for the
+    // verifier to choose these values rather than accept them.
+    const { degenerateOperand, validateSeedValues } = await import('../src/contract.mjs');
+    for (const v of ['', ' ', 'a', '/', 0, 'aaaa', {}, null]) {
+      assert.ok(degenerateOperand(v), `${JSON.stringify(v)} should be refused as an operand`);
+    }
+    for (const v of ['2026', 'season-2026', 'a1b2c3d4-...']) {
+      assert.equal(degenerateOperand(v), null, `${JSON.stringify(v)} is a real identifier`);
+    }
+    assert.deepEqual(validateSeedValues({ seasonName: 'Fall 2026' }, { emits: ['seasonName'] }), []);
+    assert.equal(validateSeedValues({ seasonName: 'a' }, { emits: ['seasonName'] }).length, 1);
+    assert.equal(validateSeedValues({}, { emits: ['seasonName'] }).length, 1);
+  });
+
+  test('the driver and the source check apply the SAME predicate', async () => {
+    // Two rules for one namespace is how a value rejected at the source arrives
+    // through the other door — which is what happened when interp accepted " "
+    // and validateSeedValues rejected it.
+    const { interp } = await import('../src/driver.mjs');
+    const { validateSeedValues } = await import('../src/contract.mjs');
+    for (const v of [' ', 'a', '/']) {
+      assert.equal(validateSeedValues({ x: v }, { emits: ['x'] }).length, 1);
+      assert.throws(() => interp('${x}', { x: v }), /Expect|character|empty|substring/i);
+    }
   });
 });

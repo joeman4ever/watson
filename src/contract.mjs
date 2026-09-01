@@ -8,6 +8,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+// The hardened wrapper, so the claim that EVERY git invocation goes through it
+// is true rather than nearly true. This one reads a base-branch tree, which the
+// pull request's author does not write — but 'not exploitable today' is a worse
+// property than 'covered'.
+import { git } from './fingerprint.mjs';
 import YAML from 'yaml';
 
 /** Parse `---\nyaml\n---\nmarkdown` into { data, body }. */
@@ -225,16 +230,49 @@ export function validateSeedValues(vars, fixtureProfile) {
       problems.push(`the fixture declares \`${name}\` in \`emits\` but did not emit it`);
       continue;
     }
-    const value = vars[name];
-    if (value === null || value === undefined || String(value).trim() === '') {
-      problems.push(
-        `\`${name}\` came back empty. An empty value interpolates into an empty ` +
-          'expectation, which every assertion satisfies.',
-      );
-    }
+    const bad = degenerateOperand(vars[name]);
+    if (bad) problems.push(`\`${name}\` ${bad}`);
   }
   return problems;
 }
+
+/**
+ * Is this value too unspecific to be an assertion operand?
+ *
+ * The first version of this check rejected only the empty string, which ruled
+ * out the one value an attacker would never have to use. `expect_text` and
+ * `expect_url_contains` are SUBSTRING tests, so a single common character is
+ * exactly as vacuous:
+ *
+ *     expect_text "a"          -> true against "Something went wrong."
+ *     expect_url_contains "/"  -> true against any URL at all
+ *
+ * A HEURISTIC, and named as one. It raises the cost of a vacuous operand; it
+ * does not remove the ability to choose one, because the product still chooses
+ * the value. The structural fix is for the VERIFIER to choose these values and
+ * pass them into the fixture, rather than accepting whatever comes back — see
+ * `docs/verifier-chosen-fixture-values.md`.
+ */
+export function degenerateOperand(value) {
+  if (value === null || value === undefined) return 'is null; an unresolved operand is not an expectation';
+  if (typeof value === 'object') return 'is not a scalar; an assertion operand must be a string or number';
+  const v = String(value).trim();
+  if (v === '') return 'came back empty; an empty expectation is satisfied by anything';
+  if (v.length < MIN_OPERAND_LENGTH) {
+    return `is ${v.length} character(s) long. Assertions on it are substring tests, so a short `
+      + `value is satisfied by almost any page — it proves nothing about the product.`;
+  }
+  if (new Set(v).size < 2) return 'repeats a single character; as a substring test that proves nothing';
+  if (!/[a-z0-9]/i.test(v)) return 'contains no alphanumeric character; as a substring test that proves nothing';
+  return null;
+}
+
+/**
+ * Chosen against what a fixture legitimately emits: database ids, slugs, season
+ * names, session names. Four characters admits `2026`, which is a real season
+ * name, and excludes `a` and `/`, which are not identifiers at all.
+ */
+export const MIN_OPERAND_LENGTH = 4;
 
 /**
  * Expand `depends_on` into an ordered setup list. A prerequisite runs as SETUP,
@@ -273,7 +311,7 @@ export function loadContractAt(repoRoot, sha) {
     tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'watson-contract-'));
     // `git archive` writes only what the commit contains — nothing from the
     // working tree, so a dirty checkout cannot contaminate the base side.
-    const tar = execFileSync('git', ['archive', '--format=tar', sha, '.watson'], {
+    const tar = git(['archive', '--format=tar', sha, '.watson'], {
       cwd: repoRoot, maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'],
     });
     execFileSync('tar', ['-x', '-C', tmp], { input: tar, stdio: ['pipe', 'ignore', 'ignore'] });

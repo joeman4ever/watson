@@ -173,9 +173,18 @@ chooses the port, resolves every command and environment variable, and confirms
 readiness itself by polling the product's own health endpoint. **The product
 plane executes:** it runs what it is handed and answers with what came back.
 
-Nothing the plane says is trusted, and it has no endpoint that reports readiness
-— deliberately, and there is a test for it. A plane allowed to decide one small
-thing is a plane the product can use to make the verifier agree with it.
+The plane has no endpoint that reports readiness — deliberately, and there is a
+test for it. A plane allowed to decide one small thing is a plane the product can
+use to make the verifier agree with it.
+
+Almost nothing the plane says is trusted, and the *almost* is load-bearing. The
+fixture's emitted variables are product-authored and become **assertion
+operands**: `expect_text: "${seasonName}"` asserts against a string the product
+chose. Watson refuses values too unspecific to prove anything — an empty string,
+a single character, `"/"` — which raises the cost of a vacuous assertion without
+removing the ability to choose one. Closing it properly means the verifier
+choosing those values and passing them *into* the fixture. That is a contract
+change, and it is tracked rather than claimed.
 
 ### The browser is part of the verifier
 

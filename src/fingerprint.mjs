@@ -52,15 +52,35 @@ const SAFE_CONFIG = [
   'uploadpack.packObjectsHook=',
   'protocol.ext.allow=never',
   'protocol.file.allow=never',
+  // `refs/replace/` lives inside the .git the product owns, and git resolves
+  // objects through it by default. Without this, three product-authored lines
+  // make `ls-tree` return a tree the author wrote while `rev-parse HEAD` still
+  // reports the reviewed commit — arbitrary content at exact_head: true.
+  'core.useReplaceRefs=false',
 ].flatMap((kv) => ['-c', kv]);
 
 const SAFE_ENV = {
   GIT_CONFIG_NOSYSTEM: '1',
-  GIT_CONFIG_GLOBAL: '/dev/null',
+  // Belt and braces with `core.useReplaceRefs=false` above.
+  GIT_NO_REPLACE_OBJECTS: '1',
   GIT_TERMINAL_PROMPT: '0',
   GIT_ASKPASS: '',
   GIT_OPTIONAL_LOCKS: '0',
 };
+
+// DELIBERATELY NOT SET: GIT_CONFIG_GLOBAL=/dev/null.
+//
+// It looks like more hardening and is the opposite. The global config belongs to
+// the VERIFIER, not to the product, so it is not part of the attack surface —
+// and it is the only place `safe.directory` can be set, which is exactly what
+// makes a checkout owned by another uid readable at all. Discarding it turns
+// the intended topology (the product writes the tree, the verifier reads it)
+// into `clean: null` on every run, and therefore INDETERMINATE forever.
+//
+// What actually blocks the attack is the `-c` overrides above: command-line
+// config outranks the repository's own, which is where a hostile setting lives.
+// `safe.directory` is ignored from `-c` by git on purpose, so there is no way to
+// re-add it here — the global file has to stay in the picture.
 
 /** Run git against a repository that may be hostile. */
 export function git(args, { cwd, encoding = 'utf8', maxBuffer = 64 * 1024 * 1024, stdio } = {}) {
@@ -165,16 +185,25 @@ export function workingTreeState(repoRoot, expectedSha = null) {
     };
   }
 
-  // Content hashing covers TRACKED paths. Untracked-but-not-ignored files change
-  // nothing about the commit's own content, but they can change how the product
-  // behaves, so they still count as a divergent tree — and for those, git's own
-  // listing is the only practical source of the ignore rules.
+  // Content hashing covers paths that are IN THE COMMIT. Two other kinds of file
+  // change how the product behaves without appearing there, and each needs its
+  // own source:
   //
-  // Deliberately a UNION, not a replacement. `git status` can be blinded by the
-  // product's index; the content hash cannot. The content hash cannot see an
-  // untracked file; `git status` can. Neither is trusted to be complete alone.
+  //   untracked — never added. `ls-files --others`.
+  //   STAGED    — added but not committed. `ls-files --cached`, compared against
+  //               the commit tree.
+  //
+  // The second was a hole, and a regression against the `git status` check this
+  // replaced. "Others" means "not in the index", so `git add server/evil.js`
+  // removed the file from the untracked listing while it was never in the commit
+  // tree either — invisible to both halves at once, from one word.
+  //
+  // The union is not defence in depth against an attacker: every source here
+  // reads the same product-owned `.git`. It is coverage. What resists tampering
+  // is the content hash, which asks git for the commit's tree and nothing else.
   const untracked = untrackedPaths(repoRoot);
-  const all = [...new Set([...diverged, ...untracked])].sort();
+  const staged = stagedButUncommitted(repoRoot, against);
+  const all = [...new Set([...diverged, ...untracked, ...staged])].sort();
 
   const contractDirty = all.some((p) => p.startsWith('.watson/'));
   const clean = all.length === 0;
@@ -219,9 +248,15 @@ export function workingTreeState(repoRoot, expectedSha = null) {
  * before it was fixed.
  *
  * So identity is established from the commit's own object tree — read with
- * plumbing that consults no index — and from the bytes on disk, hashed here.
- * Nothing the product can set in `.git/config`, `.git/index` or `.gitattributes`
- * takes part: no content filters, no fsmonitor, no assume-unchanged bit.
+ * plumbing that consults no index, and with replace refs disabled — and from the
+ * bytes on disk, hashed here. No content filter, fsmonitor, assume-unchanged bit
+ * or replacement object takes part in THIS comparison.
+ *
+ * Stated precisely, because the previous version of this comment overreached:
+ * the index does take part elsewhere, in the staged-path listing beside this,
+ * and the product's ignore rules decide what counts as untracked. Neither can
+ * make a path that IS in the commit look unmodified — that is what this function
+ * guarantees, and it is the whole of what it guarantees.
  */
 export function divergedPaths(repoRoot, sha) {
   // `-z` because paths may contain anything; `-r` to recurse into subtrees.
@@ -235,7 +270,18 @@ export function divergedPaths(repoRoot, sha) {
     if (tab < 0) continue;
     const [mode, type, object] = entry.slice(0, tab).split(/\s+/);
     const rel = entry.slice(tab + 1);
-    // Submodules (`commit`) have no working-tree content to hash here.
+    // A gitlink (`160000 commit`) is not a blob, so there is nothing to hash —
+    // but the directory it names has working-tree content all the same, and
+    // skipping it left an entire subtree unmeasured. A pull request that moves
+    // runtime code into a submodule would verify as exact-HEAD whatever is on
+    // disk there.
+    //
+    // Refusing is the honest answer while nothing here uses submodules: Watson
+    // says it cannot establish identity rather than quietly establishing it for
+    // part of the tree. Measuring them properly means recursing into each
+    // submodule's own object store, which is a real change and belongs with a
+    // product that actually has one.
+    if (type === 'commit') { diverged.push(`${rel} (submodule — content not measurable)`); continue; }
     if (type !== 'blob') continue;
 
     const abs = path.join(repoRoot, rel);
@@ -272,6 +318,27 @@ function untrackedPaths(repoRoot) {
   try {
     return git(['ls-files', '--others', '--exclude-standard', '-z'], { cwd: repoRoot })
       .split('\0').filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Paths the index carries that the commit does not — `git add`ed and not
+ * committed.
+ *
+ * Its own ignore rules do not apply: `git add` is an explicit act, so a path
+ * here was deliberately staged and is deliberately not in the reviewed commit.
+ */
+function stagedButUncommitted(repoRoot, sha) {
+  try {
+    const cached = git(['ls-files', '--cached', '-z'], { cwd: repoRoot })
+      .split('\0').filter(Boolean);
+    const inCommit = new Set(
+      git(['ls-tree', '-r', '-z', '--name-only', sha], { cwd: repoRoot })
+        .split('\0').filter(Boolean),
+    );
+    return cached.filter((p) => !inCommit.has(p));
   } catch {
     return [];
   }
