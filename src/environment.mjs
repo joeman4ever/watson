@@ -18,7 +18,11 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import url from 'node:url';
-import { isAuthorized as isAuthorizedStatus, browserSandbox, BROWSER_CHANNEL } from './driver.mjs';
+// `interp` rather than `interpolate`: preconditions are ASSERTIONS about the
+// product's read paths, and the two differ on an unresolved name — `interpolate`
+// substitutes the empty string, which makes a precondition URL collapse to a
+// prefix that may well answer 200 and pass vacuously.
+import { isAuthorized as isAuthorizedStatus, browserSandbox, BROWSER_CHANNEL, interp } from './driver.mjs';
 // Re-exported rather than redefined: product-command execution lives in a
 // dependency-free module so the product plane can run it from a read-only
 // engine mount without installing anything.
@@ -426,7 +430,7 @@ export async function doctor({ baseUrl, dbName, databaseUrl, adminToken, expectS
     try {
       const token = pre.as ? tokens?.[pre.as] : adminToken;
       if (pre.as && !token) { add(label, false, `no token for identity ${pre.as}`); continue; }
-      const r = await get(interpolate(pre.get, vars ?? {}), token);
+      const r = await get(interp(pre.get, vars ?? {}), token);
       if (pre.expect?.authorized !== undefined) {
         const ok = isAuthorizedStatus(r.status) === pre.expect.authorized;
         add(label, ok, `${r.status} (expected ${pre.expect.authorized ? 'authorized' : 'denied'})`);
@@ -434,7 +438,7 @@ export async function doctor({ baseUrl, dbName, databaseUrl, adminToken, expectS
       }
       if (pre.expect?.json) {
         const bad = Object.entries(pre.expect.json)
-          .filter(([k, v]) => String(r.body?.[k]) !== String(interpolate(String(v), vars ?? {})));
+          .filter(([k, v]) => String(r.body?.[k]) !== String(interp(String(v), vars ?? {})));
         add(label, bad.length === 0,
           bad.length ? bad.map(([k, v]) => `${k}: wanted ${v}, got ${JSON.stringify(r.body?.[k])}`).join('; ')
                      : Object.keys(pre.expect.json).map((k) => `${k}=${r.body?.[k]}`).join(', '));

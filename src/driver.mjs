@@ -403,8 +403,29 @@ export async function runStep(step, ctx) {
   }
 }
 
+/**
+ * Substitute `${name}` from the run's variables.
+ *
+ * FAIL-CLOSED on an unknown name. It used to leave the literal `${name}` in
+ * place, which turns a map typo into an assertion against a string no page will
+ * ever contain — reported as a product failure. And it is one small step from
+ * the sibling bug the engine also had, where an unknown name became the EMPTY
+ * string and the assertion became vacuously true.
+ *
+ * There is no safe default here. An expectation whose operand could not be
+ * resolved is not an expectation, so the run says so.
+ */
 export function interp(str, vars) {
-  return String(str).replace(/\$\{(\w+)\}/g, (_, k) => (vars?.[k] ?? `\${${k}}`));
+  return String(str).replace(/\$\{(\w+)\}/g, (_, k) => {
+    const v = vars?.[k];
+    if (v === undefined || v === null || String(v) === '') {
+      throw new Error(
+        `\${${k}} could not be resolved to a value. An unresolved operand is not an ` +
+          'expectation; refusing to assert against it.',
+      );
+    }
+    return String(v);
+  });
 }
 
 // ------------------------------------------------------------------- evidence

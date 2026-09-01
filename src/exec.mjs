@@ -59,6 +59,12 @@ export const SCRUBBED_ENV_KEYS = Object.freeze([
   'ACTIONS_ID_TOKEN_REQUEST_TOKEN', 'ACTIONS_ID_TOKEN_REQUEST_URL',
   'GITHUB_TOKEN', 'GH_TOKEN', 'NPM_TOKEN', 'NODE_AUTH_TOKEN',
   'GITHUB_ENV', 'GITHUB_PATH', 'GITHUB_OUTPUT', 'GITHUB_STATE', 'GITHUB_STEP_SUMMARY',
+  // Watson's OWN admin credential. It creates and drops databases, including
+  // other runs'. The contract is supposed to receive a per-run `DATABASE_URL`
+  // scoped to one database; handing the product the admin string instead would
+  // undercut the doctor's "refuse any database Watson did not create" interlock
+  // from the other side.
+  'WATSON_ADMIN_DB_URL',
 ]);
 
 export function scrubEnv(env = {}) {

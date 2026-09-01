@@ -222,6 +222,17 @@ export function marker(env) {
 const ICON = { PASS: '✓', PASS_WITH_ADVISORIES: '✓', FAIL_PRODUCT: '✗', FAIL_CONTRACT: '⚠', BLOCKED_ENVIRONMENT: '⚠', INDETERMINATE: '?', NOT_APPLICABLE: '–' };
 
 export function summary(env) {
+  // Product-controlled text reaches this document: a failing command's stderr
+  // travels through the plane's error message into `doctor.probes[].detail` and
+  // into step observations. The document ends with a WATSON_METADATA marker that
+  // a consumer parses, so anything able to write `<!-- ... -->` into the body can
+  // offer a second, forged one. Neutralise the two sequences that matter; the
+  // text stays readable and stops being able to close or open a marker block.
+  const safe = (v) => String(v ?? '')
+    .replaceAll('<!--', '<!-\u2011-')
+    .replaceAll('-->', '--\u2011>')
+    .replaceAll('WATSON_METADATA', 'WATSON\u2011METADATA');
+
   const L = [];
   L.push(`## Watson — ${env.verdict}`);
   L.push('');
@@ -238,7 +249,7 @@ export function summary(env) {
 
   if (env.doctor && !env.doctor.ok) {
     L.push('### Doctor failed — the environment was not worth driving');
-    for (const p of env.doctor.probes) L.push(`- ${p.ok ? '✓' : '✗'} **${p.name}** — ${p.detail}`);
+    for (const p of env.doctor.probes) L.push(`- ${p.ok ? '✓' : '✗'} **${safe(p.name)}** — ${safe(p.detail)}`);
     L.push('');
   }
 
@@ -267,8 +278,8 @@ export function summary(env) {
     const bad = f.steps.find((s) => s.result === 'fail');
     if (!bad) continue;
     L.push(`### Failure detail — ${f.title}`);
-    L.push(`Step ${bad.n} (\`${bad.action}\`): ${bad.observed}`);
-    if (bad.expected) L.push(`Expected: ${bad.expected}`);
+    L.push(`Step ${bad.n} (\`${safe(bad.action)}\`): ${safe(bad.observed)}`);
+    if (bad.expected) L.push(`Expected: ${safe(bad.expected)}`);
     if (f.evidence?.length) L.push(`Evidence: ${f.evidence.map((e) => `\`${e}\``).join(', ')}`);
     L.push('');
   }

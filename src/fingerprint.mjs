@@ -11,6 +11,68 @@
 
 import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+
+// ---------------------------------------------------------------- safe git --
+//
+// Git is not a pure reader of a repository. Several configuration keys name
+// COMMANDS that git executes while doing ordinary work, and they can be set in a
+// repository's own `.git/config` — which, for a product checkout, is a file the
+// product writes. `core.fsmonitor` is the sharpest: git runs it during
+// `git status`, ignores its exit code, and carries on. One line in an install
+// script turns the verifier's own exactness check into arbitrary code execution
+// as the verifier.
+//
+// Demonstrated, not theorised:
+//
+//     git config core.fsmonitor /tmp/payload.sh
+//     -> workingTreeState() returns {clean: true} … and the payload ran as uid 0
+//
+// So every git invocation in this engine goes through here. Command-line `-c`
+// has the highest precedence in git's configuration order, so these win over the
+// repository config and over anything it `include`s. The environment settings
+// remove the system and global files from the picture entirely.
+//
+// This is defence in depth, not the whole defence: a deny-list of
+// command-valued keys cannot be complete (content filters, for one, are named
+// by the product's own `.gitattributes`). The identity check therefore does not
+// rely on it — see `workingTreeState`, which stopped using git's working-tree
+// machinery altogether.
+
+const SAFE_CONFIG = [
+  'core.fsmonitor=',            // a command git runs during `git status`
+  'core.hooksPath=/dev/null',   // hooks git runs on many operations
+  'core.pager=cat',
+  'core.editor=true',
+  'core.askPass=',
+  'core.sshCommand=',
+  'diff.external=',             // a command git runs to produce diffs
+  'credential.helper=',
+  'uploadpack.packObjectsHook=',
+  'protocol.ext.allow=never',
+  'protocol.file.allow=never',
+].flatMap((kv) => ['-c', kv]);
+
+const SAFE_ENV = {
+  GIT_CONFIG_NOSYSTEM: '1',
+  GIT_CONFIG_GLOBAL: '/dev/null',
+  GIT_TERMINAL_PROMPT: '0',
+  GIT_ASKPASS: '',
+  GIT_OPTIONAL_LOCKS: '0',
+};
+
+/** Run git against a repository that may be hostile. */
+export function git(args, { cwd, encoding = 'utf8', maxBuffer = 64 * 1024 * 1024, stdio } = {}) {
+  return execFileSync('git', [...SAFE_CONFIG, ...args], {
+    cwd,
+    encoding,
+    maxBuffer,
+    ...(stdio ? { stdio } : {}),
+    env: { ...process.env, ...SAFE_ENV },
+  });
+}
+
 
 /** Paths whose contents can change RUNTIME behavior of the product. */
 const PRODUCT_PATHS = [
@@ -25,8 +87,8 @@ const CONTRACT_PATHS = ['.watson'];
 
 function treeHash(repoRoot, sha, p) {
   try {
-    return execFileSync('git', ['rev-parse', `${sha}:${p}`],
-      { cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    return git(['rev-parse', `${sha}:${p}`],
+      { cwd: repoRoot, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
   } catch {
     return 'absent';
   }
@@ -76,33 +138,58 @@ export function contractFingerprint(repoRoot, sha) {
  * inexact for the same reason dirt is: the run cannot speak for that commit.
  */
 export function workingTreeState(repoRoot, expectedSha = null) {
-  let porcelain = '';
   let head = null;
   try {
-    porcelain = execFileSync('git', ['status', '--porcelain'], {
-      cwd: repoRoot, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024,
-    });
-    head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoRoot, encoding: 'utf8' }).trim();
+    head = git(['rev-parse', 'HEAD'], { cwd: repoRoot }).trim();
   } catch {
-    return { clean: null, exact_head: false, dirty_paths: [], contract_dirty: false,
-      head_sha: null, expected_sha: expectedSha, head_matches: null,
-      note: 'git status failed; exact-HEAD cannot be established' };
+    return {
+      clean: null, exact_head: false, dirty_paths: [], dirty_count: 0, contract_dirty: false,
+      head_sha: null, expected_sha: expectedSha, head_matches: null, method: 'unavailable',
+      note: 'git could not be run here; exact-HEAD cannot be established',
+    };
   }
-  const paths = porcelain.split('\n').map((l) => l.slice(3).trim()).filter(Boolean);
-  const contractDirty = paths.some((p) => p.startsWith('.watson/'));
-  const clean = paths.length === 0;
+
   // `null` when the caller named no expectation: unknown, and unknown is not a
   // failure. `false` is a positive contradiction and is fatal to any product claim.
   const headMatches = expectedSha ? head === expectedSha : null;
+  const against = expectedSha ?? head;
+
+  let diverged;
+  try {
+    diverged = divergedPaths(repoRoot, against);
+  } catch (err) {
+    return {
+      clean: null, exact_head: false, dirty_paths: [], dirty_count: 0, contract_dirty: false,
+      head_sha: head, expected_sha: expectedSha, head_matches: headMatches, method: 'failed',
+      note: `the working tree could not be compared against ${against}: ${err.message.slice(0, 200)}`,
+    };
+  }
+
+  // Content hashing covers TRACKED paths. Untracked-but-not-ignored files change
+  // nothing about the commit's own content, but they can change how the product
+  // behaves, so they still count as a divergent tree — and for those, git's own
+  // listing is the only practical source of the ignore rules.
+  //
+  // Deliberately a UNION, not a replacement. `git status` can be blinded by the
+  // product's index; the content hash cannot. The content hash cannot see an
+  // untracked file; `git status` can. Neither is trusted to be complete alone.
+  const untracked = untrackedPaths(repoRoot);
+  const all = [...new Set([...diverged, ...untracked])].sort();
+
+  const contractDirty = all.some((p) => p.startsWith('.watson/'));
+  const clean = all.length === 0;
   return {
     clean,
     exact_head: clean && headMatches !== false,
-    dirty_paths: paths.slice(0, 20),
-    dirty_count: paths.length,
+    dirty_paths: all.slice(0, 20),
+    dirty_count: all.length,
+    tracked_diverged: diverged.length,
+    untracked: untracked.length,
     contract_dirty: contractDirty,
     head_sha: head,
     expected_sha: expectedSha,
     head_matches: headMatches,
+    method: 'content-hash',
     note: headMatches === false
       ? `the checkout is at ${head}, not the reported ${expectedSha} — this run verified a different commit`
       : clean
@@ -113,9 +200,94 @@ export function workingTreeState(repoRoot, expectedSha = null) {
   };
 }
 
+/**
+ * Which tracked paths differ, in CONTENT, between the commit and what is on disk.
+ *
+ * This deliberately does not use `git status`, `git diff` or the index, and that
+ * is the whole point of it.
+ *
+ * The index belongs to the product. `git update-index --assume-unchanged <path>`
+ * tells git to stop comparing that path, permanently, and `--skip-worktree` does
+ * the same. Neither moves HEAD, neither leaves the tree dirty, and both are one
+ * line in an install script:
+ *
+ *     git update-index --assume-unchanged server/index.js
+ *     echo 'whatever the author wants to run' > server/index.js
+ *
+ * Against a `git status` check that reads clean, `head_matches` reads true, and
+ * a PASS is issued for a commit that was never run. Demonstrated on this engine
+ * before it was fixed.
+ *
+ * So identity is established from the commit's own object tree — read with
+ * plumbing that consults no index — and from the bytes on disk, hashed here.
+ * Nothing the product can set in `.git/config`, `.git/index` or `.gitattributes`
+ * takes part: no content filters, no fsmonitor, no assume-unchanged bit.
+ */
+export function divergedPaths(repoRoot, sha) {
+  // `-z` because paths may contain anything; `-r` to recurse into subtrees.
+  const raw = git(['ls-tree', '-r', '-z', sha], { cwd: repoRoot });
+  const diverged = [];
+
+  for (const entry of raw.split('\0')) {
+    if (!entry) continue;
+    // "<mode> <type> <object>\t<path>"
+    const tab = entry.indexOf('\t');
+    if (tab < 0) continue;
+    const [mode, type, object] = entry.slice(0, tab).split(/\s+/);
+    const rel = entry.slice(tab + 1);
+    // Submodules (`commit`) have no working-tree content to hash here.
+    if (type !== 'blob') continue;
+
+    const abs = path.join(repoRoot, rel);
+    let actual;
+    try {
+      // A symlink's content, to git, is its target — never what it points at.
+      // Following it would let a link into /etc read as an unmodified file.
+      const st = fs.lstatSync(abs);
+      const bytes = st.isSymbolicLink()
+        ? Buffer.from(fs.readlinkSync(abs))
+        : fs.readFileSync(abs);
+      actual = blobHash(bytes);
+      // A tracked regular file replaced by a symlink, or vice versa, is a change
+      // even when the bytes coincide.
+      const isLink = st.isSymbolicLink();
+      if (isLink !== (mode === '120000')) { diverged.push(rel); continue; }
+    } catch {
+      diverged.push(rel);   // missing or unreadable: divergent either way
+      continue;
+    }
+    if (actual !== object) diverged.push(rel);
+  }
+  return diverged;
+}
+
+/**
+ * Untracked, non-ignored paths. Best-effort by construction: the ignore rules
+ * come from the product's own `.gitignore`, so a file the product chooses to
+ * ignore is invisible here. That is a known limit, not an oversight — a change
+ * that hides itself in an ignored path is caught, if at all, by the fact that
+ * the commit's own tracked content still has to match.
+ */
+function untrackedPaths(repoRoot) {
+  try {
+    return git(['ls-files', '--others', '--exclude-standard', '-z'], { cwd: repoRoot })
+      .split('\0').filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+/** git's object id for a blob: sha1("blob <len>\0" + content). */
+function blobHash(bytes) {
+  return crypto.createHash('sha1')
+    .update(`blob ${bytes.length}\0`)
+    .update(bytes)
+    .digest('hex');
+}
+
 /** Full 40-char lowercase hex, as the marker protocol requires. */
 export function resolveSha(repoRoot, ref = 'HEAD') {
-  const sha = execFileSync('git', ['rev-parse', ref], { cwd: repoRoot, encoding: 'utf8' }).trim();
+  const sha = git(['rev-parse', ref], { cwd: repoRoot }).trim();
   if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error(`resolved ref is not a full 40-char hex SHA: ${sha}`);
   return sha;
 }
@@ -216,10 +388,10 @@ export function contractChange(repoRoot, baseSha, headSha, loadAt) {
 export function changedPaths(repoRoot, baseSha, headSha) {
   if (!baseSha || !headSha) return null;
   try {
-    const mergeBase = execFileSync('git', ['merge-base', baseSha, headSha], {
+    const mergeBase = git(['merge-base', baseSha, headSha], {
       cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
-    const out = execFileSync('git', ['diff', '--name-only', '-z', `${mergeBase}`, headSha], {
+    const out = git(['diff', '--name-only', '-z', `${mergeBase}`, headSha], {
       cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
     });
     return out.split('\0').filter(Boolean);
@@ -247,13 +419,13 @@ export function changedPaths(repoRoot, baseSha, headSha) {
  * never stop a verification, only be recorded honestly.
  */
 export function engineProvenance(engineRoot) {
-  const git = (args) => execFileSync('git', args, {
+  const run = (args) => git(args, {
     cwd: engineRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
   }).trim();
   try {
-    const commit = git(['rev-parse', 'HEAD']);
+    const commit = run(['rev-parse', 'HEAD']);
     if (!/^[0-9a-f]{40}$/.test(commit)) return { commit: null, clean: null };
-    return { commit, clean: git(['status', '--porcelain']) === '' };
+    return { commit, clean: run(['status', '--porcelain']) === '' };
   } catch {
     // No git, or the engine was installed as a plain directory. Honest silence.
     return { commit: null, clean: null };

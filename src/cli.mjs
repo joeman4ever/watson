@@ -15,6 +15,7 @@ import url from 'node:url';
 import {
   loadContract, loadContractAt, selectByProfile, withDependencies,
   validateFeatureVars, validateEnvOwnership, validateContractVersion, validateStepOrder,
+  validateSeedValues,
 } from './contract.mjs';
 import { productFingerprint, contractFingerprint, resolveSha, contractChange, workingTreeState, changedPaths, engineProvenance } from './fingerprint.mjs';
 import { selectByImpact } from './selection.mjs';
@@ -200,6 +201,10 @@ async function bringUp({ repoRoot, contract, runDir, runId, adminUrl, policy }) 
     } catch (e) {
       throw new Error(`seed did not emit parseable JSON vars: ${e.message}\n${seed.stdout.slice(-400)}`);
     }
+    const seedProblems = validateSeedValues(vars, fixture);
+    if (seedProblems.length) {
+      throw new Error(`the fixture emitted unusable variables:\n  - ${seedProblems.join('\n  - ')}`);
+    }
     step(`seeded: ${Object.keys(vars).join(', ')}`);
     timings.seed_ms = Date.now() - t;
 
@@ -311,7 +316,9 @@ async function bringUpRemote({ contract, runId, adminUrl, planeUrl, productBaseU
         `${(launched?.log ?? '').slice(-1500)}`,
       );
     }
-    Object.assign(timings, launched.timings ?? {});
+    // Spread, not Object.assign: the plane is untrusted, and `Object.assign`
+    // routes a `__proto__` key through the prototype setter.
+    Object.assign(timings, { ...(launched.timings ?? {}) });
     timings.launch_ms = Date.now() - t;
 
     // 4. READINESS — proven by the verifier, across the network, against the
@@ -331,6 +338,10 @@ async function bringUpRemote({ contract, runId, adminUrl, planeUrl, productBaseU
       throw new Error(
         `product plane failed during seed: ${seeded?.message ?? 'no message'}\n${(seeded?.log ?? '').slice(-1500)}`,
       );
+    }
+    const seedProblems = validateSeedValues(seeded.vars, fixture);
+    if (seedProblems.length) {
+      throw new Error(`the fixture emitted unusable variables:\n  - ${seedProblems.join('\n  - ')}`);
     }
     timings.seed_ms = Date.now() - t;
     step(`seeded: ${Object.keys(seeded.vars ?? {}).join(', ')}`);
@@ -354,7 +365,22 @@ async function cmdVerify(args) {
   // that asked for privilege separation and cannot have it must find out here —
   // not after the product's install script has already run as the verifier.
   const policy = env.productExecution();
+  // uid separation requires root; a sandboxed browser requires NOT root. A
+  // `verify` asked for both would run the entire bring-up and then throw at the
+  // browser, reporting BLOCKED_ENVIRONMENT after several minutes of work. Refuse
+  // here, and say what to use instead.
+  if (policy.drop) {
+    throw new Error(
+      'WATSON_PRODUCT_UID requires this process to be root, and a sandboxed browser requires that it '
+        + 'is not — `verify` cannot have both. Use --plane to run the product in its own container, '
+        + 'which is the stronger boundary anyway. uid separation remains available for `watson doctor`.',
+    );
+  }
   const outPath = typeof args.out === 'string' ? path.resolve(args.out) : null;
+  // Removed BEFORE anything runs. A crash later would otherwise leave the
+  // PREVIOUS run's result sitting at the agreed path, where a harness would read
+  // it as this run's verdict — the exact hazard `--out` exists to remove.
+  if (outPath) { try { fs.rmSync(outPath, { force: true }); } catch { /* nothing there */ } }
   // When a plane URL is given, the product runs on the far side of a boundary
   // and this process never executes a line of it. Both values come from trusted
   // orchestration, never from the product.
@@ -568,6 +594,21 @@ async function cmdVerify(args) {
     // under verification, so "is the sandbox actually on" is a fact about the
     // integrity of this run, and belongs in the evidence beside the verdict.
     base.execution.browser_sandbox_probe = await drive.probeSandbox(browser);
+    // Recorded AND acted on. Recording that the browser said it was not
+    // sandboxed, and then producing a verdict anyway, is the shape of a control
+    // that exists only on paper.
+    if (base.execution.browser_sandbox_probe.effective === false) {
+      await browser.close();
+      return finish(runDir, {
+        ...base, dbName: up.dbName, baseUrl: up.baseUrl,
+        verdict: 'BLOCKED_ENVIRONMENT',
+        verdictReason: 'Chromium reports it is not adequately sandboxed; the browser is part of the verifier and the pages it loads come from the product',
+        doctor: dr, features: [], findings: [], qualitySignals: zeroSignals(),
+        evidence: { bundle: path.relative(ROOT, runDir), retention_days: 7 },
+        timings: { ...up.timings, total_ms: Date.now() - t0 },
+        finishedAt: new Date().toISOString(),
+      });
+    }
     step(`browser sandbox: ${base.execution.browser_sandbox_probe.available
       ? (base.execution.browser_sandbox_probe.effective ? 'reported effective' : 'reported NOT effective')
       : 'not reportable by this build'} (running as uid ${typeof process.getuid === 'function' ? process.getuid() : 'n/a'})`);

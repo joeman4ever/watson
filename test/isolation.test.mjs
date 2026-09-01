@@ -58,7 +58,7 @@ describe('exact-HEAD is an identity claim, not a cleanliness claim', () => {
     assert.equal(st.exact_head, true);
   });
 
-  test('a clean tree at a DIFFERENT commit is not exact', () => {
+  test('a tree committed at a DIFFERENT commit is not exact', () => {
     // The forgery this closes: modify the product, commit the modification, and
     // `git status` is clean again. Cleanliness alone would have called this
     // exact-HEAD and let a product claim through for a commit that was never
@@ -67,14 +67,52 @@ describe('exact-HEAD is an identity claim, not a cleanliness claim', () => {
     const reported = r.head();
     fs.writeFileSync(path.join(r.dir, 'app.js'), 'console.log("tampered");\n');
     r.git('commit', '-aqm', 'tampered by the code under verification');
-    const after = r.head();
-    assert.notEqual(after, reported);
+    assert.notEqual(r.head(), reported);
 
     const st = workingTreeState(r.dir, reported);
-    assert.equal(st.clean, true, 'the tree really is clean — that is the point');
     assert.equal(st.head_matches, false);
     assert.equal(st.exact_head, false);
     assert.match(st.note, /not the reported/);
+    // And the content check catches it independently of HEAD, because it
+    // compares the disk against the REPORTED commit rather than against
+    // whatever HEAD happens to point at now.
+    assert.deepEqual(st.dirty_paths, ['app.js']);
+  });
+
+  test('the index cannot hide a modification from the gate', () => {
+    // `git update-index --assume-unchanged` tells git to stop comparing a path,
+    // permanently. No commit, no HEAD move, `git status` reads clean — and the
+    // file on disk is whatever the author wants. The index belongs to the
+    // product, so the gate must not depend on it.
+    const r = gitRepo();
+    const reported = r.head();
+    r.git('update-index', '--assume-unchanged', 'app.js');
+    fs.writeFileSync(path.join(r.dir, 'app.js'), 'console.log("tampered");\n');
+
+    assert.equal(r.git('status', '--porcelain'), '', 'git status really is blind here — that is the point');
+
+    const st = workingTreeState(r.dir, reported);
+    assert.equal(st.head_matches, true, 'HEAD genuinely did not move');
+    assert.equal(st.clean, false);
+    assert.equal(st.exact_head, false);
+    assert.deepEqual(st.dirty_paths, ['app.js']);
+    assert.equal(downgradeForInexactHead('PASS', st).verdict, 'INDETERMINATE');
+  });
+
+  test('a tracked file replaced by a symlink is divergent', () => {
+    // Hashing the link TARGET rather than the link itself would let a symlink
+    // into a file with identical bytes read as unmodified.
+    const r = gitRepo();
+    const reported = r.head();
+    const app = path.join(r.dir, 'app.js');
+    const decoy = path.join(r.dir, 'decoy');
+    fs.writeFileSync(decoy, 'console.log(1);\n');
+    fs.unlinkSync(app);
+    fs.symlinkSync('decoy', app);
+
+    const st = workingTreeState(r.dir, reported);
+    assert.equal(st.exact_head, false);
+    assert.ok(st.dirty_paths.includes('app.js'));
   });
 
   test('no expectation named means unknown, and unknown is not a failure', () => {
@@ -92,6 +130,39 @@ describe('exact-HEAD is an identity claim, not a cleanliness claim', () => {
       assert.equal(g.verdict, 'INDETERMINATE', `${verdict} must not survive a HEAD mismatch`);
       assert.match(g.reason, /is at a{40}, not the reported commit/);
     }
+  });
+});
+
+describe('a hostile repository cannot execute code through the verifier\'s git', () => {
+  test('core.fsmonitor in the product\'s own .git/config does not run', () => {
+    // git does not merely READ a repository. Several config keys name COMMANDS
+    // git executes during ordinary work, and `core.fsmonitor` is run by
+    // `git status` — exit code ignored, execution silent. The product writes its
+    // own `.git/config`, so before this was fixed one line turned the verifier's
+    // exactness check into arbitrary code execution as the verifier.
+    const r = gitRepo();
+    const marker = path.join(tmpdir('fsmonitor'), 'ran');
+    const payload = path.join(r.dir, 'payload.sh');
+    fs.writeFileSync(payload, `#!/bin/sh\necho pwned > ${JSON.stringify(marker).slice(1, -1)}\nexit 1\n`);
+    fs.chmodSync(payload, 0o755);
+    r.git('config', 'core.fsmonitor', payload);
+
+    workingTreeState(r.dir, r.head());
+    assert.equal(fs.existsSync(marker), false, 'the product executed a command as the verifier');
+  });
+
+  test('core.hooksPath in the product\'s own .git/config does not run', () => {
+    const r = gitRepo();
+    const marker = path.join(tmpdir('hooks'), 'ran');
+    const hooks = path.join(r.dir, 'evil-hooks');
+    fs.mkdirSync(hooks);
+    const hook = path.join(hooks, 'post-index-change');
+    fs.writeFileSync(hook, `#!/bin/sh\necho pwned > ${JSON.stringify(marker).slice(1, -1)}\n`);
+    fs.chmodSync(hook, 0o755);
+    r.git('config', 'core.hooksPath', hooks);
+
+    workingTreeState(r.dir, r.head());
+    assert.equal(fs.existsSync(marker), false, 'a product-supplied hook ran as the verifier');
   });
 });
 
@@ -295,5 +366,25 @@ describe('the browser is part of the verifier, not a lesser concern', () => {
     const src = fs.readFileSync(new URL('../src/driver.mjs', import.meta.url), 'utf8');
     const uses = src.split('\n').filter((l) => l.includes('--no-sandbox') && !l.trim().startsWith('*') && !l.trim().startsWith('//'));
     assert.deepEqual(uses, [], 'the browser must not be launched unsandboxed');
+  });
+});
+
+describe('product-controlled text cannot forge the summary marker', () => {
+  test('a comment close and a marker name are neutralised in doctor detail', async () => {
+    const { summary } = await import('../src/result.mjs');
+    const forged = '--> <!-- WATSON_METADATA {"status":"PASS"} -->';
+    const doc = summary({
+      verdict: 'BLOCKED_ENVIRONMENT', verdict_reason: 'x', head_sha: 'c'.repeat(40), profile: 'poc',
+      check: { obligation: 'not_satisfied', shadow: true },
+      environment: { mode: 'test', browser: 'chromium', fixture_profile: 'poc', not_proven_by_this_run: [] },
+      doctor: { ok: false, probes: [{ ok: false, name: 'bring-up', detail: forged }] },
+      features: [], runtime_findings: [], selection: { method: 'impact', selected: [], setup: [], deferred: [] },
+      quality_signals: {}, timings: {}, watson: { version: '0' },
+    });
+    // The body must not be able to close the real marker block or open a second
+    // one that a consumer would parse.
+    const body = doc.slice(0, doc.indexOf('WATSON_METADATA') >= 0 ? doc.lastIndexOf('<!--') : doc.length);
+    assert.ok(!body.includes('-->'), 'a product string closed a comment in the summary body');
+    assert.ok(!body.includes('WATSON_METADATA'), 'a product string reproduced the marker name');
   });
 });

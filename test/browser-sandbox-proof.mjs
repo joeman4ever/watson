@@ -129,14 +129,19 @@ const best = measured.find((m) => m.label === WATSON_BUILD);
 if (!best) fail(`the build Watson drives (${WATSON_BUILD}) did not start`);
 if (!best.renderers.length) fail('no renderer process was found; the sandbox state cannot be established');
 
+// EVERY renderer, not any. "1 of 3 sandboxed" is not a sandboxed browser, and a
+// proof that accepts it would pass for a build that confined one process and left
+// two open.
 const sandboxed = best.renderers.filter((r) => r.seccomp === '2');
-if (!sandboxed.length) {
-  fail(`every renderer reports Seccomp=${best.renderers.map((r) => r.seccomp).join('/')}; seccomp-bpf is NOT engaged`);
+if (sandboxed.length !== best.renderers.length) {
+  fail(`only ${sandboxed.length}/${best.renderers.length} renderer(s) report Seccomp: 2 `
+    + `(${best.renderers.map((r) => `pid ${r.pid}=${r.seccomp}`).join(', ')}); seccomp-bpf is not engaged everywhere`);
 }
 ok(`${sandboxed.length}/${best.renderers.length} renderer(s) report Seccomp: 2 (seccomp-bpf) [${best.label}]`);
 
-if (!sandboxed.some((r) => r.noNewPrivs === '1')) fail('sandboxed renderers do not report NoNewPrivs: 1');
-ok('renderers report NoNewPrivs: 1');
+const nnp = sandboxed.filter((r) => r.noNewPrivs === '1');
+if (nnp.length !== sandboxed.length) fail(`only ${nnp.length}/${sandboxed.length} renderer(s) report NoNewPrivs: 1`);
+ok('every renderer reports NoNewPrivs: 1');
 
 // LAYER 1. Chromium's own status page is the authoritative statement about it —
 // Chromium knows which of several mechanisms it chose and whether that mechanism

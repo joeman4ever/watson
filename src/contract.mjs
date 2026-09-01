@@ -195,6 +195,48 @@ export function validateFeatureVars(features, fixtureProfile, alwaysAvailable = 
 }
 
 /**
+ * Check the VALUES the fixture actually emitted, not only that their names were
+ * declared.
+ *
+ * `validateFeatureVars` above proves a journey only interpolates names the
+ * profile promises. It says nothing about what comes back, and what comes back
+ * is authored by the product — the seed command runs in the product's own
+ * checkout, on the untrusted side of the boundary.
+ *
+ * That matters because these values land in ASSERTION OPERANDS, not merely in
+ * inputs: `expect_text: "${seasonName}"`, `expect_url_contains: "${sessionId}"`,
+ * the expected values of `expect_json`, and doctor's read-path preconditions. An
+ * empty string interpolates to an empty expectation, and an empty expectation is
+ * satisfied by anything:
+ *
+ *     expect_text ""            -> true against a blank page
+ *     expect_url_contains ""    -> true against any URL
+ *
+ * So a product could neutralise the journeys that judge it by emitting `""`, and
+ * the run would report PASS having proved nothing. Refusing here makes that a
+ * BLOCKED_ENVIRONMENT — a statement about the world Watson was given, which is
+ * exactly what it is — rather than a green tick.
+ */
+export function validateSeedValues(vars, fixtureProfile) {
+  const declared = fixtureProfile?.emits ?? [];
+  const problems = [];
+  for (const name of declared) {
+    if (!(name in (vars ?? {}))) {
+      problems.push(`the fixture declares \`${name}\` in \`emits\` but did not emit it`);
+      continue;
+    }
+    const value = vars[name];
+    if (value === null || value === undefined || String(value).trim() === '') {
+      problems.push(
+        `\`${name}\` came back empty. An empty value interpolates into an empty ` +
+          'expectation, which every assertion satisfies.',
+      );
+    }
+  }
+  return problems;
+}
+
+/**
  * Expand `depends_on` into an ordered setup list. A prerequisite runs as SETUP,
  * not as its own verdict — a failing prerequisite blocks its dependants rather
  * than silently passing them.
