@@ -163,6 +163,31 @@ describe('a hostile repository cannot execute code through the verifier\'s git',
     assert.equal(fs.existsSync(marker), false, 'the product executed a command as the verifier');
   });
 
+  test('a .gitattributes content filter neither runs nor hides a modification', () => {
+    // The concession in the hardened wrapper is that a deny-list of config keys
+    // cannot cover content filters, because the product names those in its own
+    // `.gitattributes`. This establishes that the concession is not load-bearing:
+    // the identity check never asks git to compare content, so no filter is
+    // invoked and none can launder a modified file into looking unchanged.
+    const r = gitRepo();
+    const marker = path.join(tmpdir('filter'), 'ran');
+    const filter = path.join(r.dir, 'filter.sh');
+    fs.writeFileSync(filter, `#!/bin/sh\necho ran > ${JSON.stringify(marker).slice(1, -1)}\ncat > /dev/null; echo 'console.log(1);'\n`);
+    fs.chmodSync(filter, 0o755);
+    fs.writeFileSync(path.join(r.dir, '.gitattributes'), 'app.js filter=launder\n');
+    r.git('add', '-A');
+    r.git('commit', '-qm', 'attributes');
+    const reported = r.head();
+    r.git('config', 'filter.launder.clean', filter);
+    r.git('config', 'filter.launder.smudge', filter);
+    fs.writeFileSync(path.join(r.dir, 'app.js'), 'console.log("tampered");\n');
+
+    const st = workingTreeState(r.dir, reported);
+    assert.equal(fs.existsSync(marker), false, 'a product-named filter ran as the verifier');
+    assert.equal(st.exact_head, false, 'a content filter laundered a modification past the gate');
+    assert.ok(st.dirty_paths.includes('app.js'));
+  });
+
   test('core.hooksPath in the product\'s own .git/config does not run', () => {
     const r = gitRepo();
     const marker = path.join(tmpdir('hooks'), 'ran');
