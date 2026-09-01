@@ -115,11 +115,23 @@ describe('exact-HEAD is an identity claim, not a cleanliness claim', () => {
     assert.ok(st.dirty_paths.includes('app.js'));
   });
 
-  test('no expectation named means unknown, and unknown is not a failure', () => {
+  test('with no expectation named, content is still compared — against HEAD', () => {
+    // The reviewer read this as "unknown is not a failure", contradicting
+    // result.mjs's "not being able to check is not evidence of cleanliness". It
+    // no longer means that. Naming no expectation leaves `head_matches` unknown,
+    // but the CONTENT check still runs, against whatever HEAD points at — so a
+    // caller who omits the SHA still cannot get a clean answer from a tampered
+    // tree. `verify` always names one anyway.
     const r = gitRepo();
     const st = workingTreeState(r.dir);
     assert.equal(st.head_matches, null);
     assert.equal(st.exact_head, true);
+
+    fs.writeFileSync(path.join(r.dir, 'app.js'), 'tampered\n');
+    r.git('update-index', '--assume-unchanged', 'app.js');
+    const after = workingTreeState(r.dir);
+    assert.equal(after.head_matches, null, 'still no expectation named');
+    assert.equal(after.exact_head, false, 'but the content check caught it regardless');
   });
 
   test('a product claim on a mismatched HEAD is withheld', () => {
