@@ -153,7 +153,7 @@ describe('the plane costs the untrusted side nothing to start', () => {
   // writable dependency surface on the wrong side of the boundary.
   const IMPORT_RE = /^\s*import\s+(?:[^'"]*?\sfrom\s+)?['"]([^'"]+)['"]/gm;
 
-  for (const file of ['../src/plane.mjs', '../src/exec.mjs']) {
+  for (const file of ['../src/plane.mjs', '../src/exec.mjs', '../src/fingerprint.mjs']) {
     test(`${file} imports only node built-ins and engine-local modules`, () => {
       const src = fs.readFileSync(new URL(file, import.meta.url), 'utf8');
       const specifiers = [...src.matchAll(IMPORT_RE)].map((m) => m[1]);
@@ -163,9 +163,18 @@ describe('the plane costs the untrusted side nothing to start', () => {
     });
   }
 
-  test('exec.mjs, which the plane pulls in, is itself built-ins only', () => {
-    const src = fs.readFileSync(new URL('../src/exec.mjs', import.meta.url), 'utf8');
-    const specifiers = [...src.matchAll(IMPORT_RE)].map((m) => m[1]);
-    assert.deepEqual(specifiers.filter((sp) => !sp.startsWith('node:')), []);
+  for (const file of ['../src/exec.mjs', '../src/fingerprint.mjs']) {
+    test(`${file}, which the plane pulls in, is itself built-ins only`, () => {
+      const src = fs.readFileSync(new URL(file, import.meta.url), 'utf8');
+      const specifiers = [...src.matchAll(IMPORT_RE)].map((m) => m[1]);
+      assert.deepEqual(specifiers.filter((sp) => !sp.startsWith('node:')), []);
+    });
+  }
+
+  test('the plane states which checkout it is about to build', async () => {
+    await withPlane(async ({ call }) => {
+      const { json } = await call('/alive');
+      assert.ok('tree' in json, '/alive must report the plane\'s own tree so a mismatch is detectable');
+    });
   });
 });

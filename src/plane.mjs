@@ -32,6 +32,10 @@ import fs from 'node:fs';
 // importing environment.mjs here would drag in pg, jose and Playwright and make
 // the untrusted side depend on a node_modules tree somebody has to provide.
 import { runStep, launchApp, interpolate, killGroup } from './exec.mjs';
+// Also built-ins only, so importing it does not give the untrusted side a
+// dependency surface. It is here so the plane can state which checkout it is
+// about to build — see the `/alive` handler.
+import { workingTreeState } from './fingerprint.mjs';
 
 export const PLANE_PROTOCOL = 'watson-product-plane/v1';
 
@@ -167,7 +171,22 @@ export function serve({ repoRoot, logDir, port, host = '0.0.0.0' }) {
     };
     try {
       if (req.method === 'GET' && req.url === '/alive') {
-        return send(200, { ok: true, protocol: PLANE_PROTOCOL, phase: state.phase });
+        // WHICH CHECKOUT this plane is about to build.
+        //
+        // Not a security control — this process is untrusted and can say
+        // anything, and a lie would be in the direction the attacker wants. It
+        // exists because nothing else binds the tree the VERIFIER measures for
+        // exactness to the tree that actually gets built, and two different
+        // checkouts is an ordinary orchestration mistake that would otherwise
+        // produce a confident verdict about the wrong commit. A mismatch is
+        // conclusive; agreement is only reassuring.
+        const tree = workingTreeState(repoRoot);
+        return send(200, {
+          ok: true,
+          protocol: PLANE_PROTOCOL,
+          phase: state.phase,
+          tree: { head_sha: tree.head_sha, clean: tree.clean, dirty_count: tree.dirty_count },
+        });
       }
       if (req.method === 'GET' && req.url?.startsWith('/app-log')) {
         return send(200, { ok: true, log: state.appLog ? tailFile(state.appLog) : '' });

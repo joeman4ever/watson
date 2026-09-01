@@ -236,11 +236,12 @@ async function bringUp({ repoRoot, contract, runDir, runId, adminUrl, policy }) 
  * the seed's variables are product-supplied data — exactly as they always were —
  * used only as substitution values in journeys.
  */
-async function bringUpRemote({ contract, runId, adminUrl, planeUrl, productBaseUrl, productPort }) {
+async function bringUpRemote({ contract, runId, adminUrl, planeUrl, productBaseUrl, productPort, headSha }) {
   const cfg = contract.config;
   const dbName = `watson_${runId.replace(/[^a-z0-9]/gi, '').slice(-16).toLowerCase()}`;
   const started = {};
   const timings = {};
+  let planeTree = null;
 
   const plane = async (route, body) => {
     const res = await fetch(`${planeUrl}${route}`, {
@@ -264,6 +265,19 @@ async function bringUpRemote({ contract, runId, adminUrl, planeUrl, productBaseU
     const alive = await plane('/alive');
     if (!alive?.ok) throw new Error(`product plane at ${planeUrl} did not answer /alive`);
     step(`product plane ${alive.protocol} at ${planeUrl}`);
+
+    // The verifier measures exactness against ITS OWN copy of the product tree.
+    // If the plane is about to build a different one, every claim in this run is
+    // about a commit that was never driven. The plane is untrusted, so a matching
+    // answer proves little — but a MISMATCHING one is conclusive, and this is the
+    // only thing that would notice an orchestration wired to two checkouts.
+    if (headSha && alive.tree?.head_sha && alive.tree.head_sha !== headSha) {
+      throw new Error(
+        `the product plane is at ${alive.tree.head_sha}, but this run is about ${headSha}. `
+          + 'The verifier and the plane are looking at different checkouts.',
+      );
+    }
+    planeTree = alive.tree ?? null;
 
     // 1. PROVISION — from the verifier side. The database is reachable from both
     //    planes over the isolated network, but only the verifier may CREATE one,
@@ -348,7 +362,7 @@ async function bringUpRemote({ contract, runId, adminUrl, planeUrl, productBaseU
 
     return {
       dbName, databaseUrl, baseUrl: productBaseUrl, appPort: productPort,
-      vars: seeded.vars ?? {}, timings, dbServerVersion: provisioned?.serverVersion ?? null,
+      vars: seeded.vars ?? {}, timings, dbServerVersion: provisioned?.serverVersion ?? null, planeTree,
       tokens: started.identity.tokens, identity: started.identity, teardown,
     };
   } catch (err) {
@@ -532,7 +546,7 @@ async function cmdVerify(args) {
   try {
     up = planeUrl
       ? await bringUpRemote({
-          contract, runId, adminUrl, planeUrl, productBaseUrl,
+          contract, runId, adminUrl, planeUrl, productBaseUrl, headSha,
           productPort: Number(new URL(productBaseUrl).port || 80),
         })
       : await bringUp({ repoRoot, contract, runDir, runId, adminUrl, policy });
@@ -554,6 +568,10 @@ async function cmdVerify(args) {
   // shared by reference with every envelope built below, which is exactly what is
   // wanted — one record of one run's environment.
   base.execution.database_server_version = up.dbServerVersion;
+  // What the plane said about its own checkout, recorded verbatim as the
+  // untrusted claim it is. A reader can see that the two sides agreed, and that
+  // agreement between the verifier and an untrusted peer is not the same as proof.
+  if (up.planeTree) base.execution.product_plane_tree_claimed = up.planeTree;
 
   try {
     // --- doctor ---------------------------------------------------------------
