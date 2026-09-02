@@ -168,7 +168,7 @@ export function verifyAgainstManifest(treeRoot, manifest, { generatedRoots = [] 
 
   const divergent = [
     ...missing.map((p) => `${p} (missing)`),
-    ...modified,
+    ...modified.map((p) => `${p} (modified)`),
     ...typeChanged,
     ...modeChanged,
     ...unexpected.map((p) => `${p} (unexpected)`),

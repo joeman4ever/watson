@@ -18,6 +18,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 import { buildManifest, verifyAgainstManifest, MANIFEST_SCHEMA } from '../src/manifest.mjs';
+import { productIdentity } from '../src/fingerprint.mjs';
 
 function tmpdir(label) {
   return fs.mkdtempSync(path.join(os.tmpdir(), `watson-${label}-`));
@@ -85,7 +86,7 @@ describe('the attacks that defeated the git-based gate', () => {
 
     const r = check(manifest, product);
     assert.equal(r.matches, false);
-    assert.deepEqual(r.divergent, ['server/index.js']);
+    assert.deepEqual(r.divergent, ['server/index.js (modified)']);
   });
 
   test('git replace rewrites what git resolves', () => {
@@ -96,7 +97,7 @@ describe('the attacks that defeated the git-based gate', () => {
 
     const r = check(manifest, product);
     assert.equal(r.matches, false);
-    assert.deepEqual(r.divergent, ['server/index.js']);
+    assert.deepEqual(r.divergent, ['server/index.js (modified)']);
   });
 
   test('git add hides a new file from git, not from the manifest', () => {
@@ -214,7 +215,7 @@ describe('generated output is distinguished, never made invisible', () => {
     fs.writeFileSync(path.join(product, 'server/index.js'), 'PWNED\n');
     const r = check(manifest, product, { generatedRoots: ['server'] });
     assert.equal(r.matches, false);
-    assert.deepEqual(r.divergent, ['server/index.js']);
+    assert.deepEqual(r.divergent, ['server/index.js (modified)']);
   });
 });
 
@@ -262,5 +263,128 @@ describe('the class is gone, not the instances', () => {
     const { manifest, sha } = materialised();
     assert.equal(manifest.schema, MANIFEST_SCHEMA);
     assert.equal(manifest.sha, sha);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The same corpus, one level up: at the function the CLI actually calls.
+//
+// Everything above tests `verifyAgainstManifest`, the primitive. Nothing above
+// would notice if `productIdentity` — the only caller, and the thing whose
+// `exact_head` decides whether a product claim may be made at all — wired it up
+// wrongly, defaulted a missing manifest to `clean`, or dropped `generatedRoots`.
+//
+// That is not a hypothetical failure mode. It is the shape of rounds 1-3: the
+// check was usually right, and what called it was where the hole was.
+describe('the gate as the engine calls it', () => {
+  test('no manifest means no product claim, and no fallback to asking git', () => {
+    const { product, sha } = materialised();
+    const id = productIdentity({ repoRoot: product, manifest: null, expectedSha: sha });
+    assert.equal(id.exact_head, false);
+    assert.equal(id.clean, null, 'unknown, not clean — the difference is the whole gate');
+    assert.equal(id.method, 'no-manifest');
+    assert.match(id.note, /watson manifest/, 'says how to fix it rather than failing mutely');
+  });
+
+  test('a pristine tree with its own manifest is exact', () => {
+    const { product, sha, manifest } = materialised();
+    const id = productIdentity({ repoRoot: product, manifest, expectedSha: sha });
+    assert.equal(id.exact_head, true);
+    assert.equal(id.clean, true);
+    assert.equal(id.method, 'manifest');
+    assert.equal(id.head_sha, sha);
+    assert.equal(id.head_matches, true);
+  });
+
+  test('a manifest for a DIFFERENT commit authorises nothing, however well the tree matches it', () => {
+    // The tree and manifest agree perfectly. They just do not describe the commit
+    // this run says it is about — which is a run verifying something else.
+    const { product, manifest } = materialised();
+    const id = productIdentity({
+      repoRoot: product, manifest, expectedSha: 'b'.repeat(40),
+    });
+    assert.equal(id.exact_head, false);
+    assert.equal(id.clean, null);
+    assert.equal(id.head_matches, false);
+    assert.match(id.note, /but this run is about/);
+  });
+
+  test('a tampered tree is inexact, and names what diverged', () => {
+    const { product, sha, manifest } = materialised();
+    fs.writeFileSync(path.join(product, 'server/index.js'), 'console.log("owned");\n');
+    const id = productIdentity({ repoRoot: product, manifest, expectedSha: sha });
+    assert.equal(id.exact_head, false);
+    assert.equal(id.clean, false);
+    assert.deepEqual(id.dirty_paths, ['server/index.js (modified)']);
+    assert.equal(id.dirty_count, 1);
+  });
+
+  test('a divergent CONTRACT is called out specifically, because it changes what was verified', () => {
+    const dir = tmpdir('trusted-contract');
+    const git = (...a) => execFileSync('git', a, { cwd: dir, encoding: 'utf8' }).trim();
+    git('init', '-q', '-b', 'main');
+    git('config', 'user.email', 'watson@example.invalid');
+    git('config', 'user.name', 'watson-test');
+    fs.mkdirSync(path.join(dir, '.watson'));
+    fs.writeFileSync(path.join(dir, '.watson/config.yaml'), 'contract_version: 4\n');
+    fs.writeFileSync(path.join(dir, 'app.js'), 'ok\n');
+    git('add', '-A');
+    git('commit', '-qm', 'initial');
+    const sha = git('rev-parse', 'HEAD');
+    const manifest = buildManifest(dir, { sha });
+
+    const product = tmpdir('product-contract');
+    fs.cpSync(dir, product, { recursive: true });
+    fs.writeFileSync(path.join(product, '.watson/config.yaml'), 'contract_version: 4\n# weakened\n');
+
+    const id = productIdentity({ repoRoot: product, manifest, expectedSha: sha });
+    assert.equal(id.exact_head, false);
+    assert.equal(id.contract_dirty, true);
+    assert.match(id.note, /this run verified something else/);
+  });
+
+  test('declared generated roots reach the comparison, and shelter nothing committed', () => {
+    const { product, sha, manifest } = materialised();
+    fs.mkdirSync(path.join(product, 'dist'));
+    fs.writeFileSync(path.join(product, 'dist/bundle.js'), 'built\n');
+
+    const withRoot = productIdentity({
+      repoRoot: product, manifest, expectedSha: sha, generatedRoots: ['dist'],
+    });
+    assert.equal(withRoot.exact_head, true, 'build output under a declared root is not tampering');
+    assert.equal(withRoot.counts.generated, 1, 'but it is COUNTED, not invisible');
+
+    // Undeclared, the same file is an unexpected file.
+    const without = productIdentity({ repoRoot: product, manifest, expectedSha: sha });
+    assert.equal(without.exact_head, false, 'the root has to be DECLARED, not inferred');
+
+    // And a declared root does not extend backwards over a committed file.
+    fs.writeFileSync(path.join(product, 'server/index.js'), 'console.log("owned");\n');
+    const sheltered = productIdentity({
+      repoRoot: product, manifest, expectedSha: sha, generatedRoots: ['dist', 'server'],
+    });
+    assert.equal(sheltered.exact_head, false);
+    assert.deepEqual(sheltered.dirty_paths, ['server/index.js (modified)']);
+  });
+
+  test('a tree it cannot read fails CLOSED, rather than reporting clean', () => {
+    const { sha, manifest } = materialised();
+    const id = productIdentity({
+      repoRoot: path.join(os.tmpdir(), `watson-absent-${Date.now()}`), manifest, expectedSha: sha,
+    });
+    assert.equal(id.exact_head, false);
+    assert.equal(id.clean, null);
+    assert.equal(id.method, 'failed');
+  });
+
+  test('the divergence LIST is capped, the divergence COUNT is not', () => {
+    // Otherwise the cheapest attack on a reader is volume: bury one real change
+    // under fifty harmless ones and let the list truncate before it shows.
+    const { product, sha, manifest } = materialised();
+    for (let i = 0; i < 50; i += 1) fs.writeFileSync(path.join(product, `extra${i}.js`), 'x\n');
+    const id = productIdentity({ repoRoot: product, manifest, expectedSha: sha });
+    assert.equal(id.exact_head, false);
+    assert.equal(id.dirty_paths.length, 20);
+    assert.equal(id.dirty_count, 50, 'the count is the truth; the list is a courtesy');
   });
 });

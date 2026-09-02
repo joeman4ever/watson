@@ -43,11 +43,20 @@ import { verifyAgainstManifest } from './manifest.mjs';
 //
 // It is defence in depth even there: a deny-list of command-valued keys cannot
 // be complete, because content filters are named by the product's own
-// `.gitattributes`. What makes that acceptable is that no surviving call reads
-// the working tree in a filter-applying way — `rev-parse`, `ls-tree`,
-// `merge-base`, `diff --name-only` and `archive` are all object-store
-// operations. If a future call reads the working tree, this comment stops being
-// true and the call needs a different answer, not another key in the list.
+// `.gitattributes`. What makes that acceptable is that every call which runs on
+// the TRUSTED side is an object-store operation — `rev-parse`, `ls-tree`,
+// `merge-base`, `diff --name-only`, `archive` — and never reads the working
+// tree in a filter-applying way. If a trusted-side call starts reading the
+// working tree, this stops being true and that call needs a different answer,
+// not another key in the list.
+//
+// The one exception is deliberate and is not on the trusted side: the plane's
+// `/alive` runs `rev-parse HEAD` and `status --porcelain` (`plane.mjs`). That is
+// inside the product's own container, reporting on the product's own checkout,
+// where product code already runs by design — so hijacking it buys an attacker
+// nothing they do not already have, and the verifier treats the answer as
+// self-reported either way. It goes through this wrapper because there is no
+// reason for it not to, NOT because the wrapper is what makes it safe.
 
 const SAFE_CONFIG = [
   'core.fsmonitor=',            // a command git runs during `git status`
