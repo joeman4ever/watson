@@ -141,7 +141,30 @@ describe('a verifier-chosen value still has to fit the column it lands in', () =
   });
 
   test('a bare list still means text, so the simple case stays simple', () => {
-    assert.deepEqual(normaliseChosen(['a', 'b']), [['a', 'text'], ['b', 'text']]);
+    assert.deepEqual(normaliseChosen(['a', 'b']), [['a', 'text', null], ['b', 'text', null]]);
+  });
+
+  test('a closed domain is picked FROM, not invented', () => {
+    // Some values cannot be invented. nsc-eval constrains a school grade to
+    // PK, K, 1..12 with a database CHECK mirroring its own domain module, so a
+    // verifier-generated string fails at the insert. Refusing to let the
+    // verifier choose at all would hand the fixture back the decision this
+    // mechanism exists to take away — it could pick whichever member makes an
+    // assertion most vacuous. So the contract declares the domain and the
+    // verifier picks the member.
+    const GRADES = ['PK', 'K', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12'];
+    const spread = new Set();
+    for (let i = 0; i < 200; i++) {
+      const v = fixtureValues(`run-${i}`, [{ grade: { enum: GRADES } }]).grade;
+      assert.ok(GRADES.includes(v), `${v} is outside the declared domain`);
+      spread.add(v);
+    }
+    assert.ok(spread.size > 5, 'the pick should range over the domain, not stick to one member');
+    assert.equal(fixtureValues('r', [{ g: { enum: GRADES } }]).g, fixtureValues('r', [{ g: { enum: GRADES } }]).g);
+  });
+
+  test('an empty domain is refused rather than silently yielding undefined', () => {
+    assert.throws(() => fixtureValues('r', [{ g: { enum: [] } }]), /no values to choose from/);
   });
 
   test('an unknown shape is refused rather than guessed', () => {

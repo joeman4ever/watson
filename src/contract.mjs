@@ -350,9 +350,9 @@ export function validateAssertionOperands(features, fixtureProfile, engineSuppli
  */
 export function fixtureValues(runId, declared = []) {
   const out = {};
-  for (const [name, shape] of normaliseChosen(declared)) {
+  for (const [name, shape, domain] of normaliseChosen(declared)) {
     const h = crypto.createHash('sha256').update(`watson-fixture\0${runId}\0${name}`).digest('hex');
-    out[name] = SHAPES[shape](h, name);
+    out[name] = shape === 'enum' ? pickFromDomain(h, name, domain) : SHAPES[shape](h, name);
   }
   return out;
 }
@@ -385,20 +385,55 @@ export const SHAPES = {
   integer: (h) => 3 + (parseInt(h.slice(0, 6), 16) % 7),
 };
 
-/** `[name, shape]` pairs from either a bare list or a name -> shape mapping. */
+/**
+ * A CLOSED DOMAIN the verifier picks from.
+ *
+ * Some values cannot be invented. A school grade is one: nsc-eval constrains it
+ * to `PK, K, 1..12` with a database CHECK mirroring its own domain module, so a
+ * verifier-generated `watson-grantedGrade-a1b2…` fails at the insert. Refusing
+ * to let the verifier choose at all would hand the fixture back the decision
+ * this whole mechanism exists to take away — it could pick whichever member of
+ * the domain makes an assertion most vacuous.
+ *
+ * So the CONTRACT declares the domain and the VERIFIER picks the member. The set
+ * is product-authored, which is fine and visible: it is reviewed in the pull
+ * request, it is covered by the contract fingerprint, and a change to it shows up
+ * as a contract change. What the product no longer does is choose which one the
+ * assertion rests on.
+ *
+ * WHAT THIS DOES NOT FIX, because it cannot: an assertion on a one-character
+ * value from a fourteen-member domain is weak whoever picks it — `expect_text:
+ * "5"` matches almost any page. That is a JOURNEY design problem, not a value
+ * ownership problem, and it needs a different answer: assert on something
+ * specific and scope the grade with a selector, rather than asserting the grade
+ * as text.
+ */
+function pickFromDomain(h, name, domain) {
+  if (!Array.isArray(domain) || domain.length === 0) {
+    throw new Error(`\`${name}\` declares an enum shape with no values to choose from`);
+  }
+  return domain[parseInt(h.slice(0, 8), 16) % domain.length];
+}
+
+/**
+ * `[name, shape, domain?]` triples from a bare list, a name -> shape mapping, or
+ * a name -> {enum: [...]} mapping.
+ */
 export function normaliseChosen(declared) {
-  const pairs = Array.isArray(declared)
+  const entries = Array.isArray(declared)
     ? declared.map((n) => (typeof n === 'string' ? [n, 'text'] : Object.entries(n)[0]))
     : Object.entries(declared ?? {});
-  for (const [name, shape] of pairs) {
-    if (!SHAPES[shape]) {
+
+  return entries.map(([name, spec]) => {
+    if (spec && typeof spec === 'object' && Array.isArray(spec.enum)) return [name, 'enum', spec.enum];
+    if (!SHAPES[spec]) {
       throw new Error(
-        `\`${name}\` declares verifier-chosen shape \`${shape}\`, which the engine does not generate. ` +
-          `Known shapes: ${Object.keys(SHAPES).join(', ')}.`,
+        `\`${name}\` declares verifier-chosen shape \`${JSON.stringify(spec)}\`, which the engine does not ` +
+          `generate. Known shapes: ${Object.keys(SHAPES).join(', ')}, or \`{ enum: [...] }\` for a closed domain.`,
       );
     }
-  }
-  return pairs;
+    return [name, spec, null];
+  });
 }
 
 /**
