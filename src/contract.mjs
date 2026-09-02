@@ -394,7 +394,9 @@ export function fixtureValues(runId, declared = []) {
   for (const [name, shape, domain] of chosen) {
     if (name in out) continue;
     const h = crypto.createHash('sha256').update(`watson-fixture\0${runId}\0${name}`).digest('hex');
-    out[name] = shape === 'enum' ? pickFromDomain(h, name, domain) : SHAPES[shape](h, name);
+    if (shape === 'enum') out[name] = pickFromDomain(h, name, domain);
+    else if (shape === 'integer' && domain) out[name] = pickInteger(h, domain);
+    else out[name] = SHAPES[shape](h, name);
   }
   return out;
 }
@@ -423,9 +425,35 @@ export const SHAPES = {
     h.slice(20, 32),
   ].join('-'),
   // Small and positive: the fixture has to create this many rows, and a cohort
-  // of 4 billion is not a test, it is an outage.
-  integer: (h) => 3 + (parseInt(h.slice(0, 6), 16) % 7),
+  // of 4 billion is not a test, it is an outage. A range narrows it further when
+  // the product's own semantics require one — see `pickInteger`.
+  integer: (h) => pickInteger(h, { min: 3, max: 9 }),
 };
+
+/**
+ * An integer the verifier chooses, optionally within a range the contract
+ * declares.
+ *
+ * The range exists because some numbers are not free. nsc-eval seeds a cohort
+ * that must be ABOVE its disclosure threshold, so that the journey observes a
+ * reportable aggregate; a verifier that picked 4 would produce a suppressed
+ * cohort, the journey would see a suppression notice where it expected a count,
+ * and Watson would report FAIL_PRODUCT against a product that did exactly the
+ * right thing. A false accusation is the most expensive kind of wrong a verifier
+ * can be.
+ *
+ * A declared range is a RESTATEMENT of something the product decides, and that
+ * coupling is real: if the product's threshold moves past the range, the journey
+ * breaks. It breaks LOUDLY rather than silently — the contract is then stale and
+ * says so in review — but it is a coupling, and a contract that declares one
+ * should say why beside it.
+ */
+function pickInteger(h, { min, max }) {
+  if (!Number.isInteger(min) || !Number.isInteger(max) || max < min) {
+    throw new Error(`integer range { min: ${min}, max: ${max} } is not a usable range`);
+  }
+  return min + (parseInt(h.slice(0, 8), 16) % (max - min + 1));
+}
 
 /**
  * A CLOSED DOMAIN the verifier picks from.
@@ -470,6 +498,9 @@ export function normaliseChosen(declared) {
   return entries.map(([name, spec]) => {
     if (spec && typeof spec === 'object' && Array.isArray(spec.enum)) {
       return [name, 'enum', spec.enum, spec.pool ?? null];
+    }
+    if (spec && typeof spec === 'object' && spec.integer) {
+      return [name, 'integer', spec.integer, null];
     }
     if (!SHAPES[spec]) {
       throw new Error(

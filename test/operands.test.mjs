@@ -184,6 +184,26 @@ describe('a verifier-chosen value still has to fit the column it lands in', () =
     assert.equal(fixtureValues('r', [{ g: { enum: GRADES } }]).g, fixtureValues('r', [{ g: { enum: GRADES } }]).g);
   });
 
+  test('a declared range keeps a verifier-chosen number inside product semantics', () => {
+    // Some numbers are not free. nsc-eval seeds a cohort that must be ABOVE its
+    // disclosure threshold so the journey observes a reportable aggregate. A
+    // verifier that picked 4 would produce a SUPPRESSED cohort, the journey would
+    // see a suppression notice where it expected a count, and Watson would report
+    // FAIL_PRODUCT against a product that behaved correctly. A false accusation is
+    // the most expensive kind of wrong a verifier can be.
+    const seen = new Set();
+    for (let i = 0; i < 300; i++) {
+      const v = fixtureValues(`run-${i}`, [{ cohort: { integer: { min: 12, max: 18 } } }]).cohort;
+      assert.ok(Number.isInteger(v) && v >= 12 && v <= 18, `${v} escaped the declared range`);
+      seen.add(v);
+    }
+    assert.equal(seen.size, 7, 'the pick should use the whole range');
+  });
+
+  test('an unusable range is refused', () => {
+    assert.throws(() => fixtureValues('r', [{ c: { integer: { min: 9, max: 2 } } }]), /not a usable range/);
+  });
+
   test('names sharing a pool never collide', () => {
     // Five grades from one fourteen-member domain. Hashing each name
     // independently makes a collision a matter of luck, and a journey whose
