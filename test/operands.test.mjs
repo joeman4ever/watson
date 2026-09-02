@@ -162,7 +162,7 @@ describe('a verifier-chosen value still has to fit the column it lands in', () =
   });
 
   test('a bare list still means text, so the simple case stays simple', () => {
-    assert.deepEqual(normaliseChosen(['a', 'b']), [['a', 'text', null], ['b', 'text', null]]);
+    assert.deepEqual(normaliseChosen(['a', 'b']), [['a', 'text', null, null], ['b', 'text', null, null]]);
   });
 
   test('a closed domain is picked FROM, not invented', () => {
