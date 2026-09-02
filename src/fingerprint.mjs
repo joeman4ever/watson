@@ -231,8 +231,29 @@ export function productIdentity({ repoRoot, manifest = null, expectedSha = null,
   };
 }
 
-/** Full 40-char lowercase hex, as the marker protocol requires. */
+/**
+ * Full 40-char lowercase hex, as the marker protocol requires.
+ *
+ * A value that is ALREADY a full commit id is returned as given, and git is
+ * never consulted. The trusted orchestration knows which commit it materialised
+ * — that is what the run is about — and the tree it hands over is supposed to
+ * need no `.git` at all. Asking git anyway made the documented topology
+ * impossible to run:
+ *
+ *     $ watson verify --repo <materialised tree> --sha <40 hex>
+ *     fatal: not a git repository
+ *
+ * It worked in CI only because that particular tree happens to be a checkout.
+ * Found by materialising a commit the way the design describes and running the
+ * engine against it, which no unit test does.
+ *
+ * This is not a new authority: a full SHA comes from the caller, and where a
+ * manifest is supplied the manifest is still what proves the tree IS that
+ * commit. It only stops the engine consulting a product-owned `.git` for a fact
+ * it was already told.
+ */
 export function resolveSha(repoRoot, ref = 'HEAD') {
+  if (/^[0-9a-f]{40}$/.test(ref)) return ref;
   const sha = git(['rev-parse', ref], { cwd: repoRoot }).trim();
   if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error(`resolved ref is not a full 40-char hex SHA: ${sha}`);
   return sha;

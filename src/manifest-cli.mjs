@@ -55,6 +55,9 @@ export function parseManifestArgs(argv) {
 export function runManifest(argv, { log = console.log } = {}) {
   const args = parseManifestArgs(argv);
   const repoRoot = path.resolve(args.repo ?? '.');
+
+  // `resolveSha` returns a full commit id as given, without consulting git —
+  // the materialised tree it describes is not required to be a checkout.
   const sha = resolveSha(repoRoot, args.sha ?? 'HEAD');
   const manifest = buildManifest(repoRoot, {
     sha,

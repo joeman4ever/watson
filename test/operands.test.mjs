@@ -16,7 +16,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  assertionVars, validateAssertionOperands, fixtureValues, fixtureValueEnv, normaliseChosen, validateDenialAddresses,
+  assertionVars, validateAssertionOperands, fixtureValues, fixtureValueEnv, normaliseChosen, validateDenialAddresses, reconcileFixtureValues,
 } from '../src/contract.mjs';
 
 const feature = (id, steps) => ({ id, __file: `${id}.yaml`, steps });
@@ -350,5 +350,35 @@ describe('a denial has to be denying something', () => {
       { preconditions: [{ as: 'W-EVALUATOR', get: '/api/seasons/${s}/groups/${g}/x', expect: { authorized: false } }] },
     );
     assert.equal(problems.length, 1);
+  });
+});
+
+// Reconciliation, against the SHAPES the engine actually produces.
+//
+// Every test here used strings, and the engine's `integer` shape returns a
+// number. `reconcileFixtureValues` stringified one side of the comparison and
+// not the other, so `"13" !== 13` made every integer-shaped value report as
+// ignored — on every run, against a fixture that had done nothing wrong. It was
+// found by the first local end-to-end run, not by 193 passing unit tests.
+describe('reconciling what the fixture built with what the verifier chose', () => {
+  test('an integer-shaped value the fixture used correctly is NOT flagged', () => {
+    const chosen = fixtureValues('wtsn-x', [{ grantedCohortSize: { integer: { min: 12, max: 18 } } }]);
+    assert.equal(typeof chosen.grantedCohortSize, 'number', 'the shape still returns a number');
+    // The fixture reports back what it built, as a number, exactly as seeded.
+    const { ignored } = reconcileFixtureValues({ grantedCohortSize: chosen.grantedCohortSize }, chosen);
+    assert.deepEqual(ignored, []);
+  });
+
+  test('a fixture that really did use a different number IS flagged', () => {
+    const chosen = fixtureValues('wtsn-x', [{ grantedCohortSize: { integer: { min: 12, max: 18 } } }]);
+    const { ignored } = reconcileFixtureValues({ grantedCohortSize: chosen.grantedCohortSize + 1 }, chosen);
+    assert.equal(ignored.length, 1);
+    assert.match(ignored[0], /grantedCohortSize/);
+  });
+
+  test('the verifier\'s value wins whatever the fixture said', () => {
+    const chosen = fixtureValues('wtsn-x', ['primarySeasonName']);
+    const { vars } = reconcileFixtureValues({ primarySeasonName: 'something else' }, chosen);
+    assert.equal(vars.primarySeasonName, chosen.primarySeasonName);
   });
 });

@@ -645,6 +645,49 @@ export function normaliseChosen(declared) {
  * The environment the fixture receives them in. A product that ignores these and
  * invents its own values fails the cross-check at the call site rather than here.
  */
+/**
+ * Reconcile what the fixture reports it built against what the verifier chose.
+ *
+ * Lives here rather than in `cli.mjs` because it is fixture-value logic, and
+ * because `cli.mjs` runs the CLI on import — so anything in it is untestable
+ * without launching the tool. That is not a hypothetical cost: this function was
+ * untested, and shipped a comparison that flagged every integer-shaped value as
+ * ignored on every run.
+ */
+export function reconcileFixtureValues(emitted, chosen) {
+  const out = emitted ?? {};
+  const ignored = [];
+  for (const [k, v] of Object.entries(chosen)) {
+    if (!(k in out)) {
+      // OMISSION, not contradiction. This used to be invisible: the filter
+      // required the key to be present, so a fixture that simply never reported
+      // back on a value passed — and then the engine back-filled it from
+      // `chosen`, so `validateSeedValues` could not see it either.
+      //
+      // It matters most for the negative journeys, which is where it is hardest
+      // to notice. A fixture that never grants-then-revokes the verifier's
+      // `revokedGrade` still passes "the revoked grant is denied", because a
+      // grade that was never granted denies identically to one that was
+      // revoked. The assertion holds and the property it names was never built.
+      ignored.push(
+        `\`${k}\`: the verifier supplied \`${v}\`, and the fixture did not report building anything with it. `
+        + 'A world that does not contain the value the assertions are about is not the world that was asked for.',
+      );
+      continue;
+    }
+    // BOTH sides stringified. `pickInteger` returns a NUMBER, so comparing
+    // `String(emitted) !== chosen` was `"13" !== 13` — always true. Every run
+    // with an integer-shaped verifier-chosen value failed as a broken world,
+    // reporting `fixture used 13, verifier supplied 13`. Unit tests missed it
+    // because they all used strings; the first local end-to-end run found it
+    // immediately, which is the whole argument for running them.
+    if (String(out[k]) !== String(v)) {
+      ignored.push(`\`${k}\`: fixture used \`${out[k]}\`, verifier supplied \`${v}\``);
+    }
+  }
+  return { vars: { ...out, ...chosen }, ignored };
+}
+
 export function fixtureValueEnv(values) {
   return Object.fromEntries(
     Object.entries(values).map(([k, v]) => [`WATSON_FIXTURE_${k.replace(/[^A-Za-z0-9]/g, '_').toUpperCase()}`, v]),

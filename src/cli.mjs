@@ -16,6 +16,7 @@ import {
   loadContract, loadContractAt, selectByProfile, withDependencies,
   validateFeatureVars, validateEnvOwnership, validateContractVersion, validateStepOrder,
   validateSeedValues, validateAssertionOperands, validateDenialAddresses, fixtureValues, fixtureValueEnv,
+  reconcileFixtureValues,
 } from './contract.mjs';
 import { productFingerprint, contractFingerprint, resolveSha, contractChange, productIdentity, changedPaths, engineProvenance } from './fingerprint.mjs';
 import { readManifest } from './manifest.mjs';
@@ -112,34 +113,6 @@ function buildAppEnv({ cfg, runId, databaseUrl, appPort, baseUrl, identity, inhe
  * chose, so the assertions would fail for a reason that has nothing to do with
  * the product's behaviour.
  */
-function reconcileFixtureValues(emitted, chosen) {
-  const out = emitted ?? {};
-  const ignored = [];
-  for (const [k, v] of Object.entries(chosen)) {
-    if (!(k in out)) {
-      // OMISSION, not contradiction. This used to be invisible: the filter
-      // required the key to be present, so a fixture that simply never reported
-      // back on a value passed — and then the engine back-filled it from
-      // `chosen`, so `validateSeedValues` could not see it either.
-      //
-      // It matters most for the negative journeys, which is where it is hardest
-      // to notice. A fixture that never grants-then-revokes the verifier's
-      // `revokedGrade` still passes "the revoked grant is denied", because a
-      // grade that was never granted denies identically to one that was
-      // revoked. The assertion holds and the property it names was never built.
-      ignored.push(
-        `\`${k}\`: the verifier supplied \`${v}\`, and the fixture did not report building anything with it. `
-        + 'A world that does not contain the value the assertions are about is not the world that was asked for.',
-      );
-      continue;
-    }
-    if (String(out[k]) !== v) {
-      ignored.push(`\`${k}\`: fixture used \`${out[k]}\`, verifier supplied \`${v}\``);
-    }
-  }
-  return { vars: { ...out, ...chosen }, ignored };
-}
-
 /** Bring the product up exactly as Watson will drive it. Returns a handle whose
  *  `teardown()` kills only what we started, by process group. */
 async function bringUp({ repoRoot, contract, runDir, runId, adminUrl, policy }) {
