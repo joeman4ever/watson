@@ -12,13 +12,22 @@
 //     process group and killed by group. Never kill by process name — only what
 //     we started.
 
-import { spawn, execFileSync } from 'node:child_process';
 import net from 'node:net';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
-import { isAuthorized as isAuthorizedStatus } from './driver.mjs';
+import url from 'node:url';
+// `interp` rather than `interpolate`: preconditions are ASSERTIONS about the
+// product's read paths, and the two differ on an unresolved name — `interpolate`
+// substitutes the empty string, which makes a precondition URL collapse to a
+// prefix that may well answer 200 and pass vacuously.
+import { isAuthorized as isAuthorizedStatus, browserSandbox, BROWSER_CHANNEL, interp } from './driver.mjs';
+// Re-exported rather than redefined: product-command execution lives in a
+// dependency-free module so the product plane can run it from a read-only
+// engine mount without installing anything.
+import { interpolate, runStep, launchApp, killGroup, productExecution, resetProductExecution, scrubEnv, SCRUBBED_ENV_KEYS } from './exec.mjs';
+export { interpolate, runStep, launchApp, killGroup, productExecution, resetProductExecution, scrubEnv, SCRUBBED_ENV_KEYS };
 import pg from 'pg';
 import { generateKeyPair, exportJWK, SignJWT } from 'jose';
 import http from 'node:http';
@@ -32,28 +41,6 @@ export async function freePort() {
     s.listen(0, '127.0.0.1', () => {
       const { port } = s.address();
       s.close(() => resolve(port));
-    });
-  });
-}
-
-function interpolate(str, vars) {
-  return String(str).replace(/\$\{(\w+)\}/g, (_, k) => (vars[k] ?? ''));
-}
-
-/** Run a contract-declared command. Commands come from `.watson/config.yaml`,
- *  which is reviewed product-repo content — never an arbitrary string from a PR body. */
-export function runStep(cmd, { cwd, env, label, timeoutMs = 900_000 }) {
-  const started = Date.now();
-  const res = spawn(cmd.shell ?? cmd, { cwd, env, shell: true, stdio: ['ignore', 'pipe', 'pipe'] });
-  return new Promise((resolve, reject) => {
-    let out = '', err = '';
-    const timer = setTimeout(() => { res.kill('SIGKILL'); reject(new Error(`${label}: timed out after ${timeoutMs}ms`)); }, timeoutMs);
-    res.stdout.on('data', (d) => (out += d));
-    res.stderr.on('data', (d) => (err += d));
-    res.on('close', (code) => {
-      clearTimeout(timer);
-      if (code !== 0) reject(new Error(`${label}: exited ${code}\n${(err || out).slice(-1500)}`));
-      else resolve({ stdout: out, stderr: err, ms: Date.now() - started });
     });
   });
 }
@@ -147,9 +134,56 @@ export async function provisionDatabase({ adminUrl, dbName, runId }) {
       `INSERT INTO ${MARKER_TABLE} (run_id, database_name) VALUES ($1, current_database())`,
       [runId],
     );
+    // Free: the connection is already open. Which server actually stored the
+    // fixtures is part of what a runtime verdict was produced against.
+    const v = await runClient.query('SHOW server_version');
+    return { serverVersion: v.rows?.[0]?.server_version ?? null };
   } finally {
     await runClient.end();
   }
+}
+
+/**
+ * What executed this run. Cheap, synchronous, and deliberately modest: it names
+ * the components, it does not promise they can be reassembled.
+ */
+export function executionProvenance(policy = productExecution()) {
+  let playwright = null;
+  try {
+    playwright = JSON.parse(
+      fs.readFileSync(path.join(path.dirname(url.fileURLToPath(import.meta.url)), '..', 'package.json'), 'utf8'),
+    ).dependencies?.playwright ?? null;
+  } catch { /* engine package.json unreadable; not worth failing a run over */ }
+  return {
+    node: process.version,
+    platform: `${process.platform}/${process.arch}`,
+    os_release: os.release(),
+    playwright,
+    // Recorded because it varies with HOW Watson was deployed, and a reader
+    // assessing an unexpected verdict deserves to know which protections the run
+    // actually had. See `browserSandbox()` for why root implies false.
+    browser_sandbox: browserSandbox(),
+    browser_channel: BROWSER_CHANNEL,
+    database_server_version: null,
+    // The security-relevant half: whether product-authored commands actually ran
+    // as a different, unprivileged user, or as the verifier itself. A result that
+    // does not say which of those happened cannot be assessed for trust.
+    product_privilege_separated: policy.drop === true,
+    product_uid: policy.drop ? Number(policy.uid) : null,
+    // CI provenance, when a CI system supplied it. Read-only labels; nothing here
+    // is trusted for a decision.
+    ci: process.env.GITHUB_ACTIONS === 'true'
+      ? {
+          provider: 'github-actions',
+          runner_image: process.env.ImageOS ?? null,
+          runner_os: process.env.RUNNER_OS ?? null,
+          workflow_ref: process.env.GITHUB_WORKFLOW_REF ?? null,
+          event_name: process.env.GITHUB_EVENT_NAME ?? null,
+          run_id: process.env.GITHUB_RUN_ID ?? null,
+          run_attempt: process.env.GITHUB_RUN_ATTEMPT ?? null,
+        }
+      : null,
+  };
 }
 
 export async function dropDatabase({ adminUrl, dbName }) {
@@ -254,7 +288,14 @@ export async function reap({ adminUrl, prefix = 'watson_', maxAgeHours = 2, now 
  * verified. Named generically for the same reason as the result envelope: the
  * engine's semantics do not depend on which identity provider a product uses.
  */
-export async function startIdentityService({ issuer, clientId, identities }) {
+export async function startIdentityService({
+  issuer, clientId, identities,
+  // Loopback by default: in a single-process run nothing else should be able to
+  // reach the JWKS. When the product runs in a separate container it must, so
+  // the caller widens the bind and says which name to advertise. The SIGNING KEY
+  // never leaves this process either way — only the public JWK is served.
+  bindHost = '127.0.0.1', advertiseHost = '127.0.0.1',
+} = {}) {
   const { publicKey, privateKey } = await generateKeyPair('RS256', { extractable: true });
   const jwk = { ...(await exportJWK(publicKey)), kid: JWKS_KID, alg: 'RS256', use: 'sig' };
 
@@ -267,7 +308,7 @@ export async function startIdentityService({ issuer, clientId, identities }) {
       res.end();
     }
   });
-  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  await new Promise((r) => server.listen(0, bindHost, r));
   const port = server.address().port;
 
   const mint = (subject) =>
@@ -285,7 +326,7 @@ export async function startIdentityService({ issuer, clientId, identities }) {
   }
 
   return {
-    jwksUri: `http://127.0.0.1:${port}/jwks.json`,
+    jwksUri: `http://${advertiseHost}:${port}/jwks.json`,
     issuer,
     clientId,
     tokens,
@@ -308,29 +349,6 @@ export async function startIdentityService({ issuer, clientId, identities }) {
 }
 
 // -------------------------------------------------------------------- launch --
-
-/** Launch the product DETACHED in its own process group so teardown can kill
- *  the whole tree, not just the wrapper we spawned. */
-export function launchApp({ cmd, cwd, env, logFile }) {
-  const log = fs.openSync(logFile, 'a');
-  const child = spawn(cmd, {
-    cwd, env, shell: true, detached: true, stdio: ['ignore', log, log],
-  });
-  child.unref();
-  return { pid: child.pid, pgid: child.pid, logFile };
-}
-
-export function killGroup(pid) {
-  if (!pid) return false;
-  try { process.kill(-pid, 'SIGTERM'); } catch { /* already gone */ }
-  const deadline = Date.now() + 5000;
-  while (Date.now() < deadline) {
-    try { process.kill(-pid, 0); } catch { return true; }
-    try { execFileSync('sleep', ['0.2']); } catch { /* ignore */ }
-  }
-  try { process.kill(-pid, 'SIGKILL'); } catch { /* ignore */ }
-  return true;
-}
 
 export async function waitForHealth(url, timeoutMs = 60_000) {
   const deadline = Date.now() + timeoutMs;
@@ -412,7 +430,7 @@ export async function doctor({ baseUrl, dbName, databaseUrl, adminToken, expectS
     try {
       const token = pre.as ? tokens?.[pre.as] : adminToken;
       if (pre.as && !token) { add(label, false, `no token for identity ${pre.as}`); continue; }
-      const r = await get(interpolate(pre.get, vars ?? {}), token);
+      const r = await get(interp(pre.get, vars ?? {}), token);
       if (pre.expect?.authorized !== undefined) {
         const ok = isAuthorizedStatus(r.status) === pre.expect.authorized;
         add(label, ok, `${r.status} (expected ${pre.expect.authorized ? 'authorized' : 'denied'})`);
@@ -420,7 +438,7 @@ export async function doctor({ baseUrl, dbName, databaseUrl, adminToken, expectS
       }
       if (pre.expect?.json) {
         const bad = Object.entries(pre.expect.json)
-          .filter(([k, v]) => String(r.body?.[k]) !== String(interpolate(String(v), vars ?? {})));
+          .filter(([k, v]) => String(r.body?.[k]) !== String(interp(String(v), vars ?? {})));
         add(label, bad.length === 0,
           bad.length ? bad.map(([k, v]) => `${k}: wanted ${v}, got ${JSON.stringify(r.body?.[k])}`).join('; ')
                      : Object.keys(pre.expect.json).map((k) => `${k}=${r.body?.[k]}`).join(', '));
@@ -484,4 +502,3 @@ export function newRunId() {
   return `wtsn-${stamp}-${crypto.randomBytes(2).toString('hex')}`;
 }
 
-export { interpolate };

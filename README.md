@@ -32,14 +32,25 @@ writes it during a run.
 ## Usage
 
 ```bash
-watson verify --repo /path/to/product [--sha <ref>] [--base <ref>] [--profile poc] [--pr 123]
+# TRUSTED side, against a checkout the product has not run in:
+watson manifest --repo /path/to/product --sha <ref> --out manifest.json
+
+watson verify --repo /path/to/product --manifest manifest.json \
+              [--sha <ref>] [--base <ref>] [--profile poc] [--pr 123] [--out result.json] \
+              [--plane <url> --product-base-url <url>]
 watson doctor --repo /path/to/product     # bring up, probe, tear down
+watson plane  --repo /path/to/product     # the untrusted side's executor
 watson reap                               # drop orphaned watson_* databases
 ```
 
 Exit code is `0` for `PASS` / `PASS_WITH_ADVISORIES`, `1` otherwise. Every run
 writes `runs/<runId>/result.json` (machine) and `runs/<runId>/summary.md`
 (human, with a `WATSON_METADATA` marker).
+
+`--out` additionally writes the canonical result to a path **the caller names**.
+A harness should never have to find Watson's evidence by asking the filesystem
+which file is newest: that answer is influenced by every process that ran during
+the verification, the product's included.
 
 ## Lifecycle
 
@@ -131,6 +142,218 @@ network capture belongs in the library layer.
   repository write credential in the same process as the browser.
 - Contract commands come from reviewed product-repo content, never from a PR
   body or any untrusted input.
+
+## The verifier / product boundary
+
+Watson runs the product's own install, build, launch and seed commands. When the
+revision under verification is a pull request, those commands were written by the
+author whose work Watson is judging. It is inconsistent to call that code
+untrusted where credentials are concerned and trusted where the verdict is
+concerned, so the engine assumes it may be hostile and holds one invariant:
+
+> **The thing being verified must not be able to alter the verifier, the
+> orchestration that invokes it, or the evidence accepted as its result.**
+
+### Two planes
+
+```text
+VERIFIER PLANE                          PRODUCT PLANE
+  engine, contract, selection             the exact PR checkout
+  database provisioning + marker          npm install / build / start
+  identity: signing key, JWKS             the fixture seed
+  Playwright + SANDBOXED Chromium
+  the evidence directory                  runs unprivileged
+  runs unprivileged                       holds no credential
+                    │                              │
+                    └──── isolated network ────────┘
+                          HTTP only, verifier → product
+```
+
+`watson verify --plane <url> --product-base-url <url>` splits them; without those
+flags everything runs in one process, which is right for local development —
+there is no boundary to enforce between you and your own code.
+
+The division of labour is the security property. **The verifier decides:** it
+reads the contract, provisions and stamps the database, mints the identity,
+chooses the port, resolves every command and environment variable, and confirms
+readiness itself by polling the product's own health endpoint. **The product
+plane executes:** it runs what it is handed and answers with what came back.
+
+The plane has no endpoint that reports readiness — deliberately, and there is a
+test for it. A plane allowed to decide one small thing is a plane the product can
+use to make the verifier agree with it.
+
+Nothing the plane says decides a verdict, and the reason is architectural rather
+than a promise.
+
+The fixture's emitted variables used to be the exception. They become **assertion
+operands** — `expect_text: "${seasonName}"` asserted against a string the product
+chose, which let the product decide whether it passed its own test. Refusing
+values that *look* vacuous could never fix that: `http`, `Sign` and `Home` are all
+plausible and all match a generic error page. The difference is not in the string,
+it is in who picked it.
+
+So the verifier picks it. It generates the values a journey asserts on from a run
+run identity, and passes them **into** the fixture:
+
+```text
+verifier            → WATSON_FIXTURE_SEASONNAME=watson-seasonName-240b876c04012e82
+fixture             → creates the season with that name
+Watson's assertion  → expects the value the VERIFIER chose
+```
+
+The contract declares which names those are, and the engine **refuses a contract
+that asserts on anything else** — a journey may still navigate to a
+product-assigned id, it just may not treat that id as evidence. A fixture that
+ignores what it was given fails the run as a broken world, not a product defect.
+
+### The browser is part of the verifier
+
+The pages Chromium loads are served by the product under verification, so an
+unsandboxed browser is a hole in the same boundary that protects the evidence.
+Chromium refuses to start as root with its sandbox on; the response is to refuse
+to be root, never to pass `--no-sandbox`. `launchBrowser` throws as root, the
+flag appears nowhere in `src/`, and a test greps for it.
+
+`test/browser-sandbox-proof.mjs` proves the sandbox rather than asserting it. It
+launches the real browser as an unprivileged user in the pinned container image
+and establishes both of Chromium's layers, which fail independently:
+
+| layer | how it is established |
+| --- | --- |
+| seccomp-bpf | `Seccomp: 2` and `NoNewPrivs: 1` in the renderer's `/proc/<pid>/status` |
+| namespace sandbox | `chrome://sandbox` reporting *adequately sandboxed*, corroborated by the renderer's `/proc/<pid>/ns/{user,pid,net}` |
+
+Chromium's own status page is authoritative for layer 1 because Chromium knows
+which mechanism it chose. An earlier version of this proof demanded a separate
+*user* namespace and reported the sandbox missing on a browser Chromium itself
+called adequately sandboxed — the check was wrong, not the browser.
+
+Two things this proof had to learn the hard way, both now permanent:
+
+- **Docker's default seccomp profile forbids the namespace sandbox.** Measured on
+  the runners: not AppArmor, not `no-new-privileges`. `seccomp/` and
+  `tools/seccomp-profile.mjs` derive the smallest profile that permits it, and a
+  test asserts the delta from Docker's default is exactly two documented edits.
+- **Watson drives Chromium proper, not Playwright's default headless shell.** The
+  headless shell does not answer `chrome://sandbox` at all, and a sandbox this
+  design cannot prove is not one it gets to claim.
+
+CI runs the proof on every change. If an image or runner cannot give us a
+sandboxed non-root browser, the right outcome is a red build and a conversation,
+not a quietly weakened threat model.
+
+### Within one process, when that is what you have
+
+Where a container boundary is not available, the same protection is approximated
+by uid separation: `WATSON_PRODUCT_UID` / `_GID` / `_HOME` run every
+product-authored command as an unprivileged user via `setpriv` — invoked with an
+argv array, so the product's command string is never interpolated into another
+shell. Requested-but-unavailable **refuses**; it never falls back to running
+product code with the verifier's own privileges, because a security property
+believed to hold and silently absent is worse than one never claimed.
+
+This is weaker than two planes and is not what CI uses: it shares a process tree
+with the browser.
+
+### Environment scrubbing
+
+A named set of variables is removed before the product's environment is handed
+over: CI bearer tokens (`ACTIONS_RUNTIME_TOKEN`, `GITHUB_TOKEN`, …) and, just as
+important, the runner's *command channels* — `GITHUB_ENV`, `GITHUB_PATH`,
+`GITHUB_OUTPUT`, `GITHUB_STATE`. Those name files the runner reads back after a
+step, so anything able to append to them can inject environment variables and
+PATH entries into the trusted side that follows. Across a plane boundary the
+verifier's environment is not sent at all.
+
+### Product identity comes from a trusted manifest, not from git
+
+Three adversarial reviews found four ways past a git-based identity gate, and
+every one had the same shape: the gate asked a directory the product writes,
+whose `.git` the product owns, to describe itself.
+
+| attack | what it defeated |
+| --- | --- |
+| `git update-index --assume-unchanged` | `git status` |
+| `git replace` | the commit tree `ls-tree` resolves |
+| `git add` on a new file | the untracked listing |
+| corrupt `.git/index` | both listings at once |
+| self-hiding `.gitignore` | every generation |
+
+Patching each answer never changed who was answering. So the authority moved:
+
+```text
+trusted orchestration          materialises the commit
+        ↓                      BEFORE any product code runs
+watson manifest                walks it, records path + type + digest + exec bit
+        ↓                      the product never sees this tree
+product plane                  builds and runs — needs no .git at all
+        ↓
+verifier                       compares the product tree against the manifest
+```
+
+**No manifest, no product claim.** A run that was not given one withholds every
+product claim rather than falling back to asking git — the fallback *was* the
+vulnerability.
+
+It also catches what git was never asked about: a missing file, a symlink to
+identical bytes, the executable bit, a directory where a file belongs.
+
+**Generated output is the open edge, and the honest version of that sentence is
+narrower than the one that used to be here.** A file under a declared
+`generated_roots` entry is dropped from the divergence check, and the roots are
+declared in the product's own `.watson/config.yaml`. So a pull request that adds
+`- server/src` to that list can have its build write new source files and still
+report an exact-head match. That is a real hole (C1 below), found by executing it:
+
+```
+CONTROL (no generated_roots):    exact_head=false  dirty=["server/src/backdoor.ts (unexpected)"]
+ATTACK  (product declares src):  exact_head=true   clean=true  dirty_count=0
+```
+
+What IS true, and what I tried hardest to break: **no declared root can shelter a
+change to a file the commit contains** — modified, missing, type-changed and
+mode-changed all stay divergent regardless. And the exemption is now recorded and
+printed on every run, naming the roots, rather than surfacing as a bare integer
+on the one code path that never ran for a clean tree.
+
+### What that proves, and what it does not
+
+> At the verifier's measurement point, the materialised committed product source
+> matched the trusted manifest for product HEAD X.
+
+Not: *the bytes loaded into the running process are nothing but the committed
+bytes.* Build output is outside the manifest by construction, the source is
+measured at two instants rather than continuously, and nothing yet binds the
+artefact actually launched to the commit. Closing that means a trusted build
+producing an artefact or image digest and launching exactly that. It is tracked,
+not claimed.
+
+### Known limitations, and where they must be closed
+
+Recorded here rather than in a comment nobody reads, because the difference
+between shadow mode and a required check is exactly this list.
+
+| | Limitation | Phase 1 (advisory) | Before Watson is a required check |
+| --- | --- | --- | --- |
+| **C3** | The product's `DATABASE_URL` carries the same Postgres role as the admin URL, so it is not least-privilege. Bounded today by the deployment — a per-run Postgres destroyed with the run — which is a property of the orchestration, not of this code | documented | explicit final disposition |
+| **C4** | Identity binds committed *source* at two instants, not the running artefact | documented | closed, or an owner-accepted equivalent runtime binding |
+| **C1** | `generated_roots` — the identity check's exemption list — is authored by the product being measured. A pull request can widen it and hide new files from the divergence check. Recorded and printed, not closed | reported on every run | the list must come from a trusted source, or from the BASE branch's contract |
+
+Neither is called fixed. Phase-1 maturity counters do not retire them; they are
+separate requirements.
+
+### The controls
+
+`test/manifest.test.mjs` runs the full adversarial corpus — every attack that
+defeated a previous generation of the gate — against the architecture that
+replaced it. `test/operands.test.mjs` covers who may choose an assertion's
+operand. `test/isolation.test.mjs` and `test/plane.test.mjs` cover the rest.
+
+Where a control needs real privilege separation and cannot have it (no root), it
+asserts the fail-closed contract instead and says so **in its own name** — it
+never silently skips, because a green tick on a security test that did nothing is
+read as proof.
 
 ## Deliberately not built yet
 

@@ -4,13 +4,14 @@
 // globals, and unreachable code.
 export default [
   {
-    files: ['src/**/*.mjs', 'test/**/*.mjs'],
+    files: ['src/**/*.mjs', 'test/**/*.mjs', 'tools/**/*.mjs'],
     languageOptions: {
       ecmaVersion: 2023,
       sourceType: 'module',
       globals: {
         process: 'readonly', console: 'readonly', URL: 'readonly', fetch: 'readonly',
         AbortSignal: 'readonly', setTimeout: 'readonly', clearTimeout: 'readonly', Buffer: 'readonly',
+        structuredClone: 'readonly',
         // Browser globals. These are NOT available to the engine — they appear only
         // inside `page.evaluate(() => ...)` callbacks, whose bodies are serialised and
         // run in Chromium. ESLint cannot see that boundary, so they are declared here

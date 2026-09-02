@@ -15,19 +15,93 @@
 import { chromium } from 'playwright';
 import fs from 'node:fs';
 import path from 'node:path';
+import { degenerateOperand } from './contract.mjs';
 
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
-export async function launchBrowser({ executablePath, cdpPort, headless = true }) {
+/**
+ * The browser is part of the verifier, and the pages it loads come from the
+ * thing under verification.
+ *
+ * That single sentence decides this whole function. Under the threat model
+ * Watson operates in, the product controls the HTML and JavaScript Chromium
+ * executes, so an unsandboxed browser is a hole in the same boundary that
+ * protects the evidence — not a separate, lesser concern about the browser.
+ *
+ * Chromium refuses to start as root with its sandbox enabled. The response is
+ * NOT to pass `--no-sandbox`: it is to refuse to be root. Watson's product
+ * execution lives in its own container with its own unprivileged user, so the
+ * verifier never needs root to do its own job.
+ *
+ * `--no-sandbox` is deliberately absent from this file. If it is ever needed
+ * again, it needs a decision record, not a flag.
+ */
+export function browserSandbox() {
+  return !(typeof process.getuid === 'function' && process.getuid() === 0);
+}
+
+/**
+ * Chromium proper, not the headless shell.
+ *
+ * Playwright's default headless mode runs `chromium_headless_shell`, a separate
+ * binary. Measured on GitHub's runners, the two do not report the same sandbox
+ * state: full Chromium answers `chrome://sandbox` with "adequately sandboxed"
+ * and the headless shell does not answer at all. Watson cannot prove a property
+ * of a build that will not report it, and an unprovable sandbox is not one this
+ * design gets to claim — so it drives the build that reports.
+ */
+export const BROWSER_CHANNEL = 'chromium';
+
+export async function launchBrowser({ executablePath, cdpPort, headless = true, channel = BROWSER_CHANNEL } = {}) {
+  if (!browserSandbox()) {
+    throw new Error(
+      'refusing to launch the browser as root: Chromium cannot enable its sandbox as root, and the ' +
+        'pages it loads are served by the product under verification. Run the verifier as an ' +
+        'unprivileged user; product execution belongs in its own container, not in this process tree.',
+    );
+  }
   return chromium.launch({
     executablePath,
     headless,
+    // Explicit, so a caller that needs to know WHICH build it measured can say
+    // so — and so nothing silently falls back to the headless shell.
+    ...(channel ? { channel } : {}),
     args: [
       `--remote-debugging-port=${cdpPort}`,
       '--remote-debugging-address=127.0.0.1',
       '--disable-extensions',
     ],
   });
+}
+
+/**
+ * Ask Chromium what its own sandbox is doing, rather than inferring it from the
+ * absence of a flag.
+ *
+ * `chrome://sandbox` is Chromium's own status page; on Linux it reports the
+ * namespace and seccomp-bpf sandboxes and whether the layer-1 sandbox is
+ * effective. Best-effort: a Chromium build or headless mode that will not render
+ * it returns `available: false`, and the caller records that rather than
+ * inventing a claim. What the caller must NOT do is treat "no flag" as proof.
+ */
+export async function probeSandbox(browser) {
+  let ctx;
+  try {
+    ctx = await browser.newContext();
+    const page = await ctx.newPage();
+    await page.goto('chrome://sandbox', { timeout: 10_000 });
+    const text = (await page.evaluate(() => document.body.innerText)).trim();
+    return {
+      available: true,
+      // Chromium prints "You are adequately sandboxed." when layer 1 is effective.
+      effective: /adequately sandboxed/i.test(text),
+      report: text.slice(0, 2000),
+    };
+  } catch (err) {
+    return { available: false, effective: null, report: String(err.message ?? err).slice(0, 300) };
+  } finally {
+    await ctx?.close().catch(() => {});
+  }
 }
 
 /** An authenticated context + page, with always-on evidence collectors. */
@@ -80,11 +154,30 @@ export async function openIdentity(browser, { baseUrl, token, viewport }) {
  */
 export const STEPS = [
   'goto', 'reload', 'back', 'click', 'fill', 'select', 'wait_for_text',
-  'expect_text', 'expect_no_text', 'expect_no_uuid', 'expect_url_contains',
+  'expect_text', 'expect_text_in', 'expect_no_text', 'expect_no_uuid', 'expect_url_contains',
   'expect_api', 'expect_denied', 'expect_allowed', 'expect_json',
   'expect_count_at_most', 'expect_count_at_least',
   'set_viewport', 'expect_no_overflow',
 ];
+
+/**
+ * Steps whose operands are PROOF, not input.
+ *
+ * The distinction decides who is allowed to choose a value. A `fill` operand is
+ * something Watson types into the product; the product may well have chosen it,
+ * and nothing rests on it. An `expect_text` operand is the thing that makes the
+ * assertion true — so if the product picks it, the product decides whether it
+ * passes its own test.
+ *
+ * `wait_for_text` is here deliberately: it asserts what the application
+ * eventually says, and a journey that waits for a string the product chose has
+ * proved only that the product can echo itself.
+ */
+export const ASSERTION_STEPS = new Set([
+  'wait_for_text', 'expect_text', 'expect_text_in', 'expect_no_text', 'expect_url_contains',
+  'expect_api', 'expect_denied', 'expect_allowed', 'expect_json',
+  'expect_count_at_most', 'expect_count_at_least',
+]);
 
 function locator(page, sel) {
   if (typeof sel !== 'string') throw new Error(`selector must be a string, got ${JSON.stringify(sel)}`);
@@ -179,6 +272,33 @@ export async function runStep(step, ctx) {
       }
       if (!(await seen())) throw new Error(`expected page text to contain "${arg}"${note}`);
       return `page contains "${arg}"`;
+    }
+    case 'expect_text_in': {
+      // The same assertion as `expect_text`, SCOPED to one element.
+      //
+      // It exists because a journey in the product's own map said the quiet part
+      // out loud: "searching for the bare count as a string matches any
+      // incidental digit and proves nothing." That is true of every short
+      // operand — a grade, a cohort size, a threshold — and page-wide
+      // `expect_text` cannot distinguish "the stat shows 7" from "a 7 appears
+      // somewhere on the page".
+      //
+      // Polls, for the same reason `expect_text` does: this is a claim about
+      // eventual state, and sampling once races the render.
+      const el = locator(page, arg.selector);
+      const want = String(arg.text);
+      const seen = async () => {
+        try { return ((await el.first().innerText({ timeout: 1000 })) ?? '').includes(want); }
+        catch { return false; }
+      };
+      const deadline = Date.now() + timeout;
+      while (!(await seen()) && Date.now() < deadline) {
+        await page.waitForTimeout(100);
+      }
+      if (!(await seen())) {
+        throw new Error(`expected ${arg.selector} to contain "${want}"${note}`);
+      }
+      return `${arg.selector} contains "${want}"`;
     }
     case 'expect_no_text': {
       // Deliberately does NOT poll, unlike `expect_text` above. The asymmetry is
@@ -330,8 +450,35 @@ export async function runStep(step, ctx) {
   }
 }
 
+/**
+ * Substitute `${name}` from the run's variables.
+ *
+ * FAIL-CLOSED on an unknown name. It used to leave the literal `${name}` in
+ * place, which turns a map typo into an assertion against a string no page will
+ * ever contain — reported as a product failure. And it is one small step from
+ * the sibling bug the engine also had, where an unknown name became the EMPTY
+ * string and the assertion became vacuously true.
+ *
+ * There is no safe default here. An expectation whose operand could not be
+ * resolved is not an expectation, so the run says so.
+ */
 export function interp(str, vars) {
-  return String(str).replace(/\$\{(\w+)\}/g, (_, k) => (vars?.[k] ?? `\${${k}}`));
+  return String(str).replace(/\$\{(\w+)\}/g, (_, k) => {
+    const v = vars?.[k];
+    if (v === undefined) {
+      throw new Error(
+        `\${${k}} could not be resolved to a value. An unresolved operand is not an ` +
+          'expectation; refusing to assert against it.',
+      );
+    }
+    // The SAME predicate `validateSeedValues` applies at the source. Two rules
+    // for one variable namespace is how a value rejected in one place arrives
+    // through the other — which is what happened when this accepted `" "` and
+    // the source check rejected it.
+    const bad = degenerateOperand(v);
+    if (bad) throw new Error(`\${${k}} ${bad}`);
+    return String(v);
+  });
 }
 
 // ------------------------------------------------------------------- evidence
