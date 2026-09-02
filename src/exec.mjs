@@ -60,10 +60,25 @@ export const SCRUBBED_ENV_KEYS = Object.freeze([
   'GITHUB_TOKEN', 'GH_TOKEN', 'NPM_TOKEN', 'NODE_AUTH_TOKEN',
   'GITHUB_ENV', 'GITHUB_PATH', 'GITHUB_OUTPUT', 'GITHUB_STATE', 'GITHUB_STEP_SUMMARY',
   // Watson's OWN admin credential. It creates and drops databases, including
-  // other runs'. The contract is supposed to receive a per-run `DATABASE_URL`
-  // scoped to one database; handing the product the admin string instead would
-  // undercut the doctor's "refuse any database Watson did not create" interlock
-  // from the other side.
+  // other runs'.
+  //
+  // SCRUBBING THE VARIABLE IS NOT THE WHOLE FIX, and saying otherwise would be
+  // worse than the gap. `DATABASE_URL` is derived from this string by swapping
+  // the database name, so it carries the SAME ROLE — and Postgres privileges
+  // attach to the role, not to the name in the URL. A product command can
+  // therefore still reach the admin database through the credential it is
+  // legitimately given.
+  //
+  // The real fix is a per-run role with rights over one database only. It is not
+  // done here because it is not testable from this repository and it can break
+  // real provisioning: migrations that `CREATE EXTENSION` need privileges an
+  // unprivileged role does not have, and discovering that in someone's CI is a
+  // worse outcome than a documented gap.
+  //
+  // What bounds it today is the deployment, not this list: the shipping topology
+  // gives each run its own Postgres container, destroyed with the run, so
+  // "other runs' databases" is an empty set. That is a property of the
+  // orchestration and would stop being true against a shared server.
   'WATSON_ADMIN_DB_URL',
 ]);
 
