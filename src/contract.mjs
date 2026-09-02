@@ -294,32 +294,46 @@ export function degenerateOperand(value) {
  * Within an assertion step, WHICH FIELD carries the proof.
  *
  * The first version of this rule counted every `${...}` inside an assertion step,
- * and that is too coarse. `expect_denied: { path: "/api/seasons/${s}/groups/${g}" }`
- * asserts an AUTHORIZATION OUTCOME; the path is an address. A product that chooses
- * `g` cannot make "denied" true by choosing it — it would have to make the
- * endpoint actually deny, which is the behaviour under test. Choosing a
- * nonexistent group gets a 404, which this engine classifies as FAIL_CONTRACT,
- * not a pass; choosing the wrong group gets a 200 and fails.
+ * and that is too coarse: in `expect_denied` the assertion is an AUTHORIZATION
+ * OUTCOME and the path names WHICH thing. But "address" never meant "harmless",
+ * and the first cut of this table got two things wrong.
+ *
+ * WRONG ONE — a selector is not an address. `locator()` resolves `text=...`
+ * through `page.getByText`, so
+ *
+ *     expect_count_at_least: { selector: "text=${sessionName}", min: 1 }
+ *
+ * IS `expect_text: "${sessionName}"` wearing a different hat, and the table said
+ * it carried no proof at all. Anything that can name content — a `text=`
+ * selector, `:has-text(...)` — is proof, so selectors are counted. A selector
+ * that addresses structurally (`testid=`, `css=`) simply has no variables in it
+ * and costs nothing.
+ *
+ * WRONG TWO — see `validateDenialAddresses` below. The justification for
+ * exempting `expect_denied.path` rested on a claim about the product ("a
+ * nonexistent id gets a 404, which is FAIL_CONTRACT, not a pass") that is FALSE
+ * against nsc-eval, whose authorization layer deliberately has no existence
+ * oracle and answers 403 for anything outside the caller's scope. The exemption
+ * survives, because the alternative — forcing every id to be verifier-supplied —
+ * would push a product architecture change for a property a journey can carry
+ * itself. What replaces the false justification is an enforced obligation:
+ * something has to prove the address resolves.
  *
  * Contrast `expect_text: "${seasonName}"`, where the operand IS the proof: a
  * product that picks the string picks whether the assertion holds.
- *
- * Getting this wrong in the strict direction has a real cost, not just a
- * pedantic one. It would have forced `assignedGroupId` and `unassignedGroupId` to
- * be verifier-supplied, which nsc-eval cannot do without changing
- * `createGroup(sessionId, name)` in its data-access boundary — a product
- * architecture change made purely to satisfy a rule that did not need it.
  */
 const PROOF_FIELDS = {
-  expect_text_in: ['text'],
+  // Both fields: the text is the proof, and a `text=` selector is also proof.
+  expect_text_in: ['text', 'selector'],
   expect_json: ['contains', 'body', 'expect'],
-  // `path` is an address; the assertion is the status class it comes back with.
+  // `path` addresses; the assertion is the status class it comes back with. The
+  // obligation that makes this safe is enforced by `validateDenialAddresses`.
   expect_api: [],
   expect_denied: [],
   expect_allowed: [],
-  // `selector` addresses; the bound is a number from the contract, not the fixture.
-  expect_count_at_most: [],
-  expect_count_at_least: [],
+  // The BOUND is a number from the contract, but the selector can name content.
+  expect_count_at_most: ['selector'],
+  expect_count_at_least: ['selector'],
 };
 
 export function assertionVars(feature) {
@@ -357,6 +371,74 @@ export function assertionVars(feature) {
  * the verifier named instead — which is the right pressure, because a product
  * that assigns the id also decides what the assertion sees.
  */
+/**
+ * Refuse a journey that proves a denial against an address nothing shows exists.
+ *
+ * WHY THIS EXISTS. `expect_denied.path` is exempt from the ownership rule on the
+ * grounds that the path is an address, not proof. The original justification for
+ * that was: "choosing a nonexistent id gets a 404, which the engine classifies as
+ * FAIL_CONTRACT rather than a pass." Against nsc-eval that is false.
+ * `requireAssignmentScope` answers **403 for anything outside the caller's
+ * scope, with no existence check** — deliberately, so the endpoint is not an
+ * existence oracle. Correct security; fatal to the argument.
+ *
+ * The consequence, reproduced: a product in which every evaluator can open every
+ * group in the season — AC-03 broken outright — passes all three `expect_denied`
+ * steps of `evaluator-assignment-scope`, because the fixture chose an
+ * `unassignedGroupId` that does not exist. Nothing was denied. Nothing existed.
+ *
+ * The fix is not to make every id verifier-supplied; that would force a change to
+ * a product's data-access boundary to satisfy a verifier. It is to make the
+ * journey carry the property it was always relying on: SOMETHING must establish
+ * that the address resolves. Either
+ *
+ *   - a positive assertion in the same feature reaches it (`expect_allowed`,
+ *     `expect_api`, `expect_json`), which is how `assignedGroupId` already works,
+ *     or
+ *   - a fixture PRECONDITION resolves it through the product's own read paths as
+ *     an identity that is allowed to see it — which is the only option when, as
+ *     here, the journey's own identity must not be able to reach it.
+ *
+ * A decoy id satisfies neither, and the contract is refused before anything is
+ * provisioned rather than passing against a broken product.
+ */
+export function validateDenialAddresses(features, fixtureProfile) {
+  const problems = [];
+
+  // Names a precondition proves resolve. A precondition that EXPECTS a denial
+  // proves nothing about existence, for exactly the reason this check exists.
+  const provenByPrecondition = new Set();
+  for (const pre of fixtureProfile?.preconditions ?? []) {
+    const denies = pre.expect?.authorized === false;
+    if (denies) continue;
+    referencedVars(pre.get, provenByPrecondition);
+  }
+
+  for (const feature of features) {
+    const denied = new Set();
+    const positive = new Set();
+    for (const step of feature.steps ?? []) {
+      for (const [key, value] of Object.entries(step)) {
+        if (key === 'expect_denied') referencedVars(value?.path, denied);
+        else if (key === 'expect_allowed' || key === 'expect_api') referencedVars(value?.path, positive);
+        else if (key === 'expect_json') referencedVars(value?.path, positive);
+      }
+    }
+    const unproven = [...denied].filter((v) => !positive.has(v) && !provenByPrecondition.has(v));
+    if (unproven.length) {
+      problems.push(
+        `${feature.__file ?? feature.id}: asserts a DENIAL against `
+        + `${unproven.map((v) => `\`\${${v}}\``).join(', ')}, which nothing in this run proves exists. `
+        + 'A denial against an address that resolves to nothing is satisfied by a product that denies '
+        + 'everything AND by one that denies nothing, so it proves neither. Reach it with an '
+        + '`expect_allowed`/`expect_api` in this feature, or resolve it in a fixture precondition as an '
+        + 'identity permitted to see it.',
+      );
+    }
+  }
+  return problems;
+}
+
 export function validateAssertionOperands(features, fixtureProfile, engineSupplied = ['runId']) {
   const chosen = new Set([
     ...normaliseChosen(fixtureProfile?.verifier_chosen ?? []).map(([n]) => n),
@@ -381,9 +463,22 @@ export function validateAssertionOperands(features, fixtureProfile, engineSuppli
  *
  * Deterministic per run, derived from the run identity the verifier owns, so a
  * re-run of the same run is reproducible and two concurrent runs never collide.
- * Not random, because flakiness bought nothing here — what matters is that the
- * product cannot predict or choose them, and a value keyed to a run id it never
- * sees satisfies that.
+ * Not random, because flakiness bought nothing here.
+ *
+ * THE PROPERTY IS "CANNOT CHOOSE", NOT "CANNOT PREDICT", and the difference is
+ * worth stating because the docs used to claim the second. The product CAN
+ * predict these: the run id is passed to the fixture on its own command line
+ * (nsc-eval's `command:` interpolates `${RUN_ID}`), a contract's `env:` block can
+ * put it in front of the running application, and this derivation is public. A
+ * hostile application can recompute every value at startup and render them.
+ *
+ * That is survivable, and choosing would not be. An application that renders
+ * `${primarySeasonName}` on every page makes `expect_text` pass — and fails the
+ * negative journeys, which assert that the same string does NOT appear where it
+ * must not, and the denials, which are status-class assertions it cannot paint
+ * its way out of. What the old design allowed was different in kind: the fixture
+ * picked a string that was ALREADY on the failure page, so the product did not
+ * have to do anything at all.
  *
  * Long enough that a substring assertion on one is meaningful: 16 hex characters
  * do not appear on an error page by accident.
@@ -445,7 +540,7 @@ export function fixtureValues(runId, declared = []) {
  * the verifier generates something that fits it.
  *
  * Every shape is derived from the same run-scoped hash, so all of them are
- * deterministic per run, unpredictable to a product that cannot see the run id,
+ * deterministic per run, not chosen by the product,
  * and distinct from each other.
  */
 export const SHAPES = {

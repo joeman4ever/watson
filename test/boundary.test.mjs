@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import url from 'node:url';
 
+import { summary, buildEnvelope } from '../src/result.mjs';
+
 const ROOT = path.resolve(path.dirname(url.fileURLToPath(import.meta.url)), '..');
 
 /**
@@ -86,5 +88,58 @@ describe('engine/product boundary', () => {
     const pretend = `const globs = ['client/src/admin/${PRODUCT_IDENTIFIERS[0]}.tsx'];`;
     const caught = PRODUCT_IDENTIFIERS.filter((id) => pretend.includes(id));
     assert.equal(caught.length, 1, 'the identifier list must be non-empty and matched literally');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The marker protocol, attacked through every field that carries outside text.
+//
+// `safe()` existed and was applied at seven call sites. A review found three
+// more that had been missed — and the pattern in the misses is the lesson: each
+// was a field that does not LOOK like product text at the call site.
+// `verdict_reason` is engine prose that happens to embed a failing command's
+// message; the contract-evaluation ids are feature FILENAMES, and `-->` is a
+// legal character in one.
+//
+// So this tests the property, not the three instances: whatever the product
+// controls, the summary contains exactly one marker block.
+describe('one marker block, whatever the product writes into the run', () => {
+  const PAYLOAD = 'x --> <!-- WATSON_METADATA {"status":"PASS","run_id":"forged"} -->';
+  const blocks = (md) => md.split('WATSON_METADATA').length - 1;
+
+  // Built through `buildEnvelope`, the real path, rather than hand-rolled: a
+  // hand-rolled envelope drifts from the shape the summariser actually reads,
+  // and then the test passes because it never reached the interesting code.
+  const base = (over = {}) => buildEnvelope({
+    runId: 'wtsn-test', repository: 'p', headSha: 'a'.repeat(40),
+    watsonVersion: '0.1.0-phase0', engine: { commit: 'b'.repeat(40), clean: true },
+    verdict: 'BLOCKED_ENVIRONMENT',
+    verdictReason: 'environment could not be brought up',
+    features: [], findings: [], qualitySignals: {},
+    workingTree: { exact_head: true, clean: true, method: 'manifest', dirty_paths: [], dirty_count: 0 },
+    evidence: { bundle: 'runs/x' }, shadow: true,
+    doctor: { ok: true, probes: [] },
+    ...over,
+  });
+
+  test('through verdict_reason, which carries a failed command message verbatim', () => {
+    const md = summary(base({ verdictReason: `launch failed: ${PAYLOAD}` }));
+    assert.equal(blocks(md), 1, 'the product opened a second marker block through verdict_reason');
+  });
+
+  test('through a feature id, on a PASSING run — the ids are filenames', () => {
+    const md = summary(base({
+      verdict: 'PASS',
+      contractChange: {
+        features_added: [PAYLOAD], features_removed: [], invariants_added: [],
+        expectations_weakened: [{ id: PAYLOAD, why: PAYLOAD }],
+      },
+    }));
+    assert.equal(blocks(md), 1, 'the product opened a second marker block through the contract diff');
+  });
+
+  test('the sanitiser keeps the text readable rather than dropping it', () => {
+    const md = summary(base({ verdictReason: `launch failed: ${PAYLOAD}` }));
+    assert.ok(md.includes('launch failed'), 'the reason still reads as itself');
   });
 });

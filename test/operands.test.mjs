@@ -16,7 +16,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  assertionVars, validateAssertionOperands, fixtureValues, fixtureValueEnv, normaliseChosen,
+  assertionVars, validateAssertionOperands, fixtureValues, fixtureValueEnv, normaliseChosen, validateDenialAddresses,
 } from '../src/contract.mjs';
 
 const feature = (id, steps) => ({ id, __file: `${id}.yaml`, steps });
@@ -62,12 +62,30 @@ describe('proof operands and input operands are different things', () => {
     assert.deepEqual([...assertionVars(f)], ['seasonName']);
   });
 
-  test('a selector addresses; the text it must contain is proof', () => {
+  test('a selector is PROOF, because a selector can name content', () => {
+    // This test used to assert the opposite, and was wrong. `locator()` resolves
+    // `text=...` through `page.getByText`, so
+    //     expect_count_at_least: { selector: "text=${sessionName}", min: 1 }
+    // is `expect_text: "${sessionName}"` with the ownership rule looking the
+    // other way. A review found it by executing it.
+    //
+    // Counted for EVERY selector rather than only content-matching ones: the
+    // prefix can itself come from a variable, and a rule that has to parse the
+    // selector to decide whether it matters is a rule with a next bypass in it.
+    // It costs nothing real — a structural selector has no variables in it.
     const f = feature('f', [
-      { expect_text_in: { selector: 'testid=${addressing}', text: '${cohortSize}' } },
-      { expect_count_at_most: { selector: 'testid=${alsoAddressing}', max: 0 } },
+      { expect_text_in: { selector: 'text=${scopedByContent}', text: '${cohortSize}' } },
+      { expect_count_at_most: { selector: 'testid=${structural}', max: 0 } },
     ]);
-    assert.deepEqual([...assertionVars(f)], ['cohortSize']);
+    assert.deepEqual([...assertionVars(f)].sort(), ['cohortSize', 'scopedByContent', 'structural']);
+  });
+
+  test('the equivalent assertion is classified the same way whichever form it takes', () => {
+    // The property, rather than the instance: writing an assertion as a selector
+    // must not launder its operand.
+    const viaText = feature('f', [{ expect_text: '${sessionName}' }]);
+    const viaSelector = feature('f', [{ expect_count_at_least: { selector: 'text=${sessionName}', min: 1 } }]);
+    assert.deepEqual([...assertionVars(viaText)], [...assertionVars(viaSelector)]);
   });
 
   test('a scoped text assertion counts as proof', () => {
@@ -286,5 +304,51 @@ describe('the usability check does not reject values a product legitimately emit
     for (const v of ['', '   ', null, undefined, {}, []]) {
       assert.ok(degenerateOperand(v), `${JSON.stringify(v)} should be reported at the source`);
     }
+  });
+});
+
+// A denial proves nothing unless the thing denied exists. This is the check that
+// replaced a FALSE justification: `expect_denied.path` was exempted from the
+// ownership rule on the grounds that a nonexistent id would 404 into
+// FAIL_CONTRACT. nsc-eval's authorization layer answers 403 for anything outside
+// the caller's scope, with no existence check — deliberately, so it is not an
+// existence oracle. So the exemption needed a different guarantee, not a better
+// excuse.
+describe('a denial has to be denying something', () => {
+  const f = (steps) => ({ id: 'x', __file: 'x.md', steps });
+
+  test('the attack the review demonstrated: a decoy id nothing can resolve', () => {
+    // A product where EVERY evaluator can open EVERY group passes this journey,
+    // because the group named was never created.
+    const problems = validateDenialAddresses([f([
+      { expect_denied: { path: '/api/seasons/${s}/groups/${unassignedGroupId}/scoring-workspace' } },
+    ])], { preconditions: [{ as: 'W-EVALUATOR', get: '/api/seasons/${s}/x', expect: { authorized: true } }] });
+    assert.equal(problems.length, 1);
+    assert.match(problems[0], /unassignedGroupId/);
+    assert.match(problems[0], /denies everything AND by one that denies nothing/);
+  });
+
+  test('reaching it positively in the same feature satisfies it', () => {
+    assert.deepEqual(validateDenialAddresses([f([
+      { expect_allowed: { path: '/api/seasons/${s}/groups/${g}/scoring-workspace' } },
+      { expect_denied: { path: '/api/seasons/${s}/groups/${g}/my-scores' } },
+    ])], {}), []);
+  });
+
+  test('a precondition that RESOLVES it satisfies it — the only option when this identity must not', () => {
+    assert.deepEqual(validateDenialAddresses(
+      [f([{ expect_denied: { path: '/api/seasons/${s}/groups/${g}/scoring-workspace' } }])],
+      { preconditions: [{ as: 'W-ADMIN', get: '/api/seasons/${s}/groups/${g}/scoring-workspace', expect: { authorized: true } }] },
+    ), []);
+  });
+
+  test('a precondition that expects a DENIAL does not satisfy it', () => {
+    // Two denials are not an existence proof. This is the shape that would have
+    // let the check be satisfied by restating the thing being tested.
+    const problems = validateDenialAddresses(
+      [f([{ expect_denied: { path: '/api/seasons/${s}/groups/${g}/scoring-workspace' } }])],
+      { preconditions: [{ as: 'W-EVALUATOR', get: '/api/seasons/${s}/groups/${g}/x', expect: { authorized: false } }] },
+    );
+    assert.equal(problems.length, 1);
   });
 });

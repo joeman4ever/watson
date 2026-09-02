@@ -248,6 +248,12 @@ export function summary(env) {
   // a consumer parses, so anything able to write `<!-- ... -->` into the body can
   // offer a second, forged one. Neutralise the two sequences that matter; the
   // text stays readable and stops being able to close or open a marker block.
+  // THE RULE: every value that reaches this document from outside the engine
+  // goes through `safe()`. Not "every value that looks dangerous" — a review
+  // found three that had been missed (`verdict_reason`, which carries a failing
+  // command's message straight from the plane, and the contract-evaluation ids,
+  // which are FEATURE FILENAMES and so product-authored). Each had been left out
+  // because it did not look like product text at the call site. It was.
   const safe = (v) => String(v ?? '')
     .replaceAll('<!--', '<!-\u2011-')
     .replaceAll('-->', '--\u2011>')
@@ -256,7 +262,7 @@ export function summary(env) {
   const L = [];
   L.push(`## Watson — ${env.verdict}`);
   L.push('');
-  L.push(`**${env.verdict_reason}**`);
+  L.push(`**${safe(env.verdict_reason)}**`);
   L.push('');
   L.push(`| | |`);
   L.push(`| --- | --- |`);
@@ -318,11 +324,11 @@ export function summary(env) {
     const ce = env.contract_evaluation;
     if (ce.expectations_weakened?.length) {
       L.push('Expectations **weakened**:');
-      for (const w of ce.expectations_weakened) L.push(`- \`${w.id}\` — ${w.why}`);
+      for (const w of ce.expectations_weakened) L.push(`- \`${safe(w.id)}\` — ${safe(w.why)}`);
     }
-    if (ce.features_removed?.length) L.push(`Features removed: ${ce.features_removed.map((f) => `\`${f}\``).join(', ')}`);
-    if (ce.features_added?.length) L.push(`Features added: ${ce.features_added.map((f) => `\`${f}\``).join(', ')}`);
-    if (ce.invariants_added?.length) L.push(`Invariants added: ${ce.invariants_added.map((f) => `\`${f}\``).join(', ')}`);
+    if (ce.features_removed?.length) L.push(`Features removed: ${ce.features_removed.map((f) => `\`${safe(f)}\``).join(', ')}`);
+    if (ce.features_added?.length) L.push(`Features added: ${ce.features_added.map((f) => `\`${safe(f)}\``).join(', ')}`);
+    if (ce.invariants_added?.length) L.push(`Invariants added: ${ce.invariants_added.map((f) => `\`${safe(f)}\``).join(', ')}`);
     if (ce.base_contract_available === false) {
       L.push('The base contract could not be read, so only the FACT of a change is reported — review the `.watson/` diff directly.');
     } else if (!ce.expectations_weakened?.length && !ce.features_removed?.length) {
@@ -348,6 +354,22 @@ export function summary(env) {
       L.push('**The contract itself is modified.** This run verified expectations that do not exist at that SHA, so its result cannot be cited for that commit.');
     }
     if (wt.dirty_paths?.length) L.push('', 'Modified: ' + wt.dirty_paths.map((p) => `\`${safe(p)}\``).join(', '));
+    L.push('');
+  }
+
+  // Printed on EVERY run, including an exact-head one — which is the only run
+  // where it matters. `generated_roots` comes from the product's own
+  // `.watson/config.yaml`, so files under a declared root are dropped from the
+  // divergence check; a pull request that widens that list buys itself silence.
+  // It used to be silent in the literal sense: the result carried a count and no
+  // names, and this block ran only when `exact_head === false` — so the case
+  // worth seeing was the one case never shown.
+  if (wt?.generated_count > 0) {
+    L.push(
+      `_${wt.generated_count} file(s) were excluded from the identity check as generated output, under `
+      + `root(s) declared by the product: ${wt.generated_roots.map((r) => `\`${safe(r)}\``).join(', ')}. `
+      + 'A change to a file the commit contains is still divergent; a NEW file under one of these roots is not._',
+    );
     L.push('');
   }
 

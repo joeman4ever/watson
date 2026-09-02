@@ -206,6 +206,17 @@ export function productIdentity({ repoRoot, manifest = null, expectedSha = null,
     exact_head: result.matches && headMatches !== false,
     dirty_paths: result.divergent.slice(0, 20),
     dirty_count: result.divergent.length,
+    // WHAT WAS EXEMPTED, and how much. `generated_roots` is read from the
+    // PRODUCT's own `.watson/config.yaml`, so a pull request declaring
+    // `- server/src` can have its build write new source files that this check
+    // then reports as no divergence at all. That is a real hole (watson#7 C1)
+    // and it is not closed by recording it — but it WAS previously invisible:
+    // the result carried the integer `counts.generated` and not one root name,
+    // and the summary printed identity detail only on an inexact head. A reader
+    // could not see that anything had been exempted, let alone what. Recorded
+    // here so the hole is at least legible while its governance is decided.
+    generated_roots: result.generated_roots ?? [],
+    generated_count: result.counts?.generated ?? 0,
     contract_dirty: contractDirty,
     head_sha: manifest.sha,
     expected_sha: expectedSha,

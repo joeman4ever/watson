@@ -15,10 +15,11 @@ import url from 'node:url';
 import {
   loadContract, loadContractAt, selectByProfile, withDependencies,
   validateFeatureVars, validateEnvOwnership, validateContractVersion, validateStepOrder,
-  validateSeedValues, validateAssertionOperands, fixtureValues, fixtureValueEnv,
+  validateSeedValues, validateAssertionOperands, validateDenialAddresses, fixtureValues, fixtureValueEnv,
 } from './contract.mjs';
 import { productFingerprint, contractFingerprint, resolveSha, contractChange, productIdentity, changedPaths, engineProvenance } from './fingerprint.mjs';
-import { buildManifest, readManifest, MANIFEST_SCHEMA } from './manifest.mjs';
+import { readManifest } from './manifest.mjs';
+import { runManifest } from './manifest-cli.mjs';
 import { selectByImpact } from './selection.mjs';
 import * as env from './environment.mjs';
 import * as drive from './driver.mjs';
@@ -112,10 +113,31 @@ function buildAppEnv({ cfg, runId, databaseUrl, appPort, baseUrl, identity, inhe
  * the product's behaviour.
  */
 function reconcileFixtureValues(emitted, chosen) {
-  const ignored = Object.entries(chosen)
-    .filter(([k, v]) => k in (emitted ?? {}) && String(emitted[k]) !== v)
-    .map(([k, v]) => `\`${k}\`: fixture used \`${emitted[k]}\`, verifier supplied \`${v}\``);
-  return { vars: { ...emitted, ...chosen }, ignored };
+  const out = emitted ?? {};
+  const ignored = [];
+  for (const [k, v] of Object.entries(chosen)) {
+    if (!(k in out)) {
+      // OMISSION, not contradiction. This used to be invisible: the filter
+      // required the key to be present, so a fixture that simply never reported
+      // back on a value passed — and then the engine back-filled it from
+      // `chosen`, so `validateSeedValues` could not see it either.
+      //
+      // It matters most for the negative journeys, which is where it is hardest
+      // to notice. A fixture that never grants-then-revokes the verifier's
+      // `revokedGrade` still passes "the revoked grant is denied", because a
+      // grade that was never granted denies identically to one that was
+      // revoked. The assertion holds and the property it names was never built.
+      ignored.push(
+        `\`${k}\`: the verifier supplied \`${v}\`, and the fixture did not report building anything with it. `
+        + 'A world that does not contain the value the assertions are about is not the world that was asked for.',
+      );
+      continue;
+    }
+    if (String(out[k]) !== v) {
+      ignored.push(`\`${k}\`: fixture used \`${out[k]}\`, verifier supplied \`${v}\``);
+    }
+  }
+  return { vars: { ...out, ...chosen }, ignored };
 }
 
 /** Bring the product up exactly as Watson will drive it. Returns a handle whose
@@ -598,6 +620,10 @@ async function cmdVerify(args) {
       plan.map((p) => p.feature),
       contract.fixtures.profiles?.[contract.config.launch.fixture_profile],
     ),
+    ...validateDenialAddresses(
+      plan.map((p) => p.feature),
+      contract.fixtures.profiles?.[contract.config.launch.fixture_profile],
+    ),
     ...validateFeatureVars(
       plan.map((p) => p.feature),
       contract.fixtures.profiles?.[contract.config.launch.fixture_profile],
@@ -943,19 +969,12 @@ try {
     // in, before handing that tree to anything untrusted. A manifest built after
     // the product has touched the tree describes the product's work, not the
     // commit's.
-    const repoRoot = path.resolve(args.repo ?? '.');
-    const sha = resolveSha(repoRoot, args.sha ?? 'HEAD');
-    const m = buildManifest(repoRoot, { sha, repository: args.repository ?? path.basename(repoRoot) });
-    const out = args.out ? path.resolve(args.out) : null;
-    const json = `${JSON.stringify(m, null, 1)}\n`;
-    if (out) {
-      fs.mkdirSync(path.dirname(out), { recursive: true });
-      fs.writeFileSync(out, json);
-      log(`\n${MANIFEST_SCHEMA}  ${sha}`);
-      log(`  ${Object.keys(m.entries).length} entries -> ${out}\n`);
-    } else {
-      process.stdout.write(json);
-    }
+    //
+    // The implementation lives in `manifest-cli.mjs`, which imports node
+    // built-ins only, and CI invokes that file directly — the trusted runner has
+    // no `node_modules`, so it cannot load this file at all. Delegating keeps
+    // one implementation rather than two that drift.
+    runManifest(process.argv.slice(3));
     process.exit(0);
   } else if (cmd === 'plane') {
     // The product plane. Runs in the UNTRUSTED container, as an unprivileged

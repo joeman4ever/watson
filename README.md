@@ -194,7 +194,7 @@ plausible and all match a generic error page. The difference is not in the strin
 it is in who picked it.
 
 So the verifier picks it. It generates the values a journey asserts on from a run
-identity the product never sees, and passes them **into** the fixture:
+run identity, and passes them **into** the fixture:
 
 ```text
 verifier            → WATSON_FIXTURE_SEASONNAME=watson-seasonName-240b876c04012e82
@@ -297,9 +297,25 @@ product claim rather than falling back to asking git — the fallback *was* the
 vulnerability.
 
 It also catches what git was never asked about: a missing file, a symlink to
-identical bytes, the executable bit, a directory where a file belongs. Generated
-output under a declared root is **counted and reported**, never used to make an
-unexpected file invisible, and never able to shelter a change to a committed file.
+identical bytes, the executable bit, a directory where a file belongs.
+
+**Generated output is the open edge, and the honest version of that sentence is
+narrower than the one that used to be here.** A file under a declared
+`generated_roots` entry is dropped from the divergence check, and the roots are
+declared in the product's own `.watson/config.yaml`. So a pull request that adds
+`- server/src` to that list can have its build write new source files and still
+report an exact-head match. That is a real hole (C1 below), found by executing it:
+
+```
+CONTROL (no generated_roots):    exact_head=false  dirty=["server/src/backdoor.ts (unexpected)"]
+ATTACK  (product declares src):  exact_head=true   clean=true  dirty_count=0
+```
+
+What IS true, and what I tried hardest to break: **no declared root can shelter a
+change to a file the commit contains** — modified, missing, type-changed and
+mode-changed all stay divergent regardless. And the exemption is now recorded and
+printed on every run, naming the roots, rather than surfacing as a bare integer
+on the one code path that never ran for a clean tree.
 
 ### What that proves, and what it does not
 
@@ -322,6 +338,7 @@ between shadow mode and a required check is exactly this list.
 | --- | --- | --- | --- |
 | **C3** | The product's `DATABASE_URL` carries the same Postgres role as the admin URL, so it is not least-privilege. Bounded today by the deployment — a per-run Postgres destroyed with the run — which is a property of the orchestration, not of this code | documented | explicit final disposition |
 | **C4** | Identity binds committed *source* at two instants, not the running artefact | documented | closed, or an owner-accepted equivalent runtime binding |
+| **C1** | `generated_roots` — the identity check's exemption list — is authored by the product being measured. A pull request can widen it and hide new files from the divergence check. Recorded and printed, not closed | reported on every run | the list must come from a trusted source, or from the BASE branch's contract |
 
 Neither is called fixed. Phase-1 maturity counters do not retire them; they are
 separate requirements.

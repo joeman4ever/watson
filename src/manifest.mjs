@@ -53,7 +53,7 @@ function digestOf(bytes) {
  * Its presence below the root is reported separately rather than ignored,
  * because a gitlink is exactly the condition the previous gate skipped silently.
  */
-export function walkTree(root, { onNestedGit } = {}) {
+export function walkTree(root, { onNestedGit, onRootGit } = {}) {
   const entries = new Map();
   const stack = [''];
 
@@ -70,7 +70,16 @@ export function walkTree(root, { onNestedGit } = {}) {
     for (const d of dirents) {
       const childRel = rel === '' ? d.name : `${rel}/${d.name}`;
       if (d.name === GIT_DIR) {
+        // A nested `.git` is REPORTED; the tree root's own is skipped silently,
+        // because that one is the checkout's and is not product source — every
+        // run would otherwise be divergent. The asymmetry is deliberate and was
+        // undocumented: a review asked what happens when a `.git` is planted at
+        // the root AFTER the manifest is built. Nothing does, and nothing can —
+        // no engine call runs git against the product tree once product code has
+        // executed — but "not exploitable today" is a worse property than
+        // "recorded", so it is reported for the caller to note.
         if (rel !== '') onNestedGit?.(childRel);
+        else onRootGit?.();
         continue;
       }
       // `withFileTypes` reports the entry itself, so a symlink is a symlink even
@@ -137,7 +146,8 @@ export function verifyAgainstManifest(treeRoot, manifest, { generatedRoots = [] 
     throw new Error(`unrecognised manifest schema \`${manifest?.schema}\``);
   }
   const nested = [];
-  const actual = walkTree(treeRoot, { onNestedGit: (p) => nested.push(p) });
+  let rootGit = false;
+  const actual = walkTree(treeRoot, { onNestedGit: (p) => nested.push(p), onRootGit: () => { rootGit = true; } });
   const expected = new Map(Object.entries(manifest.entries ?? {}));
 
   const isGenerated = (p) => generatedRoots.some((r) => p === r || p.startsWith(`${r.replace(/\/$/, '')}/`));
@@ -164,7 +174,14 @@ export function verifyAgainstManifest(treeRoot, manifest, { generatedRoots = [] 
   // A repository the manifest did not record is a subtree whose content this
   // check cannot speak for. Refusing is the honest answer; the previous gate
   // skipped gitlinks silently and left a whole subtree unmeasured.
-  const nestedUnexpected = nested.filter((p) => !(manifest.nested_git ?? []).includes(p));
+  // A nested repository under a DECLARED generated root is an ordinary fact of
+  // dependency installation — a git-URL dependency, a postinstall clone — not a
+  // subtree the product hid. Treating it as divergence made every such run
+  // INDETERMINATE, which is fail-closed but permanently red, and a signal that is
+  // always red stops being read. Counted as generated, like anything else there.
+  const nestedUnexpected = nested
+    .filter((p) => !(manifest.nested_git ?? []).includes(p))
+    .filter((p) => !isGenerated(p.replace(/\/\.git$/, '')) && !isGenerated(p));
 
   const divergent = [
     ...missing.map((p) => `${p} (missing)`),
@@ -190,6 +207,11 @@ export function verifyAgainstManifest(treeRoot, manifest, { generatedRoots = [] 
       // Counted and reported, never folded into the verdict — and never used to
       // decide that an unexpected file is invisible.
       generated: generated.length,
+      // Whether the measured tree carries its own `.git`. Not divergence — the
+      // trusted checkout has one by construction — but a product plane is
+      // supposed to need no `.git` at all, so a reader comparing the two sides
+      // can see which one this was.
+      root_git: rootGit ? 1 : 0,
     },
     generated_roots: generatedRoots,
   };
