@@ -54,7 +54,7 @@ import { runStep, launchApp, interpolate, killGroup } from './exec.mjs';
 // Also built-ins only, so importing it does not give the untrusted side a
 // dependency surface. It is here so the plane can state which checkout it is
 // about to build — see the `/alive` handler.
-import { workingTreeState } from './fingerprint.mjs';
+import { git } from './fingerprint.mjs';
 
 export const PLANE_PROTOCOL = 'watson-product-plane/v1';
 
@@ -199,12 +199,20 @@ export function serve({ repoRoot, logDir, port, host = '0.0.0.0' }) {
         // checkouts is an ordinary orchestration mistake that would otherwise
         // produce a confident verdict about the wrong commit. A mismatch is
         // conclusive; agreement is only reassuring.
-        const tree = workingTreeState(repoRoot);
+        let head = null;
+        let clean = null;
+        try {
+          head = git(['rev-parse', 'HEAD'], { cwd: repoRoot }).trim();
+          clean = git(['status', '--porcelain'], { cwd: repoRoot }) === '';
+        } catch { /* no git here, or no checkout — reported as nulls */ }
         return send(200, {
           ok: true,
           protocol: PLANE_PROTOCOL,
           phase: state.phase,
-          tree: { head_sha: tree.head_sha, clean: tree.clean, dirty_count: tree.dirty_count },
+          // Self-reported, and treated as such. The verifier establishes identity
+          // from the trusted manifest; this exists only so a run wired to two
+          // different checkouts is noticed rather than confidently mis-reported.
+          tree: { head_sha: head, clean, dirty_count: null },
         });
       }
       if (req.method === 'GET' && req.url?.startsWith('/app-log')) {

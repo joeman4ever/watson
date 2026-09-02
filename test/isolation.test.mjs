@@ -21,8 +21,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 
-import { workingTreeState } from '../src/fingerprint.mjs';
-import { buildEnvelope, downgradeForInexactHead, writeResult } from '../src/result.mjs';
+import { git as safeGit } from '../src/fingerprint.mjs';
+import { buildEnvelope, writeResult } from '../src/result.mjs';
 import {
   scrubEnv, SCRUBBED_ENV_KEYS, productExecution, resetProductExecution, runStep,
 } from '../src/environment.mjs';
@@ -49,155 +49,18 @@ function gitRepo() {
   return { dir, git, head: () => git('rev-parse', 'HEAD') };
 }
 
-describe('exact-HEAD is an identity claim, not a cleanliness claim', () => {
-  test('a clean tree at the reported commit is exact', () => {
-    const r = gitRepo();
-    const st = workingTreeState(r.dir, r.head());
-    assert.equal(st.clean, true);
-    assert.equal(st.head_matches, true);
-    assert.equal(st.exact_head, true);
-  });
-
-  test('a tree committed at a DIFFERENT commit is not exact', () => {
-    // The forgery this closes: modify the product, commit the modification, and
-    // `git status` is clean again. Cleanliness alone would have called this
-    // exact-HEAD and let a product claim through for a commit that was never
-    // driven.
-    const r = gitRepo();
-    const reported = r.head();
-    fs.writeFileSync(path.join(r.dir, 'app.js'), 'console.log("tampered");\n');
-    r.git('commit', '-aqm', 'tampered by the code under verification');
-    assert.notEqual(r.head(), reported);
-
-    const st = workingTreeState(r.dir, reported);
-    assert.equal(st.head_matches, false);
-    assert.equal(st.exact_head, false);
-    assert.match(st.note, /not the reported/);
-    // And the content check catches it independently of HEAD, because it
-    // compares the disk against the REPORTED commit rather than against
-    // whatever HEAD happens to point at now.
-    assert.deepEqual(st.dirty_paths, ['app.js']);
-  });
-
-  test('the index cannot hide a modification from the gate', () => {
-    // `git update-index --assume-unchanged` tells git to stop comparing a path,
-    // permanently. No commit, no HEAD move, `git status` reads clean — and the
-    // file on disk is whatever the author wants. The index belongs to the
-    // product, so the gate must not depend on it.
-    const r = gitRepo();
-    const reported = r.head();
-    r.git('update-index', '--assume-unchanged', 'app.js');
-    fs.writeFileSync(path.join(r.dir, 'app.js'), 'console.log("tampered");\n');
-
-    assert.equal(r.git('status', '--porcelain'), '', 'git status really is blind here — that is the point');
-
-    const st = workingTreeState(r.dir, reported);
-    assert.equal(st.head_matches, true, 'HEAD genuinely did not move');
-    assert.equal(st.clean, false);
-    assert.equal(st.exact_head, false);
-    assert.deepEqual(st.dirty_paths, ['app.js']);
-    assert.equal(downgradeForInexactHead('PASS', st).verdict, 'INDETERMINATE');
-  });
-
-  test('`git replace` cannot rewrite the tree the gate reads', () => {
-    // refs/replace/ lives inside the .git the product owns, and git resolves
-    // objects through it by default. Three lines, no commit, no HEAD move —
-    // and `ls-tree` returns a tree the author wrote while `rev-parse HEAD`
-    // still reports the reviewed commit.
-    const r = gitRepo();
-    const reported = r.head();
-    fs.writeFileSync(path.join(r.dir, 'app.js'), 'console.log("tampered");\n');
-    r.git('add', '-A');
-    const forged = r.git('commit-tree', r.git('write-tree'), '-m', 'forged');
-    r.git('replace', '-f', reported, forged);
-
-    const st = workingTreeState(r.dir, reported);
-    assert.equal(st.head_matches, true, 'HEAD genuinely still reports the reviewed commit');
-    assert.equal(st.exact_head, false);
-    assert.deepEqual(st.dirty_paths, ['app.js']);
-  });
-
-  test('a staged-but-uncommitted file is divergent', () => {
-    // `ls-files --others` means "not in the index", so `git add` used to remove
-    // a new file from the untracked listing while it was never in the commit
-    // tree either — invisible to both halves of the union at once. The check
-    // this replaced caught it, so this was a regression, not a residual.
-    const r = gitRepo();
-    const reported = r.head();
-    fs.writeFileSync(path.join(r.dir, 'evil.js'), 'backdoor\n');
-    assert.deepEqual(workingTreeState(r.dir, reported).dirty_paths, ['evil.js'], 'unstaged control');
-    r.git('add', '-A');
-
-    const st = workingTreeState(r.dir, reported);
-    assert.equal(st.exact_head, false);
-    assert.deepEqual(st.dirty_paths, ['evil.js']);
-  });
-
-  test('a corrupt index makes the tree INEXACT, not clean', () => {
-    // Found by attacking the fixes for the previous round. The two listing
-    // helpers returned [] on failure, which is the opposite claim from the one
-    // they had evidence for: "there are no extra files" versus "I could not
-    // tell". One line — write garbage over .git/index — made both fail while the
-    // content hash carried on, and a staged backdoor read as a clean tree at
-    // exact_head: true.
-    const r = gitRepo();
-    const reported = r.head();
-    fs.writeFileSync(path.join(r.dir, 'evil.js'), 'backdoor\n');
-    r.git('add', '-A');
-    fs.writeFileSync(path.join(r.dir, '.git', 'index'), 'GARBAGE-NOT-AN-INDEX');
-
-    const st = workingTreeState(r.dir, reported);
-    assert.equal(st.clean, null, 'unknown, not clean');
-    assert.equal(st.exact_head, false);
-    assert.equal(st.method, 'failed');
-    assert.equal(downgradeForInexactHead('PASS', st).verdict, 'INDETERMINATE');
-  });
-
-  test('a tracked file replaced by a symlink is divergent', () => {
-    // Hashing the link TARGET rather than the link itself would let a symlink
-    // into a file with identical bytes read as unmodified.
-    const r = gitRepo();
-    const reported = r.head();
-    const app = path.join(r.dir, 'app.js');
-    const decoy = path.join(r.dir, 'decoy');
-    fs.writeFileSync(decoy, 'console.log(1);\n');
-    fs.unlinkSync(app);
-    fs.symlinkSync('decoy', app);
-
-    const st = workingTreeState(r.dir, reported);
-    assert.equal(st.exact_head, false);
-    assert.ok(st.dirty_paths.includes('app.js'));
-  });
-
-  test('with no expectation named, content is still compared — against HEAD', () => {
-    // The reviewer read this as "unknown is not a failure", contradicting
-    // result.mjs's "not being able to check is not evidence of cleanliness". It
-    // no longer means that. Naming no expectation leaves `head_matches` unknown,
-    // but the CONTENT check still runs, against whatever HEAD points at — so a
-    // caller who omits the SHA still cannot get a clean answer from a tampered
-    // tree. `verify` always names one anyway.
-    const r = gitRepo();
-    const st = workingTreeState(r.dir);
-    assert.equal(st.head_matches, null);
-    assert.equal(st.exact_head, true);
-
-    fs.writeFileSync(path.join(r.dir, 'app.js'), 'tampered\n');
-    r.git('update-index', '--assume-unchanged', 'app.js');
-    const after = workingTreeState(r.dir);
-    assert.equal(after.head_matches, null, 'still no expectation named');
-    assert.equal(after.exact_head, false, 'but the content check caught it regardless');
-  });
-
-  test('a product claim on a mismatched HEAD is withheld', () => {
-    for (const verdict of ['PASS', 'PASS_WITH_ADVISORIES', 'FAIL_PRODUCT']) {
-      const g = downgradeForInexactHead(verdict, {
-        clean: true, exact_head: false, head_matches: false, head_sha: 'a'.repeat(40),
-      });
-      assert.equal(g.verdict, 'INDETERMINATE', `${verdict} must not survive a HEAD mismatch`);
-      assert.match(g.reason, /is at a{40}, not the reported commit/);
-    }
-  });
-});
+// The exact-HEAD suite that used to live here is gone, deliberately.
+//
+// It tested a gate that no longer exists: `--assume-unchanged`, `git replace`,
+// `git add`, a corrupt index, symlink substitution, HEAD identity. Every one of
+// those attacks is still executed, against the architecture that replaced it, in
+// `test/manifest.test.mjs`. Keeping both would leave a suite asserting properties
+// of deleted code, and would make the engine look like it carried a manifest plus
+// six generations of git defences.
+//
+// What stayed below is still load-bearing: git continues to run against the
+// product's directory for selection and the fingerprints, so a hostile repository
+// must not be able to execute code through it.
 
 describe('a hostile repository cannot execute code through the verifier\'s git', () => {
   test('core.fsmonitor in the product\'s own .git/config does not run', () => {
@@ -213,7 +76,7 @@ describe('a hostile repository cannot execute code through the verifier\'s git',
     fs.chmodSync(payload, 0o755);
     r.git('config', 'core.fsmonitor', payload);
 
-    workingTreeState(r.dir, r.head());
+    safeGit(['status', '--porcelain'], { cwd: r.dir });
     assert.equal(fs.existsSync(marker), false, 'the product executed a command as the verifier');
   });
 
@@ -231,15 +94,12 @@ describe('a hostile repository cannot execute code through the verifier\'s git',
     fs.writeFileSync(path.join(r.dir, '.gitattributes'), 'app.js filter=launder\n');
     r.git('add', '-A');
     r.git('commit', '-qm', 'attributes');
-    const reported = r.head();
     r.git('config', 'filter.launder.clean', filter);
     r.git('config', 'filter.launder.smudge', filter);
     fs.writeFileSync(path.join(r.dir, 'app.js'), 'console.log("tampered");\n');
 
-    const st = workingTreeState(r.dir, reported);
+    safeGit(['status', '--porcelain'], { cwd: r.dir });
     assert.equal(fs.existsSync(marker), false, 'a product-named filter ran as the verifier');
-    assert.equal(st.exact_head, false, 'a content filter laundered a modification past the gate');
-    assert.ok(st.dirty_paths.includes('app.js'));
   });
 
   test('core.hooksPath in the product\'s own .git/config does not run', () => {
@@ -252,7 +112,7 @@ describe('a hostile repository cannot execute code through the verifier\'s git',
     fs.chmodSync(hook, 0o755);
     r.git('config', 'core.hooksPath', hooks);
 
-    workingTreeState(r.dir, r.head());
+    safeGit(['status', '--porcelain'], { cwd: r.dir });
     assert.equal(fs.existsSync(marker), false, 'a product-supplied hook ran as the verifier');
   });
 });

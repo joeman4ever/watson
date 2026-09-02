@@ -11,8 +11,7 @@
 
 import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
-import fs from 'node:fs';
-import path from 'node:path';
+import { verifyAgainstManifest } from './manifest.mjs';
 
 // ---------------------------------------------------------------- safe git --
 //
@@ -34,11 +33,21 @@ import path from 'node:path';
 // repository config and over anything it `include`s. The environment settings
 // remove the system and global files from the picture entirely.
 //
-// This is defence in depth, not the whole defence: a deny-list of
-// command-valued keys cannot be complete (content filters, for one, are named
-// by the product's own `.gitattributes`). The identity check therefore does not
-// rely on it — see `workingTreeState`, which stopped using git's working-tree
-// machinery altogether.
+// WHY THIS SURVIVED THE MANIFEST. Product identity no longer runs git at all, so
+// the wrapper is not what defends it. But git is still used for things the
+// manifest does not answer — resolving a ref, the merge-base diff that drives
+// selection, the tree hashes behind the fingerprints, and reading the contract
+// at the base commit — and several of those still run with the product's
+// directory as `cwd`. Those are the calls this protects, and that is the whole
+// of its remaining job.
+//
+// It is defence in depth even there: a deny-list of command-valued keys cannot
+// be complete, because content filters are named by the product's own
+// `.gitattributes`. What makes that acceptable is that no surviving call reads
+// the working tree in a filter-applying way — `rev-parse`, `ls-tree`,
+// `merge-base`, `diff --name-only` and `archive` are all object-store
+// operations. If a future call reads the working tree, this comment stops being
+// true and the call needs a different answer, not another key in the list.
 
 const SAFE_CONFIG = [
   'core.fsmonitor=',            // a command git runs during `git status`
@@ -129,233 +138,77 @@ export function contractFingerprint(repoRoot, sha) {
 }
 
 /**
- * Whether the checkout matches the commit it claims to be.
+ * Product identity, from the trusted manifest.
  *
- * This matters more than it looks. Every result carries a 40-char SHA and two
- * fingerprints computed FROM GIT — but the contract that executes, and the product
- * that gets built and launched, both come from the WORKING TREE. When the tree is
- * dirty those are different things, and the run reports a SHA it did not actually
- * verify.
+ * WHAT REPLACED WHAT, and why the replacement is not another patch.
  *
- * That is not hypothetical: during the Phase-1 campaign a feature file written while
- * a campaign was running was picked up mid-campaign, so runs 1-3 verified two
- * journeys and runs 4-10 verified three, all reporting the same SHA.
+ * This used to hash the working tree against the commit's object tree, and
+ * before that it read `git status`. Three adversarial reviews found four ways
+ * past those, and every one had the same shape: the check asked a directory the
+ * product writes — whose `.git` the product owns — to describe itself.
+ * `--assume-unchanged`, `git replace`, `git add`, a corrupt index, a self-hiding
+ * `.gitignore`. Patching each answer never changed who was answering.
  *
- * Watson does not refuse a dirty tree — developing against one is the normal way to
- * work — but it must never claim exact-HEAD when it cannot honour it.
+ * The expectation now comes from `src/manifest.mjs`, written by the trusted
+ * orchestration from the trusted commit before any product code runs. Nothing
+ * here consults the product's `.git` at all.
  *
- * CLEANLINESS IS NOT IDENTITY. `git status` proves only that the tree matches
- * whatever HEAD currently points at — it says nothing about WHICH commit that is.
- * A tree that is modified and then committed is perfectly clean at a commit nobody
- * reviewed, and the gate as originally written would have called that exact-HEAD
- * and let a PASS through for the reported SHA.
+ * NO MANIFEST, NO PRODUCT CLAIM. A run that was not given one cannot establish
+ * identity, and says so rather than falling back to asking git — the fallback
+ * WAS the vulnerability. It costs a command locally (`watson manifest`) and buys
+ * the property that there is exactly one authority for product source identity.
  *
- * That is not a theoretical gap. Watson runs the product's own install, build and
- * launch commands from this checkout, so under a threat model where product code
- * may be hostile, `git commit -a` is a one-line forgery of the exact-HEAD property
- * — the single property every product claim rests on. So identity is checked
- * positively, against the SHA the caller says this run is about, and a mismatch is
- * inexact for the same reason dirt is: the run cannot speak for that commit.
+ * The shape of the return value is unchanged so that consumers reading
+ * `working_tree.exact_head` keep working; `method` says which authority spoke.
  */
-export function workingTreeState(repoRoot, expectedSha = null) {
-  let head = null;
-  try {
-    head = git(['rev-parse', 'HEAD'], { cwd: repoRoot }).trim();
-  } catch {
+export function productIdentity({ repoRoot, manifest = null, expectedSha = null, generatedRoots = [] }) {
+  if (!manifest) {
     return {
       clean: null, exact_head: false, dirty_paths: [], dirty_count: 0, contract_dirty: false,
-      head_sha: null, expected_sha: expectedSha, head_matches: null, method: 'unavailable',
-      note: 'git could not be run here; exact-HEAD cannot be established',
+      head_sha: null, expected_sha: expectedSha, head_matches: null, method: 'no-manifest',
+      note: 'no trusted manifest was supplied, so product identity cannot be established. '
+        + 'Build one with `watson manifest` from a checkout the product has not run in.',
     };
   }
 
-  // `null` when the caller named no expectation: unknown, and unknown is not a
-  // failure. `false` is a positive contradiction and is fatal to any product claim.
-  const headMatches = expectedSha ? head === expectedSha : null;
-  const against = expectedSha ?? head;
+  const headMatches = expectedSha ? manifest.sha === expectedSha : null;
+  if (headMatches === false) {
+    return {
+      clean: null, exact_head: false, dirty_paths: [], dirty_count: 0, contract_dirty: false,
+      head_sha: manifest.sha, expected_sha: expectedSha, head_matches: false, method: 'manifest',
+      note: `the manifest describes ${manifest.sha}, but this run is about ${expectedSha}`,
+    };
+  }
 
-  // Every source below THROWS on failure rather than reporting nothing found, and
-  // this catch turns any of them into an inexact tree. "I could not establish
-  // this" must never be recorded as "there was nothing to find".
-  let diverged;
-  let untracked;
-  let staged;
+  let result;
   try {
-    diverged = divergedPaths(repoRoot, against);
-    untracked = untrackedPaths(repoRoot);
-    staged = stagedButUncommitted(repoRoot, against);
+    result = verifyAgainstManifest(repoRoot, manifest, { generatedRoots });
   } catch (err) {
     return {
       clean: null, exact_head: false, dirty_paths: [], dirty_count: 0, contract_dirty: false,
-      head_sha: head, expected_sha: expectedSha, head_matches: headMatches, method: 'failed',
-      note: `the working tree could not be compared against ${against}: ${err.message.slice(0, 200)}`,
+      head_sha: manifest.sha, expected_sha: expectedSha, head_matches: headMatches, method: 'failed',
+      note: `the product tree could not be compared against the manifest: ${err.message.slice(0, 200)}`,
     };
   }
 
-  // Content hashing covers paths that are IN THE COMMIT. Two other kinds of file
-  // change how the product behaves without appearing there, and each needs its
-  // own source:
-  //
-  //   untracked — never added. `ls-files --others`.
-  //   STAGED    — added but not committed. `ls-files --cached`, compared against
-  //               the commit tree.
-  //
-  // The second was a hole, and a regression against the `git status` check this
-  // replaced. "Others" means "not in the index", so `git add server/evil.js`
-  // removed the file from the untracked listing while it was never in the commit
-  // tree either — invisible to both halves at once, from one word.
-  //
-  // The union is not defence in depth against an attacker: every source here
-  // reads the same product-owned `.git`. It is coverage. What resists tampering
-  // is the content hash, which asks git for the commit's tree and nothing else.
-  const all = [...new Set([...diverged, ...untracked, ...staged])].sort();
-
-  const contractDirty = all.some((p) => p.startsWith('.watson/'));
-  const clean = all.length === 0;
+  const contractDirty = result.divergent.some((p) => p.startsWith('.watson/'));
   return {
-    clean,
-    exact_head: clean && headMatches !== false,
-    dirty_paths: all.slice(0, 20),
-    dirty_count: all.length,
-    tracked_diverged: diverged.length,
-    untracked: untracked.length,
+    clean: result.matches,
+    exact_head: result.matches && headMatches !== false,
+    dirty_paths: result.divergent.slice(0, 20),
+    dirty_count: result.divergent.length,
     contract_dirty: contractDirty,
-    head_sha: head,
+    head_sha: manifest.sha,
     expected_sha: expectedSha,
     head_matches: headMatches,
-    method: 'content-hash',
-    note: headMatches === false
-      ? `the checkout is at ${head}, not the reported ${expectedSha} — this run verified a different commit`
-      : clean
-        ? 'checkout matches the reported SHA'
-        : contractDirty
-          ? 'the CONTRACT differs from the reported SHA — this run verified something else'
-          : 'the product tree differs from the reported SHA',
+    method: 'manifest',
+    counts: result.counts,
+    note: result.matches
+      ? 'the product tree matches the trusted manifest for the reported commit'
+      : contractDirty
+        ? 'the CONTRACT differs from the trusted manifest — this run verified something else'
+        : 'the product tree differs from the trusted manifest for the reported commit',
   };
-}
-
-/**
- * Which tracked paths differ, in CONTENT, between the commit and what is on disk.
- *
- * This deliberately does not use `git status`, `git diff` or the index, and that
- * is the whole point of it.
- *
- * The index belongs to the product. `git update-index --assume-unchanged <path>`
- * tells git to stop comparing that path, permanently, and `--skip-worktree` does
- * the same. Neither moves HEAD, neither leaves the tree dirty, and both are one
- * line in an install script:
- *
- *     git update-index --assume-unchanged server/index.js
- *     echo 'whatever the author wants to run' > server/index.js
- *
- * Against a `git status` check that reads clean, `head_matches` reads true, and
- * a PASS is issued for a commit that was never run. Demonstrated on this engine
- * before it was fixed.
- *
- * So identity is established from the commit's own object tree — read with
- * plumbing that consults no index, and with replace refs disabled — and from the
- * bytes on disk, hashed here. No content filter, fsmonitor, assume-unchanged bit
- * or replacement object takes part in THIS comparison.
- *
- * Stated precisely, because the previous version of this comment overreached:
- * the index does take part elsewhere, in the staged-path listing beside this,
- * and the product's ignore rules decide what counts as untracked. Neither can
- * make a path that IS in the commit look unmodified — that is what this function
- * guarantees, and it is the whole of what it guarantees.
- */
-export function divergedPaths(repoRoot, sha) {
-  // `-z` because paths may contain anything; `-r` to recurse into subtrees.
-  const raw = git(['ls-tree', '-r', '-z', sha], { cwd: repoRoot });
-  const diverged = [];
-
-  for (const entry of raw.split('\0')) {
-    if (!entry) continue;
-    // "<mode> <type> <object>\t<path>"
-    const tab = entry.indexOf('\t');
-    if (tab < 0) continue;
-    const [mode, type, object] = entry.slice(0, tab).split(/\s+/);
-    const rel = entry.slice(tab + 1);
-    // A gitlink (`160000 commit`) is not a blob, so there is nothing to hash —
-    // but the directory it names has working-tree content all the same, and
-    // skipping it left an entire subtree unmeasured. A pull request that moves
-    // runtime code into a submodule would verify as exact-HEAD whatever is on
-    // disk there.
-    //
-    // Refusing is the honest answer while nothing here uses submodules: Watson
-    // says it cannot establish identity rather than quietly establishing it for
-    // part of the tree. Measuring them properly means recursing into each
-    // submodule's own object store, which is a real change and belongs with a
-    // product that actually has one.
-    if (type === 'commit') { diverged.push(`${rel} (submodule — content not measurable)`); continue; }
-    if (type !== 'blob') continue;
-
-    const abs = path.join(repoRoot, rel);
-    let actual;
-    try {
-      // A symlink's content, to git, is its target — never what it points at.
-      // Following it would let a link into /etc read as an unmodified file.
-      const st = fs.lstatSync(abs);
-      const bytes = st.isSymbolicLink()
-        ? Buffer.from(fs.readlinkSync(abs))
-        : fs.readFileSync(abs);
-      actual = blobHash(bytes);
-      // A tracked regular file replaced by a symlink, or vice versa, is a change
-      // even when the bytes coincide.
-      const isLink = st.isSymbolicLink();
-      if (isLink !== (mode === '120000')) { diverged.push(rel); continue; }
-    } catch {
-      diverged.push(rel);   // missing or unreadable: divergent either way
-      continue;
-    }
-    if (actual !== object) diverged.push(rel);
-  }
-  return diverged;
-}
-
-/**
- * Untracked, non-ignored paths.
- *
- * THROWS rather than returning an empty list. The two are opposite claims —
- * "there are no extra files" and "I could not tell" — and returning `[]` for the
- * second was a fail-open with a one-line trigger: corrupt `.git/index`, and both
- * this and the staged listing failed while the content hash carried on, so a
- * staged backdoor read as a clean tree at exact_head: true. Found by attacking
- * the fixes for the previous round of attacks.
- *
- * The ignore rules still come from the product's own `.gitignore`, so a file the
- * product chooses to ignore is invisible here. That is a stated limit of what
- * this establishes, not a silent one.
- */
-function untrackedPaths(repoRoot) {
-  return git(['ls-files', '--others', '--exclude-standard', '-z'], { cwd: repoRoot })
-    .split('\0').filter(Boolean);
-}
-
-/**
- * Paths the index carries that the commit does not — `git add`ed and not
- * committed.
- *
- * Its own ignore rules do not apply: `git add` is an explicit act, so a path
- * here was deliberately staged and is deliberately not in the reviewed commit.
- *
- * THROWS rather than returning an empty list, for the reason given above.
- */
-function stagedButUncommitted(repoRoot, sha) {
-  const cached = git(['ls-files', '--cached', '-z'], { cwd: repoRoot })
-    .split('\0').filter(Boolean);
-  const inCommit = new Set(
-    git(['ls-tree', '-r', '-z', '--name-only', sha], { cwd: repoRoot })
-      .split('\0').filter(Boolean),
-  );
-  return cached.filter((p) => !inCommit.has(p));
-}
-
-/** git's object id for a blob: sha1("blob <len>\0" + content). */
-function blobHash(bytes) {
-  return crypto.createHash('sha1')
-    .update(`blob ${bytes.length}\0`)
-    .update(bytes)
-    .digest('hex');
 }
 
 /** Full 40-char lowercase hex, as the marker protocol requires. */

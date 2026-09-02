@@ -163,13 +163,28 @@ describe('the plane costs the untrusted side nothing to start', () => {
     });
   }
 
-  for (const file of ['../src/exec.mjs', '../src/fingerprint.mjs']) {
-    test(`${file}, which the plane pulls in, is itself built-ins only`, () => {
-      const src = fs.readFileSync(new URL(file, import.meta.url), 'utf8');
-      const specifiers = [...src.matchAll(IMPORT_RE)].map((m) => m[1]);
-      assert.deepEqual(specifiers.filter((sp) => !sp.startsWith('node:')), []);
-    });
-  }
+  test('the whole import graph reachable from the plane is dependency-free', () => {
+    // Walked transitively rather than checked file by file. `fingerprint.mjs`
+    // now imports `manifest.mjs`, which is fine — what must not appear anywhere
+    // in the closure is a third-party package, because the untrusted side starts
+    // this from a read-only mount with nothing installed.
+    const seen = new Set();
+    const foreign = [];
+    const visit = (url) => {
+      if (seen.has(url.href)) return;
+      seen.add(url.href);
+      const src = fs.readFileSync(url, 'utf8');
+      for (const m of src.matchAll(IMPORT_RE)) {
+        const sp = m[1];
+        if (sp.startsWith('node:')) continue;
+        if (sp.startsWith('./') || sp.startsWith('../')) { visit(new URL(sp, url)); continue; }
+        foreign.push(`${url.pathname.split('/').pop()} -> ${sp}`);
+      }
+    };
+    visit(new URL('../src/plane.mjs', import.meta.url));
+    assert.ok(seen.size >= 3, `expected to walk several modules, saw ${seen.size}`);
+    assert.deepEqual(foreign, [], `third-party imports reached the untrusted plane: ${foreign.join(', ')}`);
+  });
 
   test('the plane states which checkout it is about to build', async () => {
     await withPlane(async ({ call }) => {

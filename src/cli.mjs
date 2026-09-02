@@ -17,7 +17,8 @@ import {
   validateFeatureVars, validateEnvOwnership, validateContractVersion, validateStepOrder,
   validateSeedValues, validateAssertionOperands, fixtureValues, fixtureValueEnv,
 } from './contract.mjs';
-import { productFingerprint, contractFingerprint, resolveSha, contractChange, workingTreeState, changedPaths, engineProvenance } from './fingerprint.mjs';
+import { productFingerprint, contractFingerprint, resolveSha, contractChange, productIdentity, changedPaths, engineProvenance } from './fingerprint.mjs';
+import { buildManifest, readManifest, MANIFEST_SCHEMA } from './manifest.mjs';
 import { selectByImpact } from './selection.mjs';
 import * as env from './environment.mjs';
 import * as drive from './driver.mjs';
@@ -462,6 +463,10 @@ async function cmdVerify(args) {
   // agreed path is read by a harness as this run's verdict, so removing it has to
   // happen earlier than every exit — including the ones a few lines down, which
   // is where it used to sit and therefore did not run.
+  // The trusted orchestration's account of what it materialised, written before
+  // any product code ran. Without it there is no authority for product identity
+  // and no product claim can be made — see `productIdentity`.
+  const manifest = typeof args.manifest === 'string' ? readManifest(path.resolve(args.manifest)) : null;
   const outPath = typeof args.out === 'string' ? path.resolve(args.out) : null;
   if (outPath) {
     try { fs.rmSync(outPath, { force: true, recursive: true }); } catch { /* nothing there */ }
@@ -556,9 +561,15 @@ async function cmdVerify(args) {
       sha === headSha ? contract : loadContractAt(repoRoot, sha)),
     // Recorded on EVERY result, pass or fail. A run that reports a SHA it did not
     // actually verify is worse than one that reports nothing.
-    workingTree: workingTreeState(repoRoot, headSha),
+    workingTree: productIdentity({
+      repoRoot, manifest, expectedSha: headSha,
+      generatedRoots: contract.config.generated_roots ?? [],
+    }),
+    manifest: manifest ? { schema: manifest.schema, sha: manifest.sha, built_at: manifest.built_at,
+      entries: Object.keys(manifest.entries ?? {}).length } : null,
     repoRoot,
     profile, selection, startedAt, shadow: true, outPath,
+    manifestObject: manifest, generatedRoots: contract.config.generated_roots ?? [],
     execution: {
       ...env.executionProvenance(policy),
       // Which boundary this run actually had between the verifier and the code
@@ -847,7 +858,10 @@ function finish(runDir, run) {
   // and ended dirty drove some mixture of the two, and cannot honestly speak for
   // either.
   if (run.repoRoot && run.verdict) {
-    const at_end = workingTreeState(run.repoRoot, run.headSha ?? null);
+    const at_end = productIdentity({
+      repoRoot: run.repoRoot, manifest: run.manifestObject ?? null,
+      expectedSha: run.headSha ?? null, generatedRoots: run.generatedRoots ?? [],
+    });
     const at_start = run.workingTree ?? at_end;
     const changed_mid_run =
       at_start.exact_head !== at_end.exact_head
@@ -924,6 +938,25 @@ try {
     process.exit(envlp.check?.obligation === 'satisfied' ? 0 : 1);
   } else if (cmd === 'doctor') {
     process.exit(await cmdDoctor(args));
+  } else if (cmd === 'manifest') {
+    // RUN THIS ON THE TRUSTED SIDE, against a checkout the product has not run
+    // in, before handing that tree to anything untrusted. A manifest built after
+    // the product has touched the tree describes the product's work, not the
+    // commit's.
+    const repoRoot = path.resolve(args.repo ?? '.');
+    const sha = resolveSha(repoRoot, args.sha ?? 'HEAD');
+    const m = buildManifest(repoRoot, { sha, repository: args.repository ?? path.basename(repoRoot) });
+    const out = args.out ? path.resolve(args.out) : null;
+    const json = `${JSON.stringify(m, null, 1)}\n`;
+    if (out) {
+      fs.mkdirSync(path.dirname(out), { recursive: true });
+      fs.writeFileSync(out, json);
+      log(`\n${MANIFEST_SCHEMA}  ${sha}`);
+      log(`  ${Object.keys(m.entries).length} entries -> ${out}\n`);
+    } else {
+      process.stdout.write(json);
+    }
+    process.exit(0);
   } else if (cmd === 'plane') {
     // The product plane. Runs in the UNTRUSTED container, as an unprivileged
     // user, and executes only what the verifier hands it. It never sees the
@@ -948,7 +981,7 @@ try {
     for (const k of kept) log(`  kept ${k.datname} — ${k.why}`);
     process.exit(0);
   } else {
-    log(`watson ${VERSION}\n\n  watson verify --repo <path> [--sha <ref>] [--base <ref>] [--profile poc] [--pr N] [--out <file>]\n               [--plane <url> --product-base-url <url>]\n  watson doctor --repo <path>\n  watson plane --repo <path> [--port 8079]\n  watson reap\n`);
+    log(`watson ${VERSION}\n\n  watson verify --repo <path> [--sha <ref>] [--base <ref>] [--profile poc] [--pr N] [--out <file>]\n               [--plane <url> --product-base-url <url>]\n               [--manifest <file>]\n  watson manifest --repo <path> [--sha <ref>] [--out <file>]   (TRUSTED side, before product code runs)\n  watson doctor --repo <path>\n  watson plane --repo <path> [--port 8079]\n  watson reap\n`);
     process.exit(cmd ? 1 : 0);
   }
 } catch (err) {
