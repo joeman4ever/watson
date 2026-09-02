@@ -341,34 +341,6 @@ describe('product-controlled text cannot forge the summary marker', () => {
 });
 
 
-describe('an assertion operand the product chose must at least be specific', () => {
-  test('short and single-character values are refused', async () => {
-    // The first version of this check rejected only the empty string, which is
-    // the one value an attacker would never have to use: `expect_text` and
-    // `expect_url_contains` are SUBSTRING tests, so "a" and "/" are exactly as
-    // vacuous. A heuristic, and named as one — the structural fix is for the
-    // verifier to choose these values rather than accept them.
-    const { degenerateOperand, validateSeedValues } = await import('../src/contract.mjs');
-    for (const v of ['', ' ', 'a', '/', 0, 'aaaa', {}, null]) {
-      assert.ok(degenerateOperand(v), `${JSON.stringify(v)} should be refused as an operand`);
-    }
-    for (const v of ['2026', 'season-2026', 'a1b2c3d4-...']) {
-      assert.equal(degenerateOperand(v), null, `${JSON.stringify(v)} is a real identifier`);
-    }
-    assert.deepEqual(validateSeedValues({ seasonName: 'Fall 2026' }, { emits: ['seasonName'] }), []);
-    assert.equal(validateSeedValues({ seasonName: 'a' }, { emits: ['seasonName'] }).length, 1);
-    assert.equal(validateSeedValues({}, { emits: ['seasonName'] }).length, 1);
-  });
-
-  test('the driver and the source check apply the SAME predicate', async () => {
-    // Two rules for one namespace is how a value rejected at the source arrives
-    // through the other door — which is what happened when interp accepted " "
-    // and validateSeedValues rejected it.
-    const { interp } = await import('../src/driver.mjs');
-    const { validateSeedValues } = await import('../src/contract.mjs');
-    for (const v of [' ', 'a', '/']) {
-      assert.equal(validateSeedValues({ x: v }, { emits: ['x'] }).length, 1);
-      assert.throws(() => interp('${x}', { x: v }), /Expect|character|empty|substring/i);
-    }
-  });
-});
+// The suite that lived here — "an assertion operand the product chose must at
+// least be specific" — is gone with the heuristic it tested. Who chooses the
+// operand is now the property, and `test/operands.test.mjs` tests that instead.

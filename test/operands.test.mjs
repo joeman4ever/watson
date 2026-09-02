@@ -148,3 +148,25 @@ describe('a verifier-chosen value still has to fit the column it lands in', () =
     assert.throws(() => fixtureValues('r', [{ x: 'timestamptz' }]), /does not generate/);
   });
 });
+
+describe('the usability check does not reject values a product legitimately emits', () => {
+  test('short domain values pass', async () => {
+    // A regression I introduced and then removed: while the check was still
+    // pretending to be a defence it carried a four-character floor, which
+    // rejects a school grade of "5" and a displayed threshold of 10. A usability
+    // check that fails valid contracts is not a usability check.
+    const { degenerateOperand } = await import('../src/contract.mjs');
+    for (const v of ['5', '7', 10, 0, 'U8']) {
+      assert.equal(degenerateOperand(v), null, `${JSON.stringify(v)} is a legitimate fixture value`);
+    }
+  });
+
+  test('it still catches what it is actually for', async () => {
+    // Its remaining job is small and real: an empty or non-scalar value produces
+    // a confusing failure three steps later.
+    const { degenerateOperand } = await import('../src/contract.mjs');
+    for (const v of ['', '   ', null, undefined, {}, []]) {
+      assert.ok(degenerateOperand(v), `${JSON.stringify(v)} should be reported at the source`);
+    }
+  });
+});

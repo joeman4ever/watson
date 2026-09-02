@@ -259,25 +259,23 @@ export function validateSeedValues(vars, fixtureProfile) {
  * source is kinder than debugging it.
  */
 export function degenerateOperand(value) {
-  if (value === null || value === undefined) return 'is null; an unresolved operand is not an expectation';
-  if (typeof value === 'object') return 'is not a scalar; an assertion operand must be a string or number';
-  const v = String(value).trim();
-  if (v === '') return 'came back empty; an empty expectation is satisfied by anything';
-  if (v.length < MIN_OPERAND_LENGTH) {
-    return `is ${v.length} character(s) long. Assertions on it are substring tests, so a short `
-      + `value is satisfied by almost any page — it proves nothing about the product.`;
-  }
-  if (new Set(v).size < 2) return 'repeats a single character; as a substring test that proves nothing';
-  if (!/[a-z0-9]/i.test(v)) return 'contains no alphanumeric character; as a substring test that proves nothing';
+  if (value === null || value === undefined) return 'is null, so nothing can be interpolated from it';
+  if (typeof value === 'object') return 'is not a scalar; a fixture variable must be a string or number';
+  if (String(value).trim() === '') return 'came back empty, which interpolates to nothing';
   return null;
 }
 
-/**
- * Chosen against what a fixture legitimately emits: database ids, slugs, season
- * names, session names. Four characters admits `2026`, which is a real season
- * name, and excludes `a` and `/`, which are not identifiers at all.
- */
-export const MIN_OPERAND_LENGTH = 4;
+// A length floor lived here briefly and has been removed, which is worth
+// recording because removing a check usually deserves more suspicion than adding
+// one.
+//
+// It was introduced as a defence — reject operands too short to prove anything —
+// and it never worked, because `http` and `Sign` are long enough and still
+// vacuous. `validateAssertionOperands` closes that properly. What the floor DID
+// do, once it was no longer defending anything, was reject values a product
+// legitimately emits: nsc-eval's grades are `'5'` and `'7'`, and a threshold it
+// displays is `10`. A usability check that fails valid contracts is not a
+// usability check.
 
 /**
  * The variables a feature uses AS PROOF, as opposed to as input.
