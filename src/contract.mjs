@@ -355,8 +355,44 @@ export function validateAssertionOperands(features, fixtureProfile, engineSuppli
  * do not appear on an error page by accident.
  */
 export function fixtureValues(runId, declared = []) {
+  const chosen = normaliseChosen(declared);
   const out = {};
-  for (const [name, shape, domain] of normaliseChosen(declared)) {
+
+  // POOLS FIRST. Names drawn from the same closed domain usually have to differ
+  // from each other — nsc-eval takes five grades from one fourteen-member set,
+  // and a journey whose "granted" and "ungranted" grades collide does not test
+  // an authorization boundary, it tests nothing, non-deterministically.
+  //
+  // Hashing each name independently makes that collision a matter of luck. A
+  // pool takes the choice out of luck as well as out of the product's hands.
+  const pools = new Map();
+  for (const [name, shape, domain, pool] of chosen) {
+    if (shape !== 'enum' || !pool) continue;
+    if (!pools.has(pool)) pools.set(pool, { domain, names: [] });
+    const p = pools.get(pool);
+    if (JSON.stringify(p.domain) !== JSON.stringify(domain)) {
+      throw new Error(`pool \`${pool}\` is declared with two different domains; a pool is one set`);
+    }
+    p.names.push(name);
+  }
+  for (const [pool, { domain, names }] of pools) {
+    if (names.length > domain.length) {
+      throw new Error(
+        `pool \`${pool}\` needs ${names.length} distinct values but its domain has ${domain.length}`,
+      );
+    }
+    // A deterministic permutation of the domain, keyed on the run and the pool,
+    // dealt out in declaration order. Every member is as likely as any other and
+    // no two names collide.
+    const order = [...domain]
+      .map((v) => [v, crypto.createHash('sha256').update(`watson-pool\0${runId}\0${pool}\0${v}`).digest('hex')])
+      .sort((a, b) => (a[1] < b[1] ? -1 : 1))
+      .map(([v]) => v);
+    names.forEach((name, i) => { out[name] = order[i]; });
+  }
+
+  for (const [name, shape, domain] of chosen) {
+    if (name in out) continue;
     const h = crypto.createHash('sha256').update(`watson-fixture\0${runId}\0${name}`).digest('hex');
     out[name] = shape === 'enum' ? pickFromDomain(h, name, domain) : SHAPES[shape](h, name);
   }
@@ -422,8 +458,9 @@ function pickFromDomain(h, name, domain) {
 }
 
 /**
- * `[name, shape, domain?]` triples from a bare list, a name -> shape mapping, or
- * a name -> {enum: [...]} mapping.
+ * `[name, shape, domain, pool]` from a bare list, a name -> shape mapping, or a
+ * name -> `{ enum: [...], pool?: string }` mapping. Names sharing a pool are
+ * guaranteed distinct values from the same domain.
  */
 export function normaliseChosen(declared) {
   const entries = Array.isArray(declared)
@@ -431,14 +468,16 @@ export function normaliseChosen(declared) {
     : Object.entries(declared ?? {});
 
   return entries.map(([name, spec]) => {
-    if (spec && typeof spec === 'object' && Array.isArray(spec.enum)) return [name, 'enum', spec.enum];
+    if (spec && typeof spec === 'object' && Array.isArray(spec.enum)) {
+      return [name, 'enum', spec.enum, spec.pool ?? null];
+    }
     if (!SHAPES[spec]) {
       throw new Error(
         `\`${name}\` declares verifier-chosen shape \`${JSON.stringify(spec)}\`, which the engine does not ` +
           `generate. Known shapes: ${Object.keys(SHAPES).join(', ')}, or \`{ enum: [...] }\` for a closed domain.`,
       );
     }
-    return [name, spec, null];
+    return [name, spec, null, null];
   });
 }
 

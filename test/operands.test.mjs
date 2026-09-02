@@ -184,6 +184,31 @@ describe('a verifier-chosen value still has to fit the column it lands in', () =
     assert.equal(fixtureValues('r', [{ g: { enum: GRADES } }]).g, fixtureValues('r', [{ g: { enum: GRADES } }]).g);
   });
 
+  test('names sharing a pool never collide', () => {
+    // Five grades from one fourteen-member domain. Hashing each name
+    // independently makes a collision a matter of luck, and a journey whose
+    // "granted" and "ungranted" grades are the same value does not test an
+    // authorization boundary — it tests nothing, non-deterministically.
+    const G = ['PK', 'K', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12'];
+    const names = ['grantedGrade', 'ungrantedGrade', 'revokedGrade', 'expiredGrade', 'suppressedGrade'];
+    const decl = names.map((n) => ({ [n]: { enum: G, pool: 'grades' } }));
+    for (let i = 0; i < 500; i++) {
+      const v = fixtureValues(`run-${i}`, decl);
+      assert.equal(new Set(Object.values(v)).size, names.length, `collision on run-${i}: ${JSON.stringify(v)}`);
+      for (const n of names) assert.ok(G.includes(v[n]));
+    }
+  });
+
+  test('a pool larger than its domain is refused, not silently truncated', () => {
+    const decl = ['a', 'b', 'c'].map((n) => ({ [n]: { enum: ['x', 'y'], pool: 'p' } }));
+    assert.throws(() => fixtureValues('r', decl), /needs 3 distinct values but its domain has 2/);
+  });
+
+  test('one pool means one set', () => {
+    const decl = [{ a: { enum: ['x'], pool: 'p' } }, { b: { enum: ['y'], pool: 'p' } }];
+    assert.throws(() => fixtureValues('r', decl), /two different domains/);
+  });
+
   test('an empty domain is refused rather than silently yielding undefined', () => {
     assert.throws(() => fixtureValues('r', [{ g: { enum: [] } }]), /no values to choose from/);
   });
