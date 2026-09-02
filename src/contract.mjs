@@ -70,7 +70,13 @@ export function parseFrontmatter(text, sourceLabel) {
  * silent under-verification this list exists to make impossible, and nothing but
  * a version refusal catches it.
  */
-export const SUPPORTED_CONTRACT_VERSIONS = Object.freeze([1, 2, 3]);
+// v4 adds `verifier_chosen` (with shapes and closed domains), `generated_roots`,
+// and the `expect_text_in` step. The bump is load-bearing for the first of those:
+// an engine that predates `verifier_chosen` does not error on the key, it simply
+// does not read it — so it would run the journeys with product-chosen assertion
+// operands and report a confident PASS over exactly the hole v4 exists to close.
+// Silent under-verification is what contract versions are for.
+export const SUPPORTED_CONTRACT_VERSIONS = Object.freeze([1, 2, 3, 4]);
 
 /** Problems with a contract's declared version. Checked before anything is provisioned. */
 export function validateContractVersion(config, supported = SUPPORTED_CONTRACT_VERSIONS) {

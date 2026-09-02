@@ -41,6 +41,27 @@ describe('proof operands and input operands are different things', () => {
     assert.deepEqual([...assertionVars(f)], ['label']);
   });
 
+  test('a scoped text assertion counts as proof', () => {
+    // `expect_text_in` is an assertion, so its operand is subject to the same
+    // rule. Adding a step type and forgetting to classify it is how a hole
+    // reopens quietly.
+    const f = feature('f', [{ expect_text_in: { selector: 'testid=stat', text: '${cohortSize}' } }]);
+    assert.deepEqual([...assertionVars(f)], ['cohortSize']);
+  });
+
+  test('every assertion step in the driver is classified', async () => {
+    // The two lists are edited by hand and drift silently: a step that asserts
+    // but is missing from ASSERTION_STEPS lets the product choose its operand
+    // again. Anything named `expect_*` or `wait_for_*` must be in it.
+    const { STEPS, ASSERTION_STEPS } = await import('../src/driver.mjs');
+    const looksLikeAssertion = STEPS.filter((s) => /^(expect|wait_for)_/.test(s));
+    const missing = looksLikeAssertion.filter((s) => !ASSERTION_STEPS.has(s)
+      // These two assert about the page as a whole, with no operand a fixture
+      // could supply — there is nothing for the product to choose.
+      && !['expect_no_uuid', 'expect_no_overflow'].includes(s));
+    assert.deepEqual(missing, [], `unclassified assertion steps: ${missing.join(', ')}`);
+  });
+
   test('nested operands are found', () => {
     const f = feature('f', [{ expect_json: { path: '/api/x', body: { name: '${seasonName}' } } }]);
     assert.deepEqual([...assertionVars(f)], ['seasonName']);

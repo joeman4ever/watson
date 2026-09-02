@@ -154,7 +154,7 @@ export async function openIdentity(browser, { baseUrl, token, viewport }) {
  */
 export const STEPS = [
   'goto', 'reload', 'back', 'click', 'fill', 'select', 'wait_for_text',
-  'expect_text', 'expect_no_text', 'expect_no_uuid', 'expect_url_contains',
+  'expect_text', 'expect_text_in', 'expect_no_text', 'expect_no_uuid', 'expect_url_contains',
   'expect_api', 'expect_denied', 'expect_allowed', 'expect_json',
   'expect_count_at_most', 'expect_count_at_least',
   'set_viewport', 'expect_no_overflow',
@@ -174,7 +174,7 @@ export const STEPS = [
  * proved only that the product can echo itself.
  */
 export const ASSERTION_STEPS = new Set([
-  'wait_for_text', 'expect_text', 'expect_no_text', 'expect_url_contains',
+  'wait_for_text', 'expect_text', 'expect_text_in', 'expect_no_text', 'expect_url_contains',
   'expect_api', 'expect_denied', 'expect_allowed', 'expect_json',
   'expect_count_at_most', 'expect_count_at_least',
 ]);
@@ -272,6 +272,33 @@ export async function runStep(step, ctx) {
       }
       if (!(await seen())) throw new Error(`expected page text to contain "${arg}"${note}`);
       return `page contains "${arg}"`;
+    }
+    case 'expect_text_in': {
+      // The same assertion as `expect_text`, SCOPED to one element.
+      //
+      // It exists because a journey in the product's own map said the quiet part
+      // out loud: "searching for the bare count as a string matches any
+      // incidental digit and proves nothing." That is true of every short
+      // operand — a grade, a cohort size, a threshold — and page-wide
+      // `expect_text` cannot distinguish "the stat shows 7" from "a 7 appears
+      // somewhere on the page".
+      //
+      // Polls, for the same reason `expect_text` does: this is a claim about
+      // eventual state, and sampling once races the render.
+      const el = locator(page, arg.selector);
+      const want = String(arg.text);
+      const seen = async () => {
+        try { return ((await el.first().innerText({ timeout: 1000 })) ?? '').includes(want); }
+        catch { return false; }
+      };
+      const deadline = Date.now() + timeout;
+      while (!(await seen()) && Date.now() < deadline) {
+        await page.waitForTimeout(100);
+      }
+      if (!(await seen())) {
+        throw new Error(`expected ${arg.selector} to contain "${want}"${note}`);
+      }
+      return `${arg.selector} contains "${want}"`;
     }
     case 'expect_no_text': {
       // Deliberately does NOT poll, unlike `expect_text` above. The asymmetry is
