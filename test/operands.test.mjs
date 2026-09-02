@@ -41,6 +41,35 @@ describe('proof operands and input operands are different things', () => {
     assert.deepEqual([...assertionVars(f)], ['label']);
   });
 
+  test('a path is an address, not proof', () => {
+    // `expect_denied: { path: ".../groups/${g}" }` asserts an authorization
+    // OUTCOME. A product choosing `g` cannot make "denied" true by choosing it —
+    // it would have to make the endpoint actually deny, which is the behaviour
+    // under test. A nonexistent group returns 404, which the engine classifies as
+    // FAIL_CONTRACT rather than a pass.
+    const f = feature('f', [
+      { expect_denied: { path: '/api/seasons/${seasonId}/groups/${groupId}' } },
+      { expect_allowed: { path: '/api/seasons/${seasonId}/groups/${groupId}/scores' } },
+      { expect_api: { path: '/api/seasons/${seasonId}/x' } },
+    ]);
+    assert.deepEqual([...assertionVars(f)], []);
+  });
+
+  test('but the BODY of a json assertion is proof', () => {
+    const f = feature('f', [
+      { expect_json: { path: '/api/x/${addressId}', contains: { name: '${seasonName}' } } },
+    ]);
+    assert.deepEqual([...assertionVars(f)], ['seasonName']);
+  });
+
+  test('a selector addresses; the text it must contain is proof', () => {
+    const f = feature('f', [
+      { expect_text_in: { selector: 'testid=${addressing}', text: '${cohortSize}' } },
+      { expect_count_at_most: { selector: 'testid=${alsoAddressing}', max: 0 } },
+    ]);
+    assert.deepEqual([...assertionVars(f)], ['cohortSize']);
+  });
+
   test('a scoped text assertion counts as proof', () => {
     // `expect_text_in` is an assertion, so its operand is subject to the same
     // rule. Adding a step type and forgetting to classify it is how a hole

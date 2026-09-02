@@ -290,11 +290,45 @@ export function degenerateOperand(value) {
  * anything; a value that makes an assertion true cannot be chosen by the thing
  * the assertion is about.
  */
+/**
+ * Within an assertion step, WHICH FIELD carries the proof.
+ *
+ * The first version of this rule counted every `${...}` inside an assertion step,
+ * and that is too coarse. `expect_denied: { path: "/api/seasons/${s}/groups/${g}" }`
+ * asserts an AUTHORIZATION OUTCOME; the path is an address. A product that chooses
+ * `g` cannot make "denied" true by choosing it — it would have to make the
+ * endpoint actually deny, which is the behaviour under test. Choosing a
+ * nonexistent group gets a 404, which this engine classifies as FAIL_CONTRACT,
+ * not a pass; choosing the wrong group gets a 200 and fails.
+ *
+ * Contrast `expect_text: "${seasonName}"`, where the operand IS the proof: a
+ * product that picks the string picks whether the assertion holds.
+ *
+ * Getting this wrong in the strict direction has a real cost, not just a
+ * pedantic one. It would have forced `assignedGroupId` and `unassignedGroupId` to
+ * be verifier-supplied, which nsc-eval cannot do without changing
+ * `createGroup(sessionId, name)` in its data-access boundary — a product
+ * architecture change made purely to satisfy a rule that did not need it.
+ */
+const PROOF_FIELDS = {
+  expect_text_in: ['text'],
+  expect_json: ['contains', 'body', 'expect'],
+  // `path` is an address; the assertion is the status class it comes back with.
+  expect_api: [],
+  expect_denied: [],
+  expect_allowed: [],
+  // `selector` addresses; the bound is a number from the contract, not the fixture.
+  expect_count_at_most: [],
+  expect_count_at_least: [],
+};
+
 export function assertionVars(feature) {
   const into = new Set();
   for (const step of feature.steps ?? []) {
     for (const [key, value] of Object.entries(step)) {
-      if (ASSERTION_STEPS.has(key)) referencedVars(value, into);
+      if (!ASSERTION_STEPS.has(key)) continue;
+      if (!(key in PROOF_FIELDS)) { referencedVars(value, into); continue; }
+      for (const field of PROOF_FIELDS[key]) referencedVars(value?.[field], into);
     }
   }
   return into;
