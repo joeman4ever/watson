@@ -16,7 +16,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  assertionVars, validateAssertionOperands, fixtureValues, fixtureValueEnv,
+  assertionVars, validateAssertionOperands, fixtureValues, fixtureValueEnv, normaliseChosen,
 } from '../src/contract.mjs';
 
 const feature = (id, steps) => ({ id, __file: `${id}.yaml`, steps });
@@ -48,7 +48,7 @@ describe('proof operands and input operands are different things', () => {
 });
 
 describe('the contract may not let the product choose its own proof', () => {
-  const profile = { emits: ['seasonName', 'sessionId'], verifier_chosen: ['seasonName'] };
+  const profile = { emits: ['seasonName', 'sessionId'], verifier_chosen: [{ seasonName: 'text' }] };
 
   test('an assertion on a verifier-chosen value is allowed', () => {
     const problems = validateAssertionOperands([feature('a', [{ expect_text: '${seasonName}' }])], profile);
@@ -115,5 +115,36 @@ describe('the values the verifier supplies', () => {
     const seen = new Set();
     for (let i = 0; i < 200; i++) seen.add(fixtureValues(`run-${i}`, ['n']).n);
     assert.equal(seen.size, 200);
+  });
+});
+
+describe('a verifier-chosen value still has to fit the column it lands in', () => {
+  test('a uuid shape produces something a uuid column accepts', () => {
+    // Handing the fixture `watson-primarySeasonId-3f2a…` where a uuid belongs
+    // fails at the insert and reads as a broken world — a verifier-chosen value
+    // is only useful if the product can actually store it.
+    const v = fixtureValues('run-1', [{ seasonId: 'uuid' }]).seasonId;
+    assert.match(v, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  });
+
+  test('an integer shape is small, because the fixture has to create that many rows', () => {
+    for (let i = 0; i < 50; i++) {
+      const n = fixtureValues(`run-${i}`, [{ cohort: 'integer' }]).cohort;
+      assert.ok(Number.isInteger(n) && n >= 3 && n <= 9, `${n} is not a usable cohort size`);
+    }
+  });
+
+  test('every shape stays deterministic and distinct', () => {
+    const a = fixtureValues('run-1', [{ x: 'uuid' }, { y: 'text' }, { z: 'integer' }]);
+    assert.deepEqual(a, fixtureValues('run-1', [{ x: 'uuid' }, { y: 'text' }, { z: 'integer' }]));
+    assert.notEqual(a.x, fixtureValues('run-2', [{ x: 'uuid' }]).x);
+  });
+
+  test('a bare list still means text, so the simple case stays simple', () => {
+    assert.deepEqual(normaliseChosen(['a', 'b']), [['a', 'text'], ['b', 'text']]);
+  });
+
+  test('an unknown shape is refused rather than guessed', () => {
+    assert.throws(() => fixtureValues('r', [{ x: 'timestamptz' }]), /does not generate/);
   });
 });

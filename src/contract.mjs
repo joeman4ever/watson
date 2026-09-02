@@ -320,7 +320,10 @@ export function assertionVars(feature) {
  * that assigns the id also decides what the assertion sees.
  */
 export function validateAssertionOperands(features, fixtureProfile, engineSupplied = ['runId']) {
-  const chosen = new Set([...(fixtureProfile?.verifier_chosen ?? []), ...engineSupplied]);
+  const chosen = new Set([
+    ...normaliseChosen(fixtureProfile?.verifier_chosen ?? []).map(([n]) => n),
+    ...engineSupplied,
+  ]);
   const problems = [];
   for (const f of features) {
     const used = [...assertionVars(f)].filter((v) => !chosen.has(v)).sort();
@@ -347,13 +350,57 @@ export function validateAssertionOperands(features, fixtureProfile, engineSuppli
  * Long enough that a substring assertion on one is meaningful: 16 hex characters
  * do not appear on an error page by accident.
  */
-export function fixtureValues(runId, names = []) {
+export function fixtureValues(runId, declared = []) {
   const out = {};
-  for (const name of names) {
+  for (const [name, shape] of normaliseChosen(declared)) {
     const h = crypto.createHash('sha256').update(`watson-fixture\0${runId}\0${name}`).digest('hex');
-    out[name] = `watson-${name}-${h.slice(0, 16)}`;
+    out[name] = SHAPES[shape](h, name);
   }
   return out;
+}
+
+/**
+ * A verifier-chosen value still has to be something the product can store.
+ *
+ * A season NAME can be any string; a season ID is a uuid column; a cohort SIZE
+ * is an integer the fixture has to actually create that many rows for. Handing
+ * the fixture `watson-primarySeasonId-3f2a…` where a uuid belongs would fail at
+ * the insert and read as a broken world, so the contract declares the shape and
+ * the verifier generates something that fits it.
+ *
+ * Every shape is derived from the same run-scoped hash, so all of them are
+ * deterministic per run, unpredictable to a product that cannot see the run id,
+ * and distinct from each other.
+ */
+export const SHAPES = {
+  text: (h, name) => `watson-${name}-${h.slice(0, 16)}`,
+  // RFC 4122 layout, deterministic content. Version 4 nibble and variant bits are
+  // set so a strict uuid column or validator accepts it.
+  uuid: (h) => [
+    h.slice(0, 8), h.slice(8, 12),
+    `4${h.slice(13, 16)}`,
+    `${((parseInt(h.slice(16, 17), 16) & 0x3) | 0x8).toString(16)}${h.slice(17, 20)}`,
+    h.slice(20, 32),
+  ].join('-'),
+  // Small and positive: the fixture has to create this many rows, and a cohort
+  // of 4 billion is not a test, it is an outage.
+  integer: (h) => 3 + (parseInt(h.slice(0, 6), 16) % 7),
+};
+
+/** `[name, shape]` pairs from either a bare list or a name -> shape mapping. */
+export function normaliseChosen(declared) {
+  const pairs = Array.isArray(declared)
+    ? declared.map((n) => (typeof n === 'string' ? [n, 'text'] : Object.entries(n)[0]))
+    : Object.entries(declared ?? {});
+  for (const [name, shape] of pairs) {
+    if (!SHAPES[shape]) {
+      throw new Error(
+        `\`${name}\` declares verifier-chosen shape \`${shape}\`, which the engine does not generate. ` +
+          `Known shapes: ${Object.keys(SHAPES).join(', ')}.`,
+      );
+    }
+  }
+  return pairs;
 }
 
 /**
