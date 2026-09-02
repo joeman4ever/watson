@@ -44,8 +44,21 @@ const OBLIGATION = {
 export const PRODUCT_CLAIMS = new Set(['PASS', 'PASS_WITH_ADVISORIES', 'FAIL_PRODUCT']);
 
 /**
- * A product claim requires that the checkout driven actually IS the revision
+ * A product claim requires that the source driven actually IS the revision
  * reported (Phase-1 defect W2, now a standing invariant).
+ *
+ * WHAT THIS ESTABLISHES, worded carefully because the looser version is easy to
+ * write and is wrong:
+ *
+ *   At the verifier's measurement point, the materialised committed product
+ *   source matched the trusted manifest for product HEAD X.
+ *
+ * NOT: the bytes loaded into the running process are nothing but the committed
+ * bytes. Generated build output is outside the manifest by construction, the
+ * source is measured at two instants rather than continuously, and nothing here
+ * binds the artefact that was actually launched to the commit. Those are real
+ * and separate, tracked as C4, and required to be closed or consciously accepted
+ * before Watson becomes a required merge check.
  *
  * Reporting the dirt was not enough. Every result carries a 40-char SHA and two
  * fingerprints computed from git, while the contract that executed and the product
@@ -117,6 +130,13 @@ export function buildEnvelope(run) {
     head_sha: run.headSha,
     base_sha: run.baseSha ?? null,
     // Whether the checkout actually matched the SHA above.
+    // `product_identity` because that is what it is. It was `working_tree` when
+    // the answer came from `git status`; the name outlived the mechanism and
+    // then outlived the mechanism that replaced it. `working_tree` stays as an
+    // alias for one release so a consumer reading it does not silently start
+    // seeing `undefined` — which, on a field that gates product claims, would
+    // read as "not exact" and turn every run INDETERMINATE.
+    product_identity: run.workingTree ?? null,
     working_tree: run.workingTree ?? null,
 
     // Recorded ALWAYS; NOT consulted for carry-forward in phase 0/1.
@@ -315,7 +335,7 @@ export function summary(env) {
     L.push('');
   }
 
-  const wt = env.working_tree;
+  const wt = env.product_identity ?? env.working_tree;
   if (wt && wt.exact_head === false) {
     L.push('### ⚠ This run is NOT bound to the SHA it reports');
     L.push(

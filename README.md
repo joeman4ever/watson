@@ -32,8 +32,14 @@ writes it during a run.
 ## Usage
 
 ```bash
-watson verify --repo /path/to/product [--sha <ref>] [--base <ref>] [--profile poc] [--pr 123] [--out result.json]
+# TRUSTED side, against a checkout the product has not run in:
+watson manifest --repo /path/to/product --sha <ref> --out manifest.json
+
+watson verify --repo /path/to/product --manifest manifest.json \
+              [--sha <ref>] [--base <ref>] [--profile poc] [--pr 123] [--out result.json] \
+              [--plane <url> --product-base-url <url>]
 watson doctor --repo /path/to/product     # bring up, probe, tear down
+watson plane  --repo /path/to/product     # the untrusted side's executor
 watson reap                               # drop orphaned watson_* databases
 ```
 
@@ -260,19 +266,77 @@ step, so anything able to append to them can inject environment variables and
 PATH entries into the trusted side that follows. Across a plane boundary the
 verifier's environment is not sent at all.
 
-### Positive HEAD identity
+### Product identity comes from a trusted manifest, not from git
 
-The exact-HEAD gate asserts that `HEAD` *is* the SHA the run reports, not merely
-that the tree is clean. Cleanliness alone is forgeable in one command: modify the
-product, commit the modification, and `git status` is clean again at a commit
-nobody reviewed.
+Three adversarial reviews found four ways past a git-based identity gate, and
+every one had the same shape: the gate asked a directory the product writes,
+whose `.git` the product owns, to describe itself.
+
+| attack | what it defeated |
+| --- | --- |
+| `git update-index --assume-unchanged` | `git status` |
+| `git replace` | the commit tree `ls-tree` resolves |
+| `git add` on a new file | the untracked listing |
+| corrupt `.git/index` | both listings at once |
+| self-hiding `.gitignore` | every generation |
+
+Patching each answer never changed who was answering. So the authority moved:
+
+```text
+trusted orchestration          materialises the commit
+        ↓                      BEFORE any product code runs
+watson manifest                walks it, records path + type + digest + exec bit
+        ↓                      the product never sees this tree
+product plane                  builds and runs — needs no .git at all
+        ↓
+verifier                       compares the product tree against the manifest
+```
+
+**No manifest, no product claim.** A run that was not given one withholds every
+product claim rather than falling back to asking git — the fallback *was* the
+vulnerability.
+
+It also catches what git was never asked about: a missing file, a symlink to
+identical bytes, the executable bit, a directory where a file belongs. Generated
+output under a declared root is **counted and reported**, never used to make an
+unexpected file invisible, and never able to shelter a change to a committed file.
+
+### What that proves, and what it does not
+
+> At the verifier's measurement point, the materialised committed product source
+> matched the trusted manifest for product HEAD X.
+
+Not: *the bytes loaded into the running process are nothing but the committed
+bytes.* Build output is outside the manifest by construction, the source is
+measured at two instants rather than continuously, and nothing yet binds the
+artefact actually launched to the commit. Closing that means a trusted build
+producing an artefact or image digest and launching exactly that. It is tracked,
+not claimed.
+
+### Known limitations, and where they must be closed
+
+Recorded here rather than in a comment nobody reads, because the difference
+between shadow mode and a required check is exactly this list.
+
+| | Limitation | Phase 1 (advisory) | Before Watson is a required check |
+| --- | --- | --- | --- |
+| **C3** | The product's `DATABASE_URL` carries the same Postgres role as the admin URL, so it is not least-privilege. Bounded today by the deployment — a per-run Postgres destroyed with the run — which is a property of the orchestration, not of this code | documented | explicit final disposition |
+| **C4** | Identity binds committed *source* at two instants, not the running artefact | documented | closed, or an owner-accepted equivalent runtime binding |
+
+Neither is called fixed. Phase-1 maturity counters do not retire them; they are
+separate requirements.
 
 ### The controls
 
-`test/isolation.test.mjs` and `test/plane.test.mjs`. Where a control needs real
-privilege separation and cannot have it (no root), it asserts the fail-closed
-contract instead and says so **in its own name** — it never silently skips,
-because a green tick on a security test that did nothing is read as proof.
+`test/manifest.test.mjs` runs the full adversarial corpus — every attack that
+defeated a previous generation of the gate — against the architecture that
+replaced it. `test/operands.test.mjs` covers who may choose an assertion's
+operand. `test/isolation.test.mjs` and `test/plane.test.mjs` cover the rest.
+
+Where a control needs real privilege separation and cannot have it (no root), it
+asserts the fail-closed contract instead and says so **in its own name** — it
+never silently skips, because a green tick on a security test that did nothing is
+read as proof.
 
 ## Deliberately not built yet
 
