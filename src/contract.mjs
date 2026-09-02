@@ -7,6 +7,8 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
+import { ASSERTION_STEPS } from './driver.mjs';
 import { execFileSync } from 'node:child_process';
 // The hardened wrapper, so the claim that EVERY git invocation goes through it
 // is true rather than nearly true. This one reads a base-branch tree, which the
@@ -222,6 +224,10 @@ export function validateFeatureVars(features, fixtureProfile, alwaysAvailable = 
  * BLOCKED_ENVIRONMENT — a statement about the world Watson was given, which is
  * exactly what it is — rather than a green tick.
  */
+/**
+ * Sanity-check the values a fixture emitted. See `degenerateOperand`: this is
+ * usability, not a boundary. The boundary is `validateAssertionOperands`.
+ */
 export function validateSeedValues(vars, fixtureProfile) {
   const declared = fixtureProfile?.emits ?? [];
   const problems = [];
@@ -237,21 +243,20 @@ export function validateSeedValues(vars, fixtureProfile) {
 }
 
 /**
- * Is this value too unspecific to be an assertion operand?
+ * A USABILITY CHECK. Not a trust control, and no longer described as one.
  *
- * The first version of this check rejected only the empty string, which ruled
- * out the one value an attacker would never have to use. `expect_text` and
- * `expect_url_contains` are SUBSTRING tests, so a single common character is
- * exactly as vacuous:
+ * It began as a defence: reject values too unspecific to prove anything, and a
+ * hostile fixture would find it harder to neutralise its own journeys. That was
+ * never going to work, and two reviews said so — `http`, `Sign` and `Home` are
+ * all plausible and all make a substring assertion true against a generic error
+ * page. No predicate over a string separates a real season name from a string
+ * chosen because it appears on the failure page.
  *
- *     expect_text "a"          -> true against "Something went wrong."
- *     expect_url_contains "/"  -> true against any URL at all
- *
- * A HEURISTIC, and named as one. It raises the cost of a vacuous operand; it
- * does not remove the ability to choose one, because the product still chooses
- * the value. The structural fix is for the VERIFIER to choose these values and
- * pass them into the fixture, rather than accepting whatever comes back — see
- * `docs/verifier-chosen-fixture-values.md`.
+ * `validateAssertionOperands` closes that properly, by taking the choice away.
+ * What survives here is worth keeping for a different and much smaller reason:
+ * a fixture that emits an empty or malformed value for a name a journey uses as
+ * INPUT produces a confusing failure three steps later, and saying so at the
+ * source is kinder than debugging it.
  */
 export function degenerateOperand(value) {
   if (value === null || value === undefined) return 'is null; an unresolved operand is not an expectation';
@@ -273,6 +278,93 @@ export function degenerateOperand(value) {
  * name, and excludes `a` and `/`, which are not identifiers at all.
  */
 export const MIN_OPERAND_LENGTH = 4;
+
+/**
+ * The variables a feature uses AS PROOF, as opposed to as input.
+ *
+ * Only assertion steps count. A value that merely gets typed into a form can be
+ * anything; a value that makes an assertion true cannot be chosen by the thing
+ * the assertion is about.
+ */
+export function assertionVars(feature) {
+  const into = new Set();
+  for (const step of feature.steps ?? []) {
+    for (const [key, value] of Object.entries(step)) {
+      if (ASSERTION_STEPS.has(key)) referencedVars(value, into);
+    }
+  }
+  return into;
+}
+
+/**
+ * Refuse a contract in which the PRODUCT chooses the values that make Watson's
+ * assertions true.
+ *
+ * This is the rule three rounds of review converged on, and it is the one
+ * property that closes the class rather than raising its cost:
+ *
+ *   The thing being tested cannot choose the value that makes the verifier's
+ *   assertion true.
+ *
+ * The heuristic this replaces — refusing values that look vacuous — could never
+ * establish it. `http`, `Sign` and `Home` are all syntactically plausible and all
+ * make a substring assertion true against a generic error page. There is no
+ * predicate over a string that distinguishes "a real season name" from "a string
+ * chosen because it appears on the failure page", because the difference is not
+ * in the string. It is in who picked it.
+ *
+ * So the contract must declare, per fixture profile, which names the VERIFIER
+ * supplies. Anything a journey asserts on must be one of those. A journey that
+ * wants to assert on a database-assigned id has to stop, and assert on something
+ * the verifier named instead — which is the right pressure, because a product
+ * that assigns the id also decides what the assertion sees.
+ */
+export function validateAssertionOperands(features, fixtureProfile, engineSupplied = ['runId']) {
+  const chosen = new Set([...(fixtureProfile?.verifier_chosen ?? []), ...engineSupplied]);
+  const problems = [];
+  for (const f of features) {
+    const used = [...assertionVars(f)].filter((v) => !chosen.has(v)).sort();
+    if (used.length) {
+      problems.push(
+        `${f.__file ?? f.id}: asserts on ${used.map((m) => `\`\${${m}}\``).join(', ')}, which the ` +
+          'fixture profile does not declare in `verifier_chosen`. The product would be choosing the ' +
+          'value that makes its own test pass.',
+      );
+    }
+  }
+  return problems;
+}
+
+/**
+ * The values the verifier supplies to the fixture.
+ *
+ * Deterministic per run, derived from the run identity the verifier owns, so a
+ * re-run of the same run is reproducible and two concurrent runs never collide.
+ * Not random, because flakiness bought nothing here — what matters is that the
+ * product cannot predict or choose them, and a value keyed to a run id it never
+ * sees satisfies that.
+ *
+ * Long enough that a substring assertion on one is meaningful: 16 hex characters
+ * do not appear on an error page by accident.
+ */
+export function fixtureValues(runId, names = []) {
+  const out = {};
+  for (const name of names) {
+    const h = crypto.createHash('sha256').update(`watson-fixture\0${runId}\0${name}`).digest('hex');
+    out[name] = `watson-${name}-${h.slice(0, 16)}`;
+  }
+  return out;
+}
+
+/**
+ * The environment the fixture receives them in. A product that ignores these and
+ * invents its own values fails the cross-check at the call site rather than here.
+ */
+export function fixtureValueEnv(values) {
+  return Object.fromEntries(
+    Object.entries(values).map(([k, v]) => [`WATSON_FIXTURE_${k.replace(/[^A-Za-z0-9]/g, '_').toUpperCase()}`, v]),
+  );
+}
 
 /**
  * Expand `depends_on` into an ordered setup list. A prerequisite runs as SETUP,

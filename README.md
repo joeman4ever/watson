@@ -177,14 +177,29 @@ The plane has no endpoint that reports readiness — deliberately, and there is 
 test for it. A plane allowed to decide one small thing is a plane the product can
 use to make the verifier agree with it.
 
-Almost nothing the plane says is trusted, and the *almost* is load-bearing. The
-fixture's emitted variables are product-authored and become **assertion
-operands**: `expect_text: "${seasonName}"` asserts against a string the product
-chose. Watson refuses values too unspecific to prove anything — an empty string,
-a single character, `"/"` — which raises the cost of a vacuous assertion without
-removing the ability to choose one. Closing it properly means the verifier
-choosing those values and passing them *into* the fixture. That is a contract
-change, and it is tracked rather than claimed.
+Nothing the plane says decides a verdict, and the reason is architectural rather
+than a promise.
+
+The fixture's emitted variables used to be the exception. They become **assertion
+operands** — `expect_text: "${seasonName}"` asserted against a string the product
+chose, which let the product decide whether it passed its own test. Refusing
+values that *look* vacuous could never fix that: `http`, `Sign` and `Home` are all
+plausible and all match a generic error page. The difference is not in the string,
+it is in who picked it.
+
+So the verifier picks it. It generates the values a journey asserts on from a run
+identity the product never sees, and passes them **into** the fixture:
+
+```text
+verifier            → WATSON_FIXTURE_SEASONNAME=watson-seasonName-240b876c04012e82
+fixture             → creates the season with that name
+Watson's assertion  → expects the value the VERIFIER chose
+```
+
+The contract declares which names those are, and the engine **refuses a contract
+that asserts on anything else** — a journey may still navigate to a
+product-assigned id, it just may not treat that id as evidence. A fixture that
+ignores what it was given fails the run as a broken world, not a product defect.
 
 ### The browser is part of the verifier
 

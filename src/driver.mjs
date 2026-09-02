@@ -160,6 +160,25 @@ export const STEPS = [
   'set_viewport', 'expect_no_overflow',
 ];
 
+/**
+ * Steps whose operands are PROOF, not input.
+ *
+ * The distinction decides who is allowed to choose a value. A `fill` operand is
+ * something Watson types into the product; the product may well have chosen it,
+ * and nothing rests on it. An `expect_text` operand is the thing that makes the
+ * assertion true — so if the product picks it, the product decides whether it
+ * passes its own test.
+ *
+ * `wait_for_text` is here deliberately: it asserts what the application
+ * eventually says, and a journey that waits for a string the product chose has
+ * proved only that the product can echo itself.
+ */
+export const ASSERTION_STEPS = new Set([
+  'wait_for_text', 'expect_text', 'expect_no_text', 'expect_url_contains',
+  'expect_api', 'expect_denied', 'expect_allowed', 'expect_json',
+  'expect_count_at_most', 'expect_count_at_least',
+]);
+
 function locator(page, sel) {
   if (typeof sel !== 'string') throw new Error(`selector must be a string, got ${JSON.stringify(sel)}`);
   if (sel.startsWith('testid=')) return page.getByTestId(sel.slice(7));

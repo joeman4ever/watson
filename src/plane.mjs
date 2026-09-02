@@ -17,15 +17,21 @@
 // the tree claim are all handled as untrusted data: checked, bounded, or acted on
 // only in the direction that incriminates the plane.
 //
-// The exception is the fixture's emitted `vars`. Those are product-authored and
-// they become ASSERTION OPERANDS — `expect_text: "${seasonName}"` asserts against
-// a string the product chose. `degenerateOperand` refuses values too unspecific
-// to prove anything, which raises the cost; it does not remove the ability to
-// choose. Closing it means the VERIFIER choosing those values and passing them
-// into the fixture, which is a contract change and is tracked, not done.
+// The fixture's emitted variables used to be the exception, and they were the
+// reason "nothing the plane says is trusted" was false: they become ASSERTION
+// OPERANDS, so `expect_text: "${seasonName}"` asserted against a string the
+// product chose.
 //
-// So: "nothing the plane says is trusted" was the claim, and it was false. This
-// is the true version, and it is smaller.
+// That is closed now, and by removing the choice rather than by policing it. The
+// VERIFIER generates the values a journey asserts on, from a run identity the
+// product never sees, and passes them INTO the fixture; the contract must
+// declare them, and the engine refuses a contract that asserts on anything else.
+// A fixture that ignores what it was given fails the run as a broken world.
+// Whatever the plane returns for those names is overwritten by what the verifier
+// supplied.
+//
+// So the claim is true again, and this time because of an architecture rather
+// than a promise.
 //
 // A product that subverts this process entirely can lie about its own bring-up —
 // which surfaces as a health timeout, or as an application that behaves however

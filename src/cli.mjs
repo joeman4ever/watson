@@ -15,7 +15,7 @@ import url from 'node:url';
 import {
   loadContract, loadContractAt, selectByProfile, withDependencies,
   validateFeatureVars, validateEnvOwnership, validateContractVersion, validateStepOrder,
-  validateSeedValues,
+  validateSeedValues, validateAssertionOperands, fixtureValues, fixtureValueEnv,
 } from './contract.mjs';
 import { productFingerprint, contractFingerprint, resolveSha, contractChange, workingTreeState, changedPaths, engineProvenance } from './fingerprint.mjs';
 import { selectByImpact } from './selection.mjs';
@@ -98,6 +98,23 @@ function buildAppEnv({ cfg, runId, databaseUrl, appPort, baseUrl, identity, inhe
     });
   }
   return appEnv;
+}
+
+/**
+ * Reconcile what the fixture emitted with what the verifier supplied.
+ *
+ * The verifier's values WIN, always — that is the point of supplying them. The
+ * emitted value is compared only to notice a fixture that ignored what it was
+ * given, which is a broken world rather than a product defect: the entity
+ * Watson's journeys are about to assert on does not carry the name Watson
+ * chose, so the assertions would fail for a reason that has nothing to do with
+ * the product's behaviour.
+ */
+function reconcileFixtureValues(emitted, chosen) {
+  const ignored = Object.entries(chosen)
+    .filter(([k, v]) => k in (emitted ?? {}) && String(emitted[k]) !== v)
+    .map(([k, v]) => `\`${k}\`: fixture used \`${emitted[k]}\`, verifier supplied \`${v}\``);
+  return { vars: { ...emitted, ...chosen }, ignored };
 }
 
 /** Bring the product up exactly as Watson will drive it. Returns a handle whose
@@ -191,9 +208,15 @@ async function bringUp({ repoRoot, contract, runDir, runId, adminUrl, policy }) 
     t = Date.now();
     const fixture = contract.fixtures.profiles?.[cfg.launch.fixture_profile];
     if (!fixture) throw new Error(`fixture profile \`${cfg.launch.fixture_profile}\` not declared`);
+    const chosen = fixtureValues(runId, fixture.verifier_chosen ?? []);
     const seed = await env.runStep(
       env.interpolate(fixture.command, { RUN_ID: runId, DATABASE_URL: databaseUrl }),
-      { cwd: repoRoot, env: { ...appEnv, DATABASE_URL: databaseUrl }, label: 'seed', policy },
+      {
+        cwd: repoRoot,
+        env: { ...appEnv, DATABASE_URL: databaseUrl, ...fixtureValueEnv(chosen) },
+        label: 'seed',
+        policy,
+      },
     );
     let vars = {};
     try {
@@ -201,11 +224,18 @@ async function bringUp({ repoRoot, contract, runDir, runId, adminUrl, policy }) 
     } catch (e) {
       throw new Error(`seed did not emit parseable JSON vars: ${e.message}\n${seed.stdout.slice(-400)}`);
     }
+    const reconciled = reconcileFixtureValues(vars, chosen);
+    if (reconciled.ignored.length) {
+      throw new Error(
+        `the fixture did not use the values the verifier supplied:\n  - ${reconciled.ignored.join('\n  - ')}`,
+      );
+    }
+    vars = reconciled.vars;
     const seedProblems = validateSeedValues(vars, fixture);
     if (seedProblems.length) {
       throw new Error(`the fixture emitted unusable variables:\n  - ${seedProblems.join('\n  - ')}`);
     }
-    step(`seeded: ${Object.keys(vars).join(', ')}`);
+    step(`seeded: ${Object.keys(vars).join(', ')}${Object.keys(chosen).length ? ` (${Object.keys(chosen).length} verifier-chosen)` : ''}`);
     timings.seed_ms = Date.now() - t;
 
     return { dbName, databaseUrl, baseUrl, appPort, vars, timings, dbServerVersion,
@@ -386,24 +416,33 @@ async function bringUpRemote({ contract, runId, adminUrl, planeUrl, productBaseU
     t = Date.now();
     const fixture = contract.fixtures.profiles?.[cfg.launch.fixture_profile];
     if (!fixture) throw new Error(`fixture profile \`${cfg.launch.fixture_profile}\` not declared`);
+    const chosen = fixtureValues(runId, fixture.verifier_chosen ?? []);
     const seeded = await plane('/seed', {
-      runId, seed: fixture.command, env: { ...appEnv, DATABASE_URL: databaseUrl },
+      runId,
+      seed: fixture.command,
+      env: { ...appEnv, DATABASE_URL: databaseUrl, ...fixtureValueEnv(chosen) },
     });
     if (!seeded?.ok) {
       throw new Error(
         `product plane failed during seed: ${seeded?.message ?? 'no message'}\n${(seeded?.log ?? '').slice(-1500)}`,
       );
     }
-    const seedProblems = validateSeedValues(seeded.vars, fixture);
+    const reconciled = reconcileFixtureValues(seeded.vars, chosen);
+    if (reconciled.ignored.length) {
+      throw new Error(
+        `the fixture did not use the values the verifier supplied:\n  - ${reconciled.ignored.join('\n  - ')}`,
+      );
+    }
+    const seedProblems = validateSeedValues(reconciled.vars, fixture);
     if (seedProblems.length) {
       throw new Error(`the fixture emitted unusable variables:\n  - ${seedProblems.join('\n  - ')}`);
     }
     timings.seed_ms = Date.now() - t;
-    step(`seeded: ${Object.keys(seeded.vars ?? {}).join(', ')}`);
+    step(`seeded: ${Object.keys(reconciled.vars).join(', ')}${Object.keys(chosen).length ? ` (${Object.keys(chosen).length} verifier-chosen)` : ''}`);
 
     return {
       dbName, databaseUrl, baseUrl: productBaseUrl, appPort: productPort,
-      vars: seeded.vars ?? {}, timings, dbServerVersion: provisioned?.serverVersion ?? null, planeTree,
+      vars: reconciled.vars, timings, dbServerVersion: provisioned?.serverVersion ?? null, planeTree,
       tokens: started.identity.tokens, identity: started.identity, teardown,
     };
   } catch (err) {
@@ -544,6 +583,10 @@ async function cmdVerify(args) {
     ...validateContractVersion(contract.config),
     ...validateStepOrder(plan.map((p) => p.feature)),
     ...validateEnvOwnership(contract.config),
+    ...validateAssertionOperands(
+      plan.map((p) => p.feature),
+      contract.fixtures.profiles?.[contract.config.launch.fixture_profile],
+    ),
     ...validateFeatureVars(
       plan.map((p) => p.feature),
       contract.fixtures.profiles?.[contract.config.launch.fixture_profile],
