@@ -20,7 +20,7 @@ import {
 } from './contract.mjs';
 import { validateProofDeclarations } from './proofs.mjs';
 import { resolveGovernance, downgradeForUngovernedContract } from './governance.mjs';
-import { productFingerprint, contractFingerprint, resolveSha, contractChange, productIdentity, changedPaths, engineProvenance } from './fingerprint.mjs';
+import { productFingerprint, contractFingerprint, resolveSha, contractChange, productIdentity, changedPaths, engineProvenance, verdictBearingPaths, pathExistsAt, pathReaderAt } from './fingerprint.mjs';
 import { readManifest } from './manifest.mjs';
 import { runManifest } from './manifest-cli.mjs';
 import { selectByImpact } from './selection.mjs';
@@ -533,6 +533,12 @@ async function cmdVerify(args) {
     base: baseContract, head: headContract, baseSupplied: !!baseContractDir,
   });
   const contract = governance.contract;
+  // Scoped from the governing contract, and from what exists at the HEAD commit —
+  // a path the head deleted still has to be compared, and `treeHash` reports it
+  // as `absent` on that side rather than dropping out of the digest.
+  const contractScope = verdictBearingPaths(
+    contract, pathExistsAt(repoRoot, headSha), pathReaderAt(repoRoot, headSha),
+  );
 
   log(`  repo   ${repoRoot}`);
   log(`  head   ${headSha}`);
@@ -586,7 +592,13 @@ async function cmdVerify(args) {
     headSha, baseSha,
     contractVersion: contract.config?.contract_version ?? null,
     productFingerprint: productFingerprint(repoRoot, headSha),
-    contractFingerprint: contractFingerprint(repoRoot, headSha),
+    // D2: the fingerprint covers everything verdict-bearing, which is more than
+    // `.watson/`. The scope is derived from the GOVERNING contract — a pull
+    // request cannot shrink the list that decides whether its own changes are
+    // reported — and is recorded beside the digest, because a fingerprint whose
+    // scope is invisible is one nobody can check.
+    contractFingerprint: contractFingerprint(repoRoot, headSha, contractScope),
+    contractScope,
     // Resolves the contract at BOTH SHAs so the diff can name what changed, not
     // merely that something did.
     //
@@ -594,8 +606,8 @@ async function cmdVerify(args) {
     // the product's own `.git` (F3), and the head side is the head contract as
     // authored — not the governing merge, which would diff the base against
     // itself and report no change however much the head moved.
-    contractChange: contractChange(repoRoot, baseSha, headSha, (sha) =>
-      (sha === headSha ? headContract : baseContract)),
+    contractChange: contractChange(repoRoot, baseSha, headSha,
+      (sha) => (sha === headSha ? headContract : baseContract), contractScope),
     governance,
     // Recorded on EVERY result, pass or fail. A run that reports a SHA it did not
     // actually verify is worse than one that reports nothing.

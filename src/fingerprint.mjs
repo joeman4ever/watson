@@ -108,6 +108,181 @@ const PRODUCT_PATHS = [
 
 const CONTRACT_PATHS = ['.watson'];
 
+/**
+ * The install surface. Every one of these changes what `npm ci` puts on disk,
+ * and therefore what the launched application actually is, without a single
+ * line of `.watson/` moving.
+ *
+ * Listed rather than derived because there is nothing to derive them from: a
+ * lockfile is consumed by the package manager, not named by the contract. They
+ * are included only when present, so a product using none of them is not
+ * fingerprinting phantoms.
+ */
+const INSTALL_SURFACE = [
+  'package.json', 'package-lock.json', 'npm-shrinkwrap.json',
+  'yarn.lock', 'pnpm-lock.yaml',
+  '.npmrc', '.nvmrc', '.node-version',
+];
+
+// A token in a command that is plausibly a path in this repository. Deliberately
+// conservative: it must contain a slash and a file extension, so `npm`, `run`,
+// `--workspace=server` and `start` do not match, and `server/scripts/x.ts` does.
+const PATH_TOKEN = /(?:^|[\s'"=])((?:\.\/)?[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+\.[A-Za-z0-9]+)/g;
+
+/**
+ * The contract's command strings, split by whether resolving them leads to the
+ * TEST or to the PRODUCT.
+ *
+ * The distinction decides whether `contract_change` means anything. Resolving
+ * `launch.command` reaches `server/src/index.ts` — the application under test,
+ * already measured as `product_fingerprint`. Pulling it in here would make every
+ * product pull request report a contract change and destroy the signal this
+ * field exists to carry.
+ *
+ * `world` commands are the ones that decide WHAT THE VERIFICATION DOES: the
+ * fixture that builds the world the journeys assert on, and the provisioning that
+ * shapes the schema it writes into. Those are resolved through to the files they
+ * run. `surface` commands contribute their manifests and lockfiles — what `npm
+ * ci` installs is verdict-bearing — but are not followed into product source.
+ */
+function contractCommands(contract) {
+  const world = [];
+  const surface = [];
+  const push = (into, v) => {
+    if (typeof v === 'string') into.push(v);
+    else if (Array.isArray(v)) for (const x of v) push(into, x);
+  };
+  const cfg = contract?.config ?? {};
+  push(world, cfg.provision);
+  for (const p of Object.values(contract?.fixtures?.profiles ?? {})) push(world, p?.command);
+  push(surface, cfg.install); push(surface, cfg.build); push(surface, cfg.launch?.command);
+  return { world, surface, all: [...world, ...surface] };
+}
+
+/**
+ * The directory a workspace PACKAGE NAME lives in.
+ *
+ * `--workspace=server` names a directory; `--workspace=@nsc-eval/server` names a
+ * package, and nsc-eval's contract uses both — one line apart. Without this,
+ * `provision: npm run migrate:up --workspace=@nsc-eval/server` resolved to
+ * nothing and `server/migrations` silently fell out of the measured scope, which
+ * is precisely the kind of near-miss that makes a partial control read as a
+ * complete one.
+ *
+ * Only literal workspace entries are followed. A glob (`packages/*`) is not
+ * expanded — that would need a directory listing of the commit, and guessing is
+ * what `verdict_bearing_paths` exists to replace.
+ */
+function workspaceDir(packageName, read) {
+  let root;
+  try { root = JSON.parse(read('package.json') ?? 'null'); } catch { return null; }
+  const globs = Array.isArray(root?.workspaces) ? root.workspaces : root?.workspaces?.packages;
+  for (const dir of globs ?? []) {
+    if (typeof dir !== 'string' || dir.includes('*')) continue;
+    try {
+      if (JSON.parse(read(`${dir}/package.json`) ?? 'null')?.name === packageName) return dir;
+    } catch { /* not a workspace we can read */ }
+  }
+  return null;
+}
+
+/**
+ * Follow `npm run <script> --workspace=<ws>` to the files the script actually
+ * runs.
+ *
+ * Without this the mechanism covers almost nothing for a real product. Run
+ * against nsc-eval it returned six paths and NOT the fixture script, because
+ * every command in that contract goes through `npm run` and names no file:
+ *
+ *     command: "npm run watson:fixture --workspace=server -- --profile …"
+ *     server/package.json  "watson:fixture": "tsx scripts/watson-fixture.ts"
+ *
+ * One hop of resolution reaches `server/scripts/watson-fixture.ts` and
+ * `server/migrations`. Deeper chains are not followed: two hops of guessing about
+ * a shell string is where a mechanical rule stops being mechanical, and
+ * `verdict_bearing_paths` is there for whatever this cannot see.
+ *
+ * Inside a resolved script body a bare token counts as a path when it EXISTS in
+ * the workspace — which is what lets `node-pg-migrate up -m migrations` reach
+ * `server/migrations`, while `up`, `-m` and `node-pg-migrate` resolve to nothing
+ * and drop out.
+ */
+function resolveNpmScripts(command, read, exists, into) {
+  const named = command.match(/--workspace[= ]([A-Za-z0-9_.@/-]+)/)?.[1];
+  if (!named) return;
+  const ws = named.startsWith('@') ? workspaceDir(named, read) : named;
+  if (!ws) return;
+  for (const m of command.matchAll(/npm\s+run\s+([A-Za-z0-9_:.-]+)/g)) {
+    let manifest;
+    try { manifest = JSON.parse(read(`${ws}/package.json`) ?? 'null'); } catch { manifest = null; }
+    const body = manifest?.scripts?.[m[1]];
+    if (typeof body !== 'string') continue;
+    for (const raw of body.split(/\s+/)) {
+      const token = raw.replace(/^['"]|['"]$/g, '');
+      if (!token || token.startsWith('-')) continue;
+      const candidate = `${ws}/${token.replace(/^\.\//, '')}`;
+      if (exists(candidate)) into.add(candidate);
+    }
+  }
+}
+
+/**
+ * Paths that can change the verdict, from the contract itself (ADR-049 D2).
+ *
+ * WHY THIS IS NOT JUST `.watson`.
+ *
+ * `contractFingerprint` digested `.watson/` alone, which left the entire
+ * head-authored half of the verdict surface unfingerprinted while the result
+ * told a reviewer that contract movement was reported. The contract NAMES a
+ * fixture script, build scripts and migrations; it does not CONTAIN them, and
+ * every one of them decides what the run observes:
+ *
+ *     server/scripts/watson-fixture.ts   builds the world the journeys assert on
+ *     server/package.json scripts        what `start`, `migrate:up` actually do
+ *     package-lock.json                  what code `npm ci` installs
+ *     server/migrations/**               the schema the fixture writes into
+ *
+ * Three sources, in descending order of how mechanical they are:
+ *
+ *   1. `.watson/` itself.
+ *   2. Paths extracted from the contract's own command strings. Mechanical, so a
+ *      contract that starts invoking a new script covers it without anyone
+ *      remembering to.
+ *   3. `verdict_bearing_paths`, declared in the contract for what extraction
+ *      cannot see — `npm run migrate:up` names no path. This is BASE-GOVERNED
+ *      (`CONFIG_AUTHORITY`), so a pull request cannot shrink the list that
+ *      decides whether its own changes are reported.
+ *
+ * `exists` is injected so this stays a pure function over the contract and one
+ * predicate — the caller decides whether "exists" means the working tree or a
+ * commit's object store.
+ */
+export function verdictBearingPaths(contract, exists = () => true, read = () => null) {
+  const paths = new Set(CONTRACT_PATHS);
+  const { world, all } = contractCommands(contract);
+
+  for (const cmd of world) resolveNpmScripts(String(cmd), read, exists, paths);
+
+  for (const cmd of all) {
+    for (const m of String(cmd).matchAll(PATH_TOKEN)) {
+      const p = m[1].replace(/^\.\//, '');
+      if (exists(p)) paths.add(p);
+    }
+    // `--workspace=server` means server/package.json decides what the command runs.
+    for (const m of String(cmd).matchAll(/--workspace[= ]([A-Za-z0-9_.-]+)/g)) {
+      const p = `${m[1]}/package.json`;
+      if (exists(p)) paths.add(p);
+    }
+  }
+
+  for (const p of INSTALL_SURFACE) if (exists(p)) paths.add(p);
+  for (const p of contract?.config?.verdict_bearing_paths ?? []) {
+    if (typeof p === 'string' && p && !p.startsWith('/') && !p.includes('..')) paths.add(p);
+  }
+
+  return [...paths].sort();
+}
+
 function treeHash(repoRoot, sha, p) {
   try {
     return git(['rev-parse', `${sha}:${p}`],
@@ -127,8 +302,41 @@ export function productFingerprint(repoRoot, sha) {
   return digest(repoRoot, sha, PRODUCT_PATHS);
 }
 
-export function contractFingerprint(repoRoot, sha) {
-  return digest(repoRoot, sha, CONTRACT_PATHS);
+/**
+ * Fingerprint the whole verdict-bearing surface, not only `.watson/`.
+ *
+ * `paths` defaults to `.watson` alone so a caller with no contract in hand still
+ * gets the old, narrower answer rather than an error — but the run passes the
+ * full set, and the set is recorded beside the digest so a reader can tell which
+ * question was asked. A fingerprint whose scope is invisible is a fingerprint
+ * nobody can check.
+ */
+export function contractFingerprint(repoRoot, sha, paths = CONTRACT_PATHS) {
+  return digest(repoRoot, sha, paths);
+}
+
+/** `true` if the path exists in that commit's tree. Used to scope the digest. */
+export function pathExistsAt(repoRoot, sha) {
+  return (p) => treeHash(repoRoot, sha, p) !== 'absent';
+}
+
+/**
+ * Read a file out of a COMMIT, never the working tree.
+ *
+ * The scope of the fingerprint has to be a fact about the revision under
+ * verification, not about whatever is currently on disk — otherwise a product
+ * could widen or narrow what gets measured by writing a file after the run
+ * started. `cat-file` is an object-store read; nothing here touches the checkout.
+ */
+export function pathReaderAt(repoRoot, sha) {
+  return (p) => {
+    try {
+      return git(['cat-file', 'blob', `${sha}:${p}`],
+        { cwd: repoRoot, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] });
+    } catch {
+      return null;
+    }
+  };
 }
 
 /**
@@ -235,13 +443,30 @@ export function resolveSha(repoRoot, ref = 'HEAD') {
  *
  * Returns null when the contract did not change.
  */
-export function contractChange(repoRoot, baseSha, headSha, loadAt) {
+export function contractChange(repoRoot, baseSha, headSha, loadAt, paths = CONTRACT_PATHS) {
   if (!baseSha) return null;
-  if (contractFingerprint(repoRoot, baseSha) === contractFingerprint(repoRoot, headSha)) return null;
+
+  // WHICH OF THE VERDICT-BEARING PATHS MOVED, path by path.
+  //
+  // A single digest answers "did anything change" and nothing else, which is not
+  // enough once the scope includes files the contract names but does not
+  // contain: a reviewer told "the contract changed" cannot tell a reworded
+  // journey from a rewritten fixture script. So each path is compared on its own
+  // and the ones that differ are named.
+  const pathsChanged = paths.filter(
+    (p) => treeHash(repoRoot, baseSha, p) !== treeHash(repoRoot, headSha, p),
+  );
+  if (!pathsChanged.length) return null;
 
   const base = loadAt(baseSha);
   const head = loadAt(headSha);
-  if (!base) return { model: 'head-product-x-head-contract', base_contract_available: false };
+  if (!base) {
+    return {
+      model: 'head-product-x-head-contract',
+      base_contract_available: false,
+      paths_changed: pathsChanged,
+    };
+  }
 
   const baseById = new Map(base.features.map((f) => [f.id, f]));
   const headById = new Map(head.features.map((f) => [f.id, f]));
@@ -296,6 +521,34 @@ export function contractChange(repoRoot, baseSha, headSha, loadAt) {
   }
   const invariantsAdded = [...hInv.keys()].filter((r) => !bInv.has(r));
 
+  // DOMAIN NARROWING, named rather than left to the generic diff below.
+  //
+  // ADR-049's own example: `enum: 14 values -> enum: 1 value` turns a
+  // verifier-chosen operand into a constant, so `expect_text: "${seasonName}"`
+  // becomes `expect_text: "Sign in"` and the assertion is vacuous. It is a
+  // one-line change in a file the pull request owns, and before this it surfaced
+  // as nothing at all.
+  for (const [profile, bp] of Object.entries(base.fixtures?.profiles ?? {})) {
+    const hp = head.fixtures?.profiles?.[profile];
+    if (!hp) { weakened.push({ id: `fixture:${profile}`, why: 'fixture profile removed' }); continue; }
+    for (const [name, bDomain] of Object.entries(domainsOf(bp))) {
+      const hDomain = domainsOf(hp)[name];
+      if (hDomain === undefined) {
+        weakened.push({ id: `fixture:${profile}.${name}`, why: 'no longer verifier-chosen' });
+        continue;
+      }
+      const bn = domainSize(bDomain);
+      const hn = domainSize(hDomain);
+      if (bn !== null && hn !== null && hn < bn) {
+        weakened.push({
+          id: `fixture:${profile}.${name}`,
+          why: `domain narrowed ${bn} -> ${hn}`
+            + (hn <= 1 ? ' — a one-member domain makes a verifier-chosen operand a constant' : ''),
+        });
+      }
+    }
+  }
+
   return {
     model: 'head-product-x-head-contract',
     base_contract_available: true,
@@ -303,9 +556,100 @@ export function contractChange(repoRoot, baseSha, headSha, loadAt) {
     features_removed: removed,
     invariants_added: invariantsAdded,
     expectations_weakened: weakened,
+    // The verdict-bearing files that differ between the two revisions, including
+    // the ones the contract names but does not contain: the fixture script, the
+    // package scripts, the lockfile, the migrations.
+    paths_changed: pathsChanged,
+    // EVERYTHING ELSE THAT MOVED.
+    //
+    // The lists above are curated: they say which changes are known weakenings.
+    // Curation is exactly what left domain narrowing invisible, so beside them
+    // is an uncurated structural diff of the two contracts. It cannot classify
+    // what it finds — a changed declaration is reported as changed, and a human
+    // decides — but it also cannot fail to notice a construct nobody anticipated.
+    changed_declarations: deepDiffPaths(canonicalContract(base), canonicalContract(head)),
     // Populated only once a run has results to compare against; see result.mjs.
     changed_sign: [],
   };
+}
+
+/** `verifier_chosen` as a name -> domain map, whatever shape it was declared in. */
+function domainsOf(profile) {
+  const out = {};
+  for (const entry of profile?.verifier_chosen ?? []) {
+    if (typeof entry === 'string') out[entry] = null;
+    else for (const [k, v] of Object.entries(entry ?? {})) out[k] = v;
+  }
+  return out;
+}
+
+/** How many values a declared domain admits, or null when it is not countable. */
+function domainSize(domain) {
+  if (Array.isArray(domain?.enum)) return domain.enum.length;
+  if (domain && typeof domain === 'object'
+      && Number.isFinite(domain.min) && Number.isFinite(domain.max)) {
+    return domain.max - domain.min + 1;
+  }
+  return null;
+}
+
+/**
+ * A contract reduced to what can decide a verdict, in a stable shape.
+ *
+ * Features become a map keyed by id, so a reordering is not a change and a
+ * renamed file is. `feature_files` is kept separately because feature SET
+ * membership is verdict-bearing in its own right: the loader globs `*.md`, so
+ * adding or removing a file changes what runs.
+ */
+export function canonicalContract(c) {
+  const features = {};
+  for (const f of c?.features ?? []) {
+    const { __body, __file, ...rest } = f;
+    void __body; void __file;
+    features[f.id ?? __file] = rest;
+  }
+  return {
+    config: c?.config ?? {},
+    fixtures: c?.fixtures ?? {},
+    identities: c?.identities ?? [],
+    invariants: c?.invariants ?? [],
+    features,
+    feature_files: (c?.features ?? []).map((f) => f.__file).sort(),
+  };
+}
+
+const MAX_DIFF_PATHS = 200;
+
+/**
+ * Dotted paths at which two plain values differ.
+ *
+ * Bounded, because this ends up in an evidence envelope: a contract rewritten
+ * wholesale would otherwise produce thousands of entries and drown the result
+ * that a reader is trying to interpret. The cap is reported as its own entry
+ * rather than silently applied.
+ */
+const CAPPED = `… more than ${MAX_DIFF_PATHS} declarations changed`;
+
+export function deepDiffPaths(a, b, prefix = '', into = []) {
+  // The marker is pushed exactly once, and once it is there nothing more is
+  // added. Guarding only inside the loop appended a marker per recursion level
+  // that unwound past the cap, so a truncated diff reported its own truncation
+  // several times over.
+  if (into.at(-1) === CAPPED) return into;
+  const plain = (v) => v !== null && typeof v === 'object';
+  if (!plain(a) || !plain(b) || Array.isArray(a) !== Array.isArray(b)) {
+    if (JSON.stringify(a ?? null) !== JSON.stringify(b ?? null)) into.push(prefix || '(root)');
+    return into;
+  }
+  if (Array.isArray(a)) {
+    if (JSON.stringify(a) !== JSON.stringify(b)) into.push(prefix || '(root)');
+    return into;
+  }
+  for (const k of [...new Set([...Object.keys(a), ...Object.keys(b)])].sort()) {
+    if (into.length >= MAX_DIFF_PATHS) { if (into.at(-1) !== CAPPED) into.push(CAPPED); break; }
+    deepDiffPaths(a[k], b[k], prefix ? `${prefix}.${k}` : k, into);
+  }
+  return into;
 }
 
 /**

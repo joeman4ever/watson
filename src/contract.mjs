@@ -142,6 +142,19 @@ export function loadContract(repoRoot) {
   if (!fs.existsSync(dir)) {
     throw new Error(`contract: ${repoRoot} has no .watson/ directory — this product is not onboarded`);
   }
+  // A SYMLINK IS REFUSED RATHER THAN FOLLOWED (ADR-049 D2).
+  //
+  // The contract is fingerprinted as the path `.watson`. If that path is a link,
+  // the bytes that are digested and the bytes that are LOADED can be different
+  // things — the digest sees a link whose target never changes, and the loader
+  // reads wherever it points. Following it also lets the contract escape the
+  // scope the fingerprint was computed over entirely.
+  if (fs.lstatSync(dir).isSymbolicLink()) {
+    throw new Error(
+      `contract: ${dir} is a symbolic link. The contract is fingerprinted as this path, so following `
+      + 'a link would digest one thing and load another. Refused rather than followed.',
+    );
+  }
 
   const config = readYaml(path.join(dir, 'config.yaml'), 'config.yaml');
   const identities = readYaml(path.join(dir, 'identities.yaml'), 'identities.yaml');

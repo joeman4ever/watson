@@ -141,6 +141,11 @@ export function buildEnvelope(run) {
     // Recorded ALWAYS; NOT consulted for carry-forward in phase 0/1.
     product_fingerprint: run.productFingerprint,
     contract_fingerprint: run.contractFingerprint,
+    // What that fingerprint covered. `.watson/` plus everything the contract
+    // NAMES but does not contain — the fixture script, the package scripts, the
+    // lockfile, the migrations (ADR-049 D2). Recorded because a digest whose
+    // scope is invisible cannot be checked by the person reading it.
+    contract_scope: run.contractScope ?? null,
     // The fingerprint pins the exact contract BYTES, which is the stronger fact.
     // The declared version is recorded beside it because it is what the engine
     // negotiated against — a reader comparing two observations wants to know the

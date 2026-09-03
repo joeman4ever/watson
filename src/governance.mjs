@@ -59,6 +59,7 @@ export const CONFIG_AUTHORITY = Object.freeze({
   contract_version: 'base',
   selection: 'base',
   generated_roots: 'base',
+  verdict_bearing_paths: 'base',
   identity: 'base',
   injected_by_engine: 'base',
   launch: 'split',
