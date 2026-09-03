@@ -462,6 +462,20 @@ export function provenSubjects(fixtureProfile) {
   return { exists, transitioned };
 }
 
+/**
+ * A route template, comparable across journeys: query string dropped, `${var}`
+ * placeholders kept.
+ *
+ * The query string is dropped on purpose. `?grade=${grantedGrade}` and
+ * `?grade=${ungrantedGrade}` are the SAME capability answering differently about
+ * two values — which is what a `domain_negative` denial is about, and it has its
+ * own obligations. What `capability` asks is whether the route exists and is
+ * reachable by somebody.
+ */
+export function routeOf(path) {
+  return String(path ?? '').split('?')[0];
+}
+
 export function validateDenialProofs(features, fixtureProfile) {
   const problems = [];
 
@@ -475,18 +489,38 @@ export function validateDenialProofs(features, fixtureProfile) {
   const chosen = new Set(normaliseChosen(fixtureProfile?.verifier_chosen ?? []).map(([n]) => n));
   const proven = provenSubjects(fixtureProfile);
 
-  for (const feature of features) {
-    const label = feature.__file ?? feature.id;
-    const positive = new Set();
-    let positiveSteps = 0;
-    for (const step of feature.steps ?? []) {
+  // POSITIVE CONTROLS ARE COUNTED ACROSS THE WHOLE RUN, NOT PER FEATURE.
+  //
+  // The obligation a positive control discharges is "this route is not simply
+  // denied to everyone" — and the identity that legitimately holds a capability
+  // is usually in a DIFFERENT journey from the one proving it is denied. The
+  // administrator reads the audit log; the no-role persona is denied it. Requiring
+  // both in one feature meant either an unsatisfiable rule or a journey rewritten
+  // to suit the checker.
+  //
+  // `features` is the RUN PLAN, not the whole map, and that is the property that
+  // keeps this from being a loophole: a control in a journey impact selection
+  // deselected is a control that does not execute, and it does not count here
+  // either. Widening this to the full map would credit a control that never ran.
+  const runPositiveVars = new Set();
+  const runPositiveRoutes = new Set();
+  let runPositiveSteps = 0;
+  for (const f of features) {
+    for (const step of f.steps ?? []) {
       for (const [key, value] of Object.entries(step)) {
         if (key === 'expect_allowed' || key === 'expect_api' || key === 'expect_json') {
-          referencedVars(value?.path, positive);
-          positiveSteps += 1;
+          referencedVars(value?.path, runPositiveVars);
+          if (typeof value?.path === 'string') runPositiveRoutes.add(routeOf(value.path));
+          runPositiveSteps += 1;
         }
       }
     }
+  }
+
+  for (const feature of features) {
+    const label = feature.__file ?? feature.id;
+    const positive = runPositiveVars;
+    const positiveSteps = runPositiveSteps;
 
     for (const [index, step] of (feature.steps ?? []).entries()) {
       if (!('expect_denied' in step)) continue;
@@ -561,11 +595,26 @@ export function validateDenialProofs(features, fixtureProfile) {
           );
         }
       } else if (cls === 'capability') {
+        // THE ROUTE ITSELF, not merely some route in the run.
+        //
+        // Measured against nsc-eval's map this is the difference between a rule
+        // that means something and one that does not: 48 of 58 denials were
+        // against routes NOTHING positively exercised. A product answering 403
+        // for every one of those sixteen routes, to every identity, passed all
+        // of them. `positiveSteps > 0` alone would have called that satisfied.
+        const route = routeOf(step.expect_denied?.path ?? '');
         if (positiveSteps === 0) {
           problems.push(
-            `${at}: \`capability\` requires the route or capability to be positively demonstrated somewhere `
-            + 'in this feature — an authorized control that SUCCEEDS. Without one, every denial here is '
-            + 'satisfied by a product that denies everything.',
+            `${at}: \`capability\` requires the route or capability to be positively demonstrated `
+            + 'by an authorized control that SUCCEEDS. This run has no positive assertion at all, so '
+            + 'every denial in it is satisfied by a product that denies everything.',
+          );
+        } else if (route && !runPositiveRoutes.has(route)) {
+          problems.push(
+            `${at}: \`capability\` names \`${route}\`, which no journey in this run reaches `
+            + 'successfully. A denial on a route nobody can reach is satisfied by a product that '
+            + 'has removed the route, denies it to everyone, or never had it. Exercise it as an '
+            + 'identity that legitimately holds the capability.',
           );
         }
         const context = [...vars].filter((v) => !positive.has(v) && !resolvedByPrecondition.has(v));

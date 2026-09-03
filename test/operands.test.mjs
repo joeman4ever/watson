@@ -375,17 +375,61 @@ describe('denial-proof classes', () => {
     assert.match(p[0], /was ALLOWED before the transition/);
   });
 
-  test('capability: the route must succeed for someone, or every denial is free', () => {
+  test('capability: with no positive assertion anywhere, every denial is free', () => {
     const noControl = validateDenialProofs(
       [f([{ expect_denied: { path: '/api/seasons/x/audit-log' }, proof: 'capability' }])], profile);
     assert.equal(noControl.length, 1);
     assert.match(noControl[0], /satisfied by a product that denies everything/);
+  });
 
-    const withControl = validateDenialProofs([f([
+  test('capability: THE ROUTE ITSELF must succeed for someone, not merely some route', () => {
+    // This rule used to be "the feature contains a positive step". Measured
+    // against nsc-eval's map, 48 of 58 denials were on routes NOTHING positively
+    // exercised — a product answering 403 for all sixteen of those routes, to
+    // every identity, passed every one. A positive on a DIFFERENT route does not
+    // establish that this route exists or is reachable by anybody.
+    const wrongRoute = validateDenialProofs([f([
       { expect_allowed: { path: '/api/seasons/x/my-scores' } },
       { expect_denied: { path: '/api/seasons/x/audit-log' }, proof: 'capability' },
     ])], profile);
-    assert.deepEqual(withControl, []);
+    assert.equal(wrongRoute.length, 1);
+    assert.match(wrongRoute[0], /no journey in this run reaches successfully/);
+
+    const rightRoute = validateDenialProofs([f([
+      { expect_allowed: { path: '/api/seasons/x/audit-log' } },
+      { expect_denied: { path: '/api/seasons/x/audit-log' }, proof: 'capability' },
+    ])], profile);
+    assert.deepEqual(rightRoute, []);
+  });
+
+  test('capability: the control may live in ANOTHER journey of the same run', () => {
+    // The identity that legitimately holds a capability is usually in a different
+    // journey from the one proving it is denied: the administrator reads the
+    // audit log, the no-role persona is denied it. Requiring both in one feature
+    // meant an unsatisfiable rule, or journeys rewritten to suit the checker.
+    const control = f([{ expect_allowed: { path: '/api/seasons/x/audit-log' } }]);
+    control.id = 'admin-controls';
+    const denial = f([{ expect_denied: { path: '/api/seasons/x/audit-log' }, proof: 'capability' }]);
+    assert.deepEqual(validateDenialProofs([control, denial], profile), []);
+  });
+
+  test('capability: a control in a DESELECTED journey does not count', () => {
+    // `validateDenialProofs` is given the run PLAN, not the whole map. A control
+    // impact selection dropped is a control that does not execute, and crediting
+    // it would make the rule a loophole rather than a check.
+    const denial = f([{ expect_denied: { path: '/api/seasons/x/audit-log' }, proof: 'capability' }]);
+    const p = validateDenialProofs([denial], profile);
+    assert.equal(p.length, 1);
+  });
+
+  test('capability: the query string is not part of the route', () => {
+    // `?grade=granted` and `?grade=ungranted` are the same capability answering
+    // differently about two values — which is what `domain_negative` is for.
+    const p = validateDenialProofs([f([
+      { expect_api: { path: '/api/x/report?grade=${grantedGrade}' } },
+      { expect_denied: { path: '/api/x/report?other=1' }, proof: 'capability' },
+    ])], profile);
+    assert.deepEqual(p, []);
   });
 });
 
