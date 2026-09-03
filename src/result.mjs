@@ -154,6 +154,26 @@ export function buildEnvelope(run) {
       base_contract_available: false,
     },
 
+    // WHICH CONTRACT DECIDED THIS VERDICT (ADR-049 F9).
+    //
+    // Before this key existed, a base-governed run was still labelled with the
+    // head's `contract_version` and `contract_fingerprint`, and the model string
+    // above said `head-product-x-head-contract` — which under D1 is simply
+    // false. A reader could not tell a governed run from an ungoverned one, and
+    // neither could `validate-result.mjs`.
+    //
+    // `authority` is the whole answer: `base` means a trusted contract governed;
+    // `none` and `bootstrap` mean nothing did, and the product claim was
+    // withheld for that reason.
+    governing_contract: run.governance
+      ? {
+          authority: run.governance.authority,
+          product_claims_permitted: run.governance.product_claims_permitted,
+          head_only_features: run.governance.head_only_features ?? [],
+          note: markerSafe(run.governance.note ?? ''),
+        }
+      : null,
+
     profile: run.profile,
     verdict,
     verdict_reason: run.verdictReason,

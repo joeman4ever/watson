@@ -13,12 +13,13 @@ import path from 'node:path';
 import url from 'node:url';
 
 import {
-  loadContract, loadContractAt, selectByProfile, withDependencies,
+  loadContract, selectByProfile, withDependencies,
   validateFeatureVars, validateEnvOwnership, validateBrowserOwnership, validateContractVersion, validateStepOrder,
   validateAssertionOperands, validateDenialProofs, fixtureValues, fixtureValueEnv, reconcileFixtureValues,
   normaliseChosen,
 } from './contract.mjs';
 import { validateProofDeclarations } from './proofs.mjs';
+import { resolveGovernance, downgradeForUngovernedContract } from './governance.mjs';
 import { productFingerprint, contractFingerprint, resolveSha, contractChange, productIdentity, changedPaths, engineProvenance } from './fingerprint.mjs';
 import { readManifest } from './manifest.mjs';
 import { runManifest } from './manifest-cli.mjs';
@@ -27,7 +28,7 @@ import * as env from './environment.mjs';
 import * as drive from './driver.mjs';
 import * as plane from './plane.mjs';
 import { evaluate, featureVerdict } from './checks.mjs';
-import { buildEnvelope, rollUp, writeResult, summary, downgradeForInexactHead } from './result.mjs';
+import { buildEnvelope, rollUp, writeResult, summary, downgradeForInexactHead, PRODUCT_CLAIMS } from './result.mjs';
 
 const HERE = path.dirname(url.fileURLToPath(import.meta.url));
 const ROOT = path.join(HERE, '..');
@@ -511,9 +512,31 @@ async function cmdVerify(args) {
   log(`\nWatson ${VERSION} — run ${runId}`);
   const headSha = resolveSha(repoRoot, args.sha ?? 'HEAD');
   const baseSha = args.base ? resolveSha(repoRoot, args.base) : null;
-  const contract = loadContract(repoRoot);
+  const headContract = loadContract(repoRoot);
+
+  // WHICH CONTRACT GOVERNS (ADR-049 D1/F3/F7).
+  //
+  // `--base-contract` names a TRUSTED materialisation of the base revision's
+  // `.watson/`, produced on the trusted side before either container starts. It
+  // is not read out of the product's own `.git`, which is mounted read-write into
+  // the product container — ordering used to save that, which is not the same as
+  // being safe.
+  //
+  // Absent, the run does not silently fall back to head governance. It runs and
+  // reports, and withholds the product claim. Same shape as the manifest: one
+  // authority, supplied by the trusted plane, no fallback to asking the product.
+  const baseContractDir = typeof args['base-contract'] === 'string' ? args['base-contract'] : null;
+  const baseContract = baseContractDir
+    ? (() => { try { return loadContract(baseContractDir); } catch { return null; } })()
+    : null;
+  const governance = resolveGovernance({
+    base: baseContract, head: headContract, baseSupplied: !!baseContractDir,
+  });
+  const contract = governance.contract;
+
   log(`  repo   ${repoRoot}`);
   log(`  head   ${headSha}`);
+  log(`  govern ${governance.authority} — ${governance.note}`);
   log(`  map    ${contract.features.length} feature(s), profile \`${profile}\`\n`);
 
   // Diff-driven impact selection when the contract declares rules AND a base
@@ -565,10 +588,15 @@ async function cmdVerify(args) {
     productFingerprint: productFingerprint(repoRoot, headSha),
     contractFingerprint: contractFingerprint(repoRoot, headSha),
     // Resolves the contract at BOTH SHAs so the diff can name what changed, not
-    // merely that something did. `loadContractAt` returns null for an unreadable
-    // or invalid base, which the diff reports as `base_contract_available: false`.
+    // merely that something did.
+    //
+    // The base side is the TRUSTED materialisation, never `git archive` out of
+    // the product's own `.git` (F3), and the head side is the head contract as
+    // authored — not the governing merge, which would diff the base against
+    // itself and report no change however much the head moved.
     contractChange: contractChange(repoRoot, baseSha, headSha, (sha) =>
-      sha === headSha ? contract : loadContractAt(repoRoot, sha)),
+      (sha === headSha ? headContract : baseContract)),
+    governance,
     // Recorded on EVERY result, pass or fail. A run that reports a SHA it did not
     // actually verify is worse than one that reports nothing.
     workingTree: productIdentity({
@@ -609,6 +637,8 @@ async function cmdVerify(args) {
   // would be extended against an obligation nobody discharges.
   const fixtureProfile = contract.fixtures.profiles?.[contract.config.launch.fixture_profile];
   const varProblems = [
+    // An unattributed contract key is a contract error, not a default.
+    ...governance.problems,
     ...validateContractVersion(contract.config),
     ...validateStepOrder(plan.map((p) => p.feature)),
     ...validateEnvOwnership(contract.config),
@@ -886,6 +916,26 @@ function accumulate(sig, evidence, pageText) {
 }
 
 function finish(runDir, run) {
+  // GOVERNING-CONTRACT GATE (ADR-049 D1).
+  //
+  // Runs BEFORE the exact-head gate, and both apply: a verdict about a commit
+  // requires that the commit is what was driven AND that the semantics used to
+  // judge it were not supplied by the thing being judged. Either one missing
+  // makes the verdict INDETERMINATE.
+  //
+  // FAIL_PRODUCT is withheld here as well as PASS, and that is deliberate. An
+  // accusation reached on semantics nobody trusted is not a better outcome than
+  // an unearned pass; it is the same defect pointed the other way.
+  if (run.verdict && run.governance) {
+    const gov = downgradeForUngovernedContract(run.verdict, run.governance, PRODUCT_CLAIMS);
+    if (gov.verdict !== run.verdict) {
+      log('');
+      log(`  ⚠ ${gov.reason}`);
+      run.verdictReason = gov.reason;
+      run.verdict = gov.verdict;
+    }
+  }
+
   // EXACT-HEAD GATE (W2). The last thing that happens before a verdict is written:
   // re-read the working tree and refuse to make a claim ABOUT THE COMMIT unless the
   // checkout still is that commit.
@@ -1023,7 +1073,7 @@ try {
     for (const k of kept) log(`  kept ${k.datname} — ${k.why}`);
     process.exit(0);
   } else {
-    log(`watson ${VERSION}\n\n  watson verify --repo <path> [--sha <ref>] [--base <ref>] [--profile poc] [--pr N] [--out <file>]\n               [--plane <url> --product-base-url <url>]\n               [--manifest <file>]\n  watson manifest --repo <path> [--sha <ref>] [--out <file>]   (TRUSTED side, before product code runs)\n  watson doctor --repo <path>\n  watson plane --repo <path> [--port 8079]\n  watson reap\n`);
+    log(`watson ${VERSION}\n\n  watson verify --repo <path> [--sha <ref>] [--base <ref>] [--profile poc] [--pr N] [--out <file>]\n               [--plane <url> --product-base-url <url>]\n               [--manifest <file>] [--base-contract <dir>]\n  watson manifest --repo <path> [--sha <ref>] [--out <file>]   (TRUSTED side, before product code runs)\n  watson doctor --repo <path>\n  watson plane --repo <path> [--port 8079]\n  watson reap\n`);
     process.exit(cmd ? 1 : 0);
   }
 } catch (err) {

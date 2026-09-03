@@ -34,10 +34,35 @@ writes it during a run.
 ```bash
 watson verify --repo /path/to/product [--sha <ref>] [--base <ref>] [--profile poc] [--pr 123] [--out <file>]
              [--plane <url> --product-base-url <url>]   # run the product in its own plane
+             [--manifest <file>]                        # trusted product identity
+             [--base-contract <dir>]                    # the contract that GOVERNS the verdict
+watson manifest --repo /path/to/product [--out <file>]  # TRUSTED side, before product code runs
 watson doctor --repo /path/to/product     # bring up, probe, tear down
 watson plane  --repo /path/to/product     # the UNTRUSTED side, inside the product container
 watson reap                               # drop orphaned watson_* databases
 ```
+
+### Two things the trusted side must supply
+
+Both have the same shape, and it is the shape that matters: **exactly one
+authority, handed in by the trusted plane, with no fallback to asking the
+product.** In both cases the fallback *was* the vulnerability.
+
+| flag | supplies | without it |
+| --- | --- | --- |
+| `--manifest` | what the product source IS | product identity cannot be established |
+| `--base-contract` | what PASS MEANS | no contract governed the run |
+
+Either missing withholds the product claim: the run executes, reports everything
+it observed, and returns `INDETERMINATE` rather than `PASS` or `FAIL_PRODUCT`.
+A verdict about a commit needs both that the commit is what was driven and that
+the thing being judged did not choose the semantics used to judge it.
+
+`--base-contract` names a directory the trusted side materialised from the base
+revision — not a path inside the product tree, and never `git archive` out of the
+product's own `.git` (ADR-049 F3). The head's contract is still loaded,
+fingerprinted, diffed and reported; it is a proposal, not the authority for its
+own verdict.
 
 Exit code is `0` for `PASS` / `PASS_WITH_ADVISORIES`, `1` otherwise. Every run
 writes `runs/<runId>/result.json` (machine) and `runs/<runId>/summary.md`
@@ -271,16 +296,31 @@ asserts the fail-closed contract instead and says so **in its own name** — it
 never silently skips, because a green tick on a security test that did nothing is
 read as proof.
 
-### What this slice does NOT close
+### What is still open
 
-Product **identity** is unchanged by this work. The exact-HEAD gate still asks the
-product's own `.git` whether the product's own tree is the commit, and three
-adversarial reviews have found four ways past that question. It is replaced
-wholesale — by a trusted content manifest, base-branch contract authority and
-verifier-chosen assertion operands — in the verification-policy slice that
-follows, under `nsc-eval` ADR-049. Splitting it out is deliberate: this slice is
-reviewable on its own, and mixing a second architectural rewrite into it is what
-made the combined change too large to review well.
+Product identity and contract authority were open when the execution-isolation
+slice merged; the verification-policy slice replaced both, under `nsc-eval`
+ADR-049 — a trusted content manifest, base-branch contract authority, and
+verifier-chosen assertion operands.
+
+What that does **not** close, stated because a verifier silent about its blind
+spots invites people to assume it has none:
+
+- **The base contract governs the semantics, not the code that builds the world.**
+  `server/scripts/watson-fixture.ts` is head-authored and is told every value the
+  verifier chose. A product that denies exactly those values and allows every
+  other one satisfies every base-governed assertion. That is ADR-049 F1: the
+  trusted proofs narrow it — the entity a denial is asserted against must be shown
+  to exist in the engine's own database — and they do not close it.
+- **Operational config keys are head-supplied.** `install`, `provision`, `build`,
+  `launch.command` and `env` must match the head's own tree or nothing runs at
+  all. They are fingerprinted and reported rather than base-governed, and the
+  keys that would reach the verifier's own side are refused outright.
+- **D1 buys "not in the same commit", not "cannot happen".** The sanctioned
+  two-step workflow — merge the contract change, then verify the product change
+  under it — is the same attack spread across two pull requests, resting on human
+  review of a `.watson/` diff. That is a real increase in cost, and it is the
+  accurate statement of what is closed (ADR-049 F12).
 
 ## Deliberately not built yet
 
@@ -294,7 +334,9 @@ Each is earned by Phase-0/1 evidence rather than assumed up front.
 
 ```text
 src/
-  cli.mjs          verify | doctor | plane | reap
+  cli.mjs          verify | manifest | doctor | plane | reap
+  governance.mjs   which contract governs the verdict (base, never head)
+  proofs.mjs       trusted precondition evidence, read from the run's own database
   plane.mjs        the untrusted side's server — executes, never decides
   exec.mjs         command execution, uid drop, environment scrubbing
   contract.mjs     .watson loader + validation + profile selection

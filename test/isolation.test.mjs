@@ -122,6 +122,29 @@ describe('a hostile repository cannot execute code through the verifier\'s git',
     assert.deepEqual(worktree, [], `non-object-store git verbs reached the product tree: ${worktree.join(', ')}`);
   });
 
+  test('the governing contract cannot be read out of the product\'s .git', () => {
+    // ADR-049 F3, structurally. `loadContractAt` used `git archive` against a
+    // repository mounted read-write into the product container, and D1 turned
+    // that from descriptive into verdict-bearing. The base contract now arrives
+    // as a trusted materialisation, and the way to keep it that way is for the
+    // module that loads contracts to have no git at all — not for a reviewer to
+    // notice the next time somebody adds one back.
+    const src = fs.readFileSync(new URL('../src/contract.mjs', import.meta.url), 'utf8');
+    // Comments explain why the absence matters; code is what must be absent.
+    const code = src.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+    assert.doesNotMatch(code, /\bgit\(/, 'src/contract.mjs invokes git');
+    assert.doesNotMatch(code, /execFileSync|spawnSync|child_process/, 'src/contract.mjs spawns a process');
+  });
+
+  test('governance decides authority from what the TRUSTED side supplied, not from the product', () => {
+    // The whole decision has to be a function of `baseSupplied` — an argument the
+    // trusted caller passes — and never of anything read out of the product tree.
+    const src = fs.readFileSync(new URL('../src/governance.mjs', import.meta.url), 'utf8');
+    const code = src.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+    assert.doesNotMatch(code, /require\(|import\s|readFileSync|existsSync|execFileSync|process\.env/,
+      'governance.mjs reads something other than its arguments');
+  });
+
   test('core.hooksPath in the product\'s own .git/config does not run', () => {
     const r = gitRepo();
     const marker = path.join(tmpdir('hooks'), 'ran');

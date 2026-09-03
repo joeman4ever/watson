@@ -4,17 +4,23 @@
 // Everything NSC-Eval-specific lives in nsc-eval/.watson/ and versions with the
 // code it describes.
 
+// THIS MODULE NO LONGER RUNS GIT, AND SHOULD NOT AGAIN.
+//
+// It used to, for one thing: `loadContractAt` exported `.watson/` at the base SHA
+// with `git archive` out of the product's own `.git` — a directory mounted
+// read-write into the product container. That was tolerable while the base
+// contract was only used to DESCRIBE a diff. ADR-049 D1 makes it decide the
+// verdict, and asking the product's repository for the contract that governs the
+// product is the same shape as asking the product's `.git` whether the product's
+// tree is clean, which three reviews got past.
+//
+// The governing contract now arrives as a trusted materialisation the trusted
+// side produced (`--base-contract`), and this module only reads directories it
+// is handed. `test/isolation.test.mjs` enforces the absence structurally.
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { ASSERTION_STEPS } from './driver.mjs';
-import { execFileSync } from 'node:child_process';
-// The hardened wrapper, so the claim that EVERY git invocation goes through it
-// is true rather than nearly true. This one reads a base-branch tree, which the
-// pull request's author does not write — but 'not exploitable today' is a worse
-// property than 'covered'.
-import { git } from './fingerprint.mjs';
 import YAML from 'yaml';
 
 /** Parse `---\nyaml\n---\nmarkdown` into { data, body }. */
@@ -839,32 +845,6 @@ export function withDependencies(selected, all) {
   return ordered;
 }
 
-/**
- * Load the contract as it stood at an arbitrary SHA, by exporting just `.watson/`
- * from that commit into a scratch directory.
- *
- * Used only for the base→head contract diff. It returns null rather than throwing
- * when the base contract cannot be read or does not validate: a run must not die
- * because a PREVIOUS commit's contract was malformed, and "unavailable" is already
- * a reported outcome.
- */
-export function loadContractAt(repoRoot, sha) {
-  let tmp;
-  try {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'watson-contract-'));
-    // `git archive` writes only what the commit contains — nothing from the
-    // working tree, so a dirty checkout cannot contaminate the base side.
-    const tar = git(['archive', '--format=tar', sha, '.watson'], {
-      cwd: repoRoot, maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    execFileSync('tar', ['-x', '-C', tmp], { input: tar, stdio: ['pipe', 'ignore', 'ignore'] });
-    return loadContract(tmp);
-  } catch {
-    return null;
-  } finally {
-    if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
-  }
-}
 
 /**
  * Environment keys the ENGINE owns. A contract that set one of these could point the
