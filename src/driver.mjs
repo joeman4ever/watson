@@ -18,16 +18,89 @@ import path from 'node:path';
 
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
-export async function launchBrowser({ executablePath, cdpPort, headless = true }) {
+/**
+ * The browser is part of the verifier, and the pages it loads come from the
+ * thing under verification.
+ *
+ * That single sentence decides this whole function. Under the threat model
+ * Watson operates in, the product controls the HTML and JavaScript Chromium
+ * executes, so an unsandboxed browser is a hole in the same boundary that
+ * protects the evidence — not a separate, lesser concern about the browser.
+ *
+ * Chromium refuses to start as root with its sandbox enabled. The response is
+ * NOT to pass `--no-sandbox`: it is to refuse to be root. Watson's product
+ * execution lives in its own container with its own unprivileged user, so the
+ * verifier never needs root to do its own job.
+ *
+ * `--no-sandbox` is deliberately absent from this file. If it is ever needed
+ * again, it needs a decision record, not a flag.
+ */
+export function browserSandbox() {
+  return !(typeof process.getuid === 'function' && process.getuid() === 0);
+}
+
+/**
+ * Chromium proper, not the headless shell.
+ *
+ * Playwright's default headless mode runs `chromium_headless_shell`, a separate
+ * binary. Measured on GitHub's runners, the two do not report the same sandbox
+ * state: full Chromium answers `chrome://sandbox` with "adequately sandboxed"
+ * and the headless shell does not answer at all. Watson cannot prove a property
+ * of a build that will not report it, and an unprovable sandbox is not one this
+ * design gets to claim — so it drives the build that reports.
+ */
+export const BROWSER_CHANNEL = 'chromium';
+
+export async function launchBrowser({ executablePath, cdpPort, headless = true, channel = BROWSER_CHANNEL } = {}) {
+  if (!browserSandbox()) {
+    throw new Error(
+      'refusing to launch the browser as root: Chromium cannot enable its sandbox as root, and the ' +
+        'pages it loads are served by the product under verification. Run the verifier as an ' +
+        'unprivileged user; product execution belongs in its own container, not in this process tree.',
+    );
+  }
   return chromium.launch({
     executablePath,
     headless,
+    // Explicit, so a caller that needs to know WHICH build it measured can say
+    // so — and so nothing silently falls back to the headless shell.
+    ...(channel ? { channel } : {}),
     args: [
       `--remote-debugging-port=${cdpPort}`,
       '--remote-debugging-address=127.0.0.1',
       '--disable-extensions',
     ],
   });
+}
+
+/**
+ * Ask Chromium what its own sandbox is doing, rather than inferring it from the
+ * absence of a flag.
+ *
+ * `chrome://sandbox` is Chromium's own status page; on Linux it reports the
+ * namespace and seccomp-bpf sandboxes and whether the layer-1 sandbox is
+ * effective. Best-effort: a Chromium build or headless mode that will not render
+ * it returns `available: false`, and the caller records that rather than
+ * inventing a claim. What the caller must NOT do is treat "no flag" as proof.
+ */
+export async function probeSandbox(browser) {
+  let ctx;
+  try {
+    ctx = await browser.newContext();
+    const page = await ctx.newPage();
+    await page.goto('chrome://sandbox', { timeout: 10_000 });
+    const text = (await page.evaluate(() => document.body.innerText)).trim();
+    return {
+      available: true,
+      // Chromium prints "You are adequately sandboxed." when layer 1 is effective.
+      effective: /adequately sandboxed/i.test(text),
+      report: text.slice(0, 2000),
+    };
+  } catch (err) {
+    return { available: false, effective: null, report: String(err.message ?? err).slice(0, 300) };
+  } finally {
+    await ctx?.close().catch(() => {});
+  }
 }
 
 /** An authenticated context + page, with always-on evidence collectors. */

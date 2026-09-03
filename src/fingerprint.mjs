@@ -12,6 +12,90 @@
 import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 
+// ---------------------------------------------------------------- safe git --
+//
+// Git is not a pure reader of a repository. Several configuration keys name
+// COMMANDS that git executes while doing ordinary work, and they can be set in a
+// repository's own `.git/config` — which, for a product checkout, is a file the
+// product writes. `core.fsmonitor` is the sharpest: git runs it during
+// `git status`, ignores its exit code, and carries on. One line in an install
+// script turns the verifier's own exactness check into arbitrary code execution
+// as the verifier.
+//
+// Demonstrated, not theorised:
+//
+//     git config core.fsmonitor /tmp/payload.sh
+//     -> workingTreeState() returns {clean: true} … and the payload ran as uid 0
+//
+// So every git invocation in this engine goes through here. Command-line `-c`
+// has the highest precedence in git's configuration order, so these win over the
+// repository config and over anything it `include`s. The environment settings
+// remove the system and global files from the picture entirely.
+//
+// SCOPE. Every git invocation in this engine goes through here, including the
+// ones behind the exact-HEAD gate, selection and the fingerprints — all of which
+// run with the product's directory as `cwd`.
+//
+// It is defence in depth, not the whole defence: a deny-list of command-valued
+// keys cannot be complete, because content filters are named by the product's own
+// `.gitattributes`. That is one of the reasons the identity gate is being
+// replaced rather than sanitised further (ADR-049); this slice hardens the calls
+// that exist today and does not pretend to have closed the class.
+//
+const SAFE_CONFIG = [
+  'core.fsmonitor=',            // a command git runs during `git status`
+  'core.hooksPath=/dev/null',   // hooks git runs on many operations
+  'core.pager=cat',
+  'core.editor=true',
+  'core.askPass=',
+  'core.sshCommand=',
+  'diff.external=',             // a command git runs to produce diffs
+  'credential.helper=',
+  'uploadpack.packObjectsHook=',
+  'protocol.ext.allow=never',
+  'protocol.file.allow=never',
+  // `refs/replace/` lives inside the .git the product owns, and git resolves
+  // objects through it by default. Without this, three product-authored lines
+  // make `ls-tree` return a tree the author wrote while `rev-parse HEAD` still
+  // reports the reviewed commit — arbitrary content at exact_head: true.
+  'core.useReplaceRefs=false',
+].flatMap((kv) => ['-c', kv]);
+
+const SAFE_ENV = {
+  GIT_CONFIG_NOSYSTEM: '1',
+  // Belt and braces with `core.useReplaceRefs=false` above.
+  GIT_NO_REPLACE_OBJECTS: '1',
+  GIT_TERMINAL_PROMPT: '0',
+  GIT_ASKPASS: '',
+  GIT_OPTIONAL_LOCKS: '0',
+};
+
+// DELIBERATELY NOT SET: GIT_CONFIG_GLOBAL=/dev/null.
+//
+// It looks like more hardening and is the opposite. The global config belongs to
+// the VERIFIER, not to the product, so it is not part of the attack surface —
+// and it is the only place `safe.directory` can be set, which is exactly what
+// makes a checkout owned by another uid readable at all. Discarding it turns
+// the intended topology (the product writes the tree, the verifier reads it)
+// into `clean: null` on every run, and therefore INDETERMINATE forever.
+//
+// What actually blocks the attack is the `-c` overrides above: command-line
+// config outranks the repository's own, which is where a hostile setting lives.
+// `safe.directory` is ignored from `-c` by git on purpose, so there is no way to
+// re-add it here — the global file has to stay in the picture.
+
+/** Run git against a repository that may be hostile. */
+export function git(args, { cwd, encoding = 'utf8', maxBuffer = 64 * 1024 * 1024, stdio } = {}) {
+  return execFileSync('git', [...SAFE_CONFIG, ...args], {
+    cwd,
+    encoding,
+    maxBuffer,
+    ...(stdio ? { stdio } : {}),
+    env: { ...process.env, ...SAFE_ENV },
+  });
+}
+
+
 /** Paths whose contents can change RUNTIME behavior of the product. */
 const PRODUCT_PATHS = [
   'client',
@@ -25,7 +109,7 @@ const CONTRACT_PATHS = ['.watson'];
 
 function treeHash(repoRoot, sha, p) {
   try {
-    return execFileSync('git', ['rev-parse', `${sha}:${p}`],
+    return git(['rev-parse', `${sha}:${p}`],
       { cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
   } catch {
     return 'absent';
@@ -65,7 +149,7 @@ export function contractFingerprint(repoRoot, sha) {
 export function workingTreeState(repoRoot) {
   let porcelain = '';
   try {
-    porcelain = execFileSync('git', ['status', '--porcelain'], {
+    porcelain = git(['status', '--porcelain'], {
       cwd: repoRoot, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024,
     });
   } catch {
@@ -90,7 +174,7 @@ export function workingTreeState(repoRoot) {
 
 /** Full 40-char lowercase hex, as the marker protocol requires. */
 export function resolveSha(repoRoot, ref = 'HEAD') {
-  const sha = execFileSync('git', ['rev-parse', ref], { cwd: repoRoot, encoding: 'utf8' }).trim();
+  const sha = git(['rev-parse', ref], { cwd: repoRoot }).trim();
   if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error(`resolved ref is not a full 40-char hex SHA: ${sha}`);
   return sha;
 }
@@ -191,10 +275,10 @@ export function contractChange(repoRoot, baseSha, headSha, loadAt) {
 export function changedPaths(repoRoot, baseSha, headSha) {
   if (!baseSha || !headSha) return null;
   try {
-    const mergeBase = execFileSync('git', ['merge-base', baseSha, headSha], {
+    const mergeBase = git(['merge-base', baseSha, headSha], {
       cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
-    const out = execFileSync('git', ['diff', '--name-only', '-z', `${mergeBase}`, headSha], {
+    const out = git(['diff', '--name-only', '-z', `${mergeBase}`, headSha], {
       cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
     });
     return out.split('\0').filter(Boolean);
@@ -222,13 +306,13 @@ export function changedPaths(repoRoot, baseSha, headSha) {
  * never stop a verification, only be recorded honestly.
  */
 export function engineProvenance(engineRoot) {
-  const git = (args) => execFileSync('git', args, {
+  const run = (args) => git(args, {
     cwd: engineRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
   }).trim();
   try {
-    const commit = git(['rev-parse', 'HEAD']);
+    const commit = run(['rev-parse', 'HEAD']);
     if (!/^[0-9a-f]{40}$/.test(commit)) return { commit: null, clean: null };
-    return { commit, clean: git(['status', '--porcelain']) === '' };
+    return { commit, clean: run(['status', '--porcelain']) === '' };
   } catch {
     // No git, or the engine was installed as a plain directory. Honest silence.
     return { commit: null, clean: null };

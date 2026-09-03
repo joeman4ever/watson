@@ -255,7 +255,40 @@ export function loadContractAt(repoRoot, sha) {
  */
 export const ENGINE_OWNED_ENV = Object.freeze([
   'WORKOS_ISSUER', 'WORKOS_CLIENT_ID', 'WORKOS_JWKS_URI', 'DATABASE_URL', 'PORT',
+  // PATH decides which binary any bare program name resolves to — including the
+  // ones the ENGINE spawns around the product's command. Defence in depth: the
+  // privilege-separation wrapper is now resolved absolutely on the trusted side,
+  // so PATH cannot redirect it, but a contract has no business setting PATH for
+  // the process tree the verifier builds either.
+  'PATH',
 ]);
+
+/**
+ * Refuse a contract that tries to choose what the VERIFIER executes.
+ *
+ * `browser.executable_path` used to be honoured, and it was arbitrary code
+ * execution as the verifier: the path went to `chromium.launch()`, which runs it
+ * on the verifier's side of the boundary, as the verifier's uid, with the
+ * verifier's unscrubbed environment — and it sat upstream of the root refusal,
+ * the channel pin and the sandbox probe, so naming a binary skipped all three.
+ *
+ * Refused rather than ignored. A key that is silently dropped reads to whoever
+ * wrote it as a key that works, and the next reader of the contract has no way to
+ * tell. The verifier's browser comes from the trusted side (`WATSON_CHROMIUM`) or
+ * from the pinned channel, and from nowhere else.
+ */
+export function validateBrowserOwnership(config) {
+  const declared = config?.browser ?? null;
+  if (!declared || typeof declared !== 'object') return [];
+  const keys = Object.keys(declared);
+  if (!keys.length) return [];
+  return [
+    `.watson/config.yaml declares \`browser\` (${keys.join(', ')}). The verifier chooses what it `
+    + 'executes; a contract cannot name the browser binary, because that binary runs on the '
+    + "verifier's side of the boundary with the verifier's privileges. Set WATSON_CHROMIUM on the "
+    + 'trusted side instead.',
+  ];
+}
 
 /** Problems with a contract's `env` block. Checked BEFORE anything is provisioned. */
 export function validateEnvOwnership(config) {
