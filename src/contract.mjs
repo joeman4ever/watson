@@ -485,6 +485,23 @@ export function validateDenialProofs(features, fixtureProfile) {
   for (const pre of fixtureProfile?.preconditions ?? []) {
     if (pre.expect?.authorized === false) continue;
     referencedVars(pre.get, resolvedByPrecondition);
+    // A NAME THE PRECONDITION PROVES WITHOUT NAMING IT IN THE URL.
+    //
+    // Not every entity has a route of its own. An unassigned group has no admin
+    // endpoint — it is reachable only as a MEMBER of the session's group list,
+    // which an administrator may read. `proves:` lets that read count as the
+    // existence evidence D5 Class 1 asks for.
+    //
+    // It is credited only when the precondition actually asserts on the value:
+    // the declaration alone would be the fixture vouching for itself, which is
+    // the thing this whole mechanism exists to stop. `doctor` runs the assertion
+    // and fails the run when the entity is not in the collection.
+    for (const name of pre.proves ?? []) {
+      const asserted = new Set();
+      referencedVars(pre.expect?.contains?.value, asserted);
+      referencedVars(pre.expect?.json, asserted);
+      if (asserted.has(name)) resolvedByPrecondition.add(name);
+    }
   }
   const chosen = new Set(normaliseChosen(fixtureProfile?.verifier_chosen ?? []).map(([n]) => n));
   const proven = provenSubjects(fixtureProfile);
@@ -551,7 +568,7 @@ export function validateDenialProofs(features, fixtureProfile) {
         if (unproven.length) {
           problems.push(
             `${at}: declares \`entity_existence\` but nothing proves ${unproven.map((v) => `\`\${${v}}\``).join(', ')} `
-            + 'exists. Reach it with a positive assertion in this feature, resolve it in a precondition '
+            + 'exists. Reach it with a positive assertion in this run, resolve it in a precondition '
             + 'as an identity permitted to see it, or declare a `trusted_setup` proof for it. An entity '
             + 'that does not exist denies exactly like one that does.',
           );

@@ -305,3 +305,102 @@ describe('doctor discharges the obligation the credit was extended against', () 
     assert.deepEqual(named(r, 'proof'), []);
   });
 });
+
+describe('a precondition may prove a name it does not put in the URL', () => {
+  // D5 Class 1 accepts "an authorized positive application read where the product
+  // intentionally exposes one". Not every entity has a route of its own: an
+  // unassigned group is reachable only as a MEMBER of the session's group list.
+  // Without this, three real denials had no way to establish their subject and
+  // would have failed closed forever.
+  const denial = [{
+    __file: 'f.yaml',
+    steps: [{ expect_denied: { path: '/api/seasons/${primarySeasonId}/groups/${unassignedGroupId}/x' }, proof: 'entity_existence' }],
+  }];
+
+  test('WITHOUT the proof, the denial is refused', () => {
+    const p = validateDenialProofs(denial, { preconditions: [] });
+    assert.equal(p.length, 1, JSON.stringify(p));
+    assert.match(p[0], /unassignedGroupId/);
+  });
+
+  test('a `proves` declaration that the precondition actually ASSERTS is credited', () => {
+    const p = validateDenialProofs(denial, {
+      preconditions: [
+        { as: 'W-ADMIN', get: '/api/seasons/${primarySeasonId}/sessions/${sessionId}/groups',
+          expect: { contains: { at: 'groups', field: 'id', value: '${unassignedGroupId}' } },
+          proves: ['unassignedGroupId'] },
+      ],
+    });
+    assert.deepEqual(p, []);
+  });
+
+  test('a `proves` declaration the precondition does NOT assert is refused', () => {
+    // The declaration alone is the fixture vouching for itself. It is credited
+    // only because `doctor` runs the assertion and fails the run without it.
+    const p = validateDenialProofs(denial, {
+      preconditions: [
+        { as: 'W-ADMIN', get: '/api/seasons/${primarySeasonId}/sessions/${sessionId}/groups',
+          expect: { count_at: 'groups', equals: 2 },
+          proves: ['unassignedGroupId'] },
+      ],
+    });
+    assert.equal(p.length, 1);
+    assert.match(p[0], /nothing proves/);
+  });
+
+  test('a precondition that expects a DENIAL proves nothing, `proves` or not', () => {
+    const p = validateDenialProofs(denial, {
+      preconditions: [
+        { as: 'W-EVALUATOR', get: '/api/seasons/${primarySeasonId}/x',
+          expect: { authorized: false, contains: { at: 'g', field: 'id', value: '${unassignedGroupId}' } },
+          proves: ['unassignedGroupId'] },
+      ],
+    });
+    assert.ok(p.some((x) => /nothing proves/.test(x)), JSON.stringify(p));
+  });
+});
+
+describe('doctor runs the `contains` assertion', () => {
+  const pre = (over = {}) => ({
+    preconditions: [{
+      as: null, get: '/api/x',
+      expect: { contains: { at: 'groups', field: 'id', value: '${unassignedGroupId}' } },
+      note: 'the unassigned group is in the session', ...over,
+    }],
+  });
+
+  test('present in the collection passes', async () => {
+    const r = await withFetch({ groups: [{ id: 'a' }, { id: 'G-2' }] },
+      () => doctor({ baseUrl: 'http://x', dbName: 'd', databaseUrl: 'postgres://u@h/d', adminToken: 't',
+        fixtureProfile: pre(), vars: { unassignedGroupId: 'G-2' } }));
+    const p = r.probes.find((x) => /unassigned group/.test(x.name));
+    assert.equal(p.ok, true, p.detail);
+  });
+
+  test('ABSENT from the collection fails — this is the case it exists for', async () => {
+    const r = await withFetch({ groups: [{ id: 'a' }] },
+      () => doctor({ baseUrl: 'http://x', dbName: 'd', databaseUrl: 'postgres://u@h/d', adminToken: 't',
+        fixtureProfile: pre(), vars: { unassignedGroupId: 'G-2' } }));
+    const p = r.probes.find((x) => /unassigned group/.test(x.name));
+    assert.equal(p.ok, false);
+    assert.match(p.detail, /does NOT contain/);
+  });
+
+  test('a response that is not a list fails rather than passing vacuously', async () => {
+    const r = await withFetch({ groups: 'nope' },
+      () => doctor({ baseUrl: 'http://x', dbName: 'd', databaseUrl: 'postgres://u@h/d', adminToken: 't',
+        fixtureProfile: pre(), vars: { unassignedGroupId: 'G-2' } }));
+    const p = r.probes.find((x) => /unassigned group/.test(x.name));
+    assert.equal(p.ok, false);
+    assert.match(p.detail, /not a list/);
+  });
+});
+
+/** Run `fn` with `fetch` answering every request with `body`. */
+async function withFetch(body, fn) {
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify(body), {
+    status: 200, headers: { 'content-type': 'application/json' },
+  });
+  try { return await fn(); } finally { globalThis.fetch = real; }
+}

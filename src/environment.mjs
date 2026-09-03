@@ -453,6 +453,21 @@ export async function doctor({
         add(label, n === pre.expect.equals, `${pre.expect.count_at} -> ${n}, expected ${pre.expect.equals}`);
         continue;
       }
+      // `contains` — the entity is IN the authorized collection this identity can
+      // read. This is what makes a product's own read path usable as existence
+      // evidence for a name that appears nowhere in a URL: an unassigned group
+      // has no admin route of its own, but it is a member of the session's group
+      // list, and an administrator may read that list.
+      if (pre.expect?.contains) {
+        const { at, field, value } = pre.expect.contains;
+        const rows = Array.isArray(r.body?.[at]) ? r.body[at] : null;
+        const want = interp(String(value ?? ''), vars ?? {});
+        const found = !!rows?.some((row) => String(row?.[field]) === want);
+        add(label, found, rows === null
+          ? `${at} is not a list in the response`
+          : `${at}[].${field} ${found ? 'contains' : 'does NOT contain'} the expected value (${rows.length} row(s))`);
+        continue;
+      }
       add(label, false, 'precondition declares no expectation');
     } catch (e) { add(label, false, e.message); }
   }
