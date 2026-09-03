@@ -11,6 +11,7 @@
 
 import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
+import { verifyAgainstManifest } from './manifest.mjs';
 
 // ---------------------------------------------------------------- safe git --
 //
@@ -131,49 +132,97 @@ export function contractFingerprint(repoRoot, sha) {
 }
 
 /**
- * Whether the checkout matches the commit it claims to be.
+ * Product identity, from the trusted manifest.
  *
- * This matters more than it looks. Every result carries a 40-char SHA and two
- * fingerprints computed FROM GIT — but the contract that executes, and the product
- * that gets built and launched, both come from the WORKING TREE. When the tree is
- * dirty those are different things, and the run reports a SHA it did not actually
- * verify.
+ * WHAT REPLACED WHAT, and why the replacement is not another patch.
  *
- * That is not hypothetical: during the Phase-1 campaign a feature file written while
- * a campaign was running was picked up mid-campaign, so runs 1-3 verified two
- * journeys and runs 4-10 verified three, all reporting the same SHA.
+ * This used to hash the working tree against the commit's object tree, and
+ * before that it read `git status`. Three adversarial reviews found four ways
+ * past those, and every one had the same shape: the check asked a directory the
+ * product writes — whose `.git` the product owns — to describe itself.
+ * `--assume-unchanged`, `git replace`, `git add`, a corrupt index, a self-hiding
+ * `.gitignore`. Patching each answer never changed who was answering.
  *
- * Watson does not refuse a dirty tree — developing against one is the normal way to
- * work — but it must never claim exact-HEAD when it cannot honour it.
+ * The expectation now comes from `src/manifest.mjs`, written by the trusted
+ * orchestration from the trusted commit before any product code runs. Nothing
+ * here consults the product's `.git` at all.
+ *
+ * NO MANIFEST, NO PRODUCT CLAIM. A run that was not given one cannot establish
+ * identity, and says so rather than falling back to asking git — the fallback
+ * WAS the vulnerability. It costs a command locally (`watson manifest`) and buys
+ * the property that there is exactly one authority for product source identity.
+ *
+ * The shape of the return value is unchanged so that consumers reading
+ * `working_tree.exact_head` keep working; `method` says which authority spoke.
  */
-export function workingTreeState(repoRoot) {
-  let porcelain = '';
-  try {
-    porcelain = git(['status', '--porcelain'], {
-      cwd: repoRoot, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024,
-    });
-  } catch {
-    return { clean: null, exact_head: false, dirty_paths: [], contract_dirty: false,
-      note: 'git status failed; exact-HEAD cannot be established' };
+export function productIdentity({ repoRoot, manifest = null, expectedSha = null, generatedRoots = [] }) {
+  if (!manifest) {
+    return {
+      clean: null, exact_head: false, dirty_paths: [], dirty_count: 0, contract_dirty: false,
+      head_sha: null, expected_sha: expectedSha, head_matches: null, method: 'no-manifest',
+      note: 'no trusted manifest was supplied, so product identity cannot be established. '
+        + 'Build one with `watson manifest` from a checkout the product has not run in.',
+    };
   }
-  const paths = porcelain.split('\n').map((l) => l.slice(3).trim()).filter(Boolean);
-  const contractDirty = paths.some((p) => p.startsWith('.watson/'));
+
+  const headMatches = expectedSha ? manifest.sha === expectedSha : null;
+  if (headMatches === false) {
+    return {
+      clean: null, exact_head: false, dirty_paths: [], dirty_count: 0, contract_dirty: false,
+      head_sha: manifest.sha, expected_sha: expectedSha, head_matches: false, method: 'manifest',
+      note: `the manifest describes ${manifest.sha}, but this run is about ${expectedSha}`,
+    };
+  }
+
+  let result;
+  try {
+    result = verifyAgainstManifest(repoRoot, manifest, { generatedRoots });
+  } catch (err) {
+    return {
+      clean: null, exact_head: false, dirty_paths: [], dirty_count: 0, contract_dirty: false,
+      head_sha: manifest.sha, expected_sha: expectedSha, head_matches: headMatches, method: 'failed',
+      note: `the product tree could not be compared against the manifest: ${err.message.slice(0, 200)}`,
+    };
+  }
+
+  const contractDirty = result.divergent.some((p) => p.startsWith('.watson/'));
   return {
-    clean: paths.length === 0,
-    exact_head: paths.length === 0,
-    dirty_paths: paths.slice(0, 20),
-    dirty_count: paths.length,
+    clean: result.matches,
+    exact_head: result.matches && headMatches !== false,
+    dirty_paths: result.divergent.slice(0, 20),
+    dirty_count: result.divergent.length,
+    // WHAT WAS EXEMPTED, and how much. `generated_roots` is read from the
+    // PRODUCT's own `.watson/config.yaml`, so a pull request declaring
+    // `- server/src` can have its build write new source files that this check
+    // then reports as no divergence at all. That is a real hole (watson#7 C1)
+    // and it is not closed by recording it — but it WAS previously invisible:
+    // the result carried the integer `counts.generated` and not one root name,
+    // and the summary printed identity detail only on an inexact head. A reader
+    // could not see that anything had been exempted, let alone what. Recorded
+    // here so the hole is at least legible while its governance is decided.
+    generated_roots: result.generated_roots ?? [],
+    generated_count: result.counts?.generated ?? 0,
     contract_dirty: contractDirty,
-    note: paths.length === 0
-      ? 'checkout matches the reported SHA'
+    head_sha: manifest.sha,
+    expected_sha: expectedSha,
+    head_matches: headMatches,
+    method: 'manifest',
+    counts: result.counts,
+    note: result.matches
+      ? 'the product tree matches the trusted manifest for the reported commit'
       : contractDirty
-        ? 'the CONTRACT differs from the reported SHA — this run verified something else'
-        : 'the product tree differs from the reported SHA',
+        ? 'the CONTRACT differs from the trusted manifest — this run verified something else'
+        : 'the product tree differs from the trusted manifest for the reported commit',
   };
 }
 
 /** Full 40-char lowercase hex, as the marker protocol requires. */
 export function resolveSha(repoRoot, ref = 'HEAD') {
+  // A value that is ALREADY a full commit id is returned as given, and git is
+  // never consulted. The trusted orchestration knows which commit it materialised,
+  // and the tree it hands over needs no `.git` at all — asking git anyway made
+  // the documented topology impossible to run.
+  if (/^[0-9a-f]{40}$/.test(ref)) return ref;
   const sha = git(['rev-parse', ref], { cwd: repoRoot }).trim();
   if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error(`resolved ref is not a full 40-char hex SHA: ${sha}`);
   return sha;

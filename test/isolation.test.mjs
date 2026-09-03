@@ -81,26 +81,45 @@ describe('a hostile repository cannot execute code through the verifier\'s git',
     assert.equal(fs.existsSync(marker), false, 'the product executed a command as the verifier');
   });
 
-  test('a .gitattributes content filter neither runs nor hides a modification', () => {
-    // The concession in the hardened wrapper is that a deny-list of config keys
-    // cannot cover content filters, because the product names those in its own
-    // `.gitattributes`. This establishes that the concession is not load-bearing:
-    // the identity check never asks git to compare content, so no filter is
-    // invoked and none can launder a modified file into looking unchanged.
-    const r = gitRepo();
-    const marker = path.join(tmpdir('filter'), 'ran');
-    const filter = path.join(r.dir, 'filter.sh');
-    fs.writeFileSync(filter, `#!/bin/sh\necho ran > ${JSON.stringify(marker).slice(1, -1)}\ncat > /dev/null; echo 'console.log(1);'\n`);
-    fs.chmodSync(filter, 0o755);
-    fs.writeFileSync(path.join(r.dir, '.gitattributes'), 'app.js filter=launder\n');
-    r.git('add', '-A');
-    r.git('commit', '-qm', 'attributes');
-    r.git('config', 'filter.launder.clean', filter);
-    r.git('config', 'filter.launder.smudge', filter);
-    fs.writeFileSync(path.join(r.dir, 'app.js'), 'console.log("tampered");\n');
+  // A `.gitattributes` content filter is the one thing the hardened wrapper's
+  // deny-list provably cannot cover: filters are named by the product's own
+  // attributes file, so there is no finite set of `-c` overrides that stops them.
+  //
+  // The test that used to sit here asserted the concession was "not load-bearing"
+  // and PASSED BY ACCIDENT. It tampered with `console.log(1);` (15 bytes) by
+  // writing `console.log("tampered");` (25 bytes); git decides "modified" from
+  // stat data when the size differs and never converts the content, so the filter
+  // never ran. At equal length it runs — reproduced, as uid 0:
+  //
+  //     shipped tampering (15 -> 25 bytes):  filter ran? no
+  //     equal length      (15 -> 15 bytes):  filter ran? YES  ("ran as uid 0")
+  //
+  // It is closed here by construction rather than by another deny-list entry: no
+  // trusted-side call reads the working tree any more, because product identity
+  // comes from the manifest. This test asserts that property directly, so it fails
+  // the moment someone reintroduces a working-tree read — which is the only way
+  // the filter vector can come back.
+  test('no trusted-side git call reads the working tree', () => {
+    // Verbs that make git convert file content (and therefore run a clean filter).
+    // `status`, `diff` without two commits, `add`, `stash`, `checkout`, `archive`
+    // of a worktree — all read what is on disk.
+    const WORKTREE_READING = /git\(\[\s*'(status|add|stash|checkout|commit)'/;
+    for (const file of ['../src/fingerprint.mjs', '../src/contract.mjs', '../src/cli.mjs',
+      '../src/environment.mjs', '../src/exec.mjs']) {
+      const src = fs.readFileSync(new URL(file, import.meta.url), 'utf8');
+      assert.doesNotMatch(src, WORKTREE_READING,
+        `${file} runs a working-tree-reading git verb against a product-controlled tree; `
+        + 'a `.gitattributes` filter would execute as the verifier');
+    }
+  });
 
-    safeGit(['status', '--porcelain'], { cwd: r.dir });
-    assert.equal(fs.existsSync(marker), false, 'a product-named filter ran as the verifier');
+  test('the surviving git verbs are object-store reads only', () => {
+    const src = fs.readFileSync(new URL('../src/fingerprint.mjs', import.meta.url), 'utf8');
+    const verbs = [...src.matchAll(/git\(\[\s*'([a-z-]+)'/g)].map((m) => m[1]);
+    assert.ok(verbs.length > 0, 'expected to find git invocations');
+    const OBJECT_STORE = new Set(['rev-parse', 'merge-base', 'diff', 'ls-tree', 'cat-file', 'archive']);
+    const worktree = verbs.filter((v) => !OBJECT_STORE.has(v));
+    assert.deepEqual(worktree, [], `non-object-store git verbs reached the product tree: ${worktree.join(', ')}`);
   });
 
   test('core.hooksPath in the product\'s own .git/config does not run', () => {
