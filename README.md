@@ -232,9 +232,9 @@ to be root, never to pass `--no-sandbox`. `launchBrowser` throws as root, the
 flag appears nowhere in `src/`, and a test greps for it. Those parts hold.
 
 > **THE SANDBOX WAS NOT ENGAGED FOR THE WHOLE LIFE OF THIS PROJECT, AND THIS
-> SECTION USED TO SAY IT WAS.** The cause is found and fixed; the real-topology
-> proof is what settles it, and until that job is green this repository does not
-> claim a sandboxed browser.
+> SECTION USED TO SAY IT WAS.** The cause is found, fixed, and established by an
+> executed proof in the real container topology — see *Established* below. The
+> history is kept because the way it was claimed matters more than the fix.
 
 #### What was claimed, what was true, and why
 
@@ -325,13 +325,35 @@ default profile was the thing forbidding Chromium's namespace sandbox rested on
 the same vacuous measurement. Whether it is necessary is a separate question, to
 be answered by measurement rather than by removing it and seeing.
 
-**What is established, and where.** The fix was measured as an unprivileged user
-against Chromium 131, going from *NOT adequately sandboxed* to *adequately
-sandboxed* with `chromiumSandbox` as the only variable — but that was not the
-verifier's container, and a sandbox proven somewhere else is not a sandbox. The
-CI job in `.github/workflows/ci.yml` runs the same proof in the pinned image
-under the observer's own container options, and it is the only thing that settles
-this. Until it is green, this repository does not claim a sandboxed browser.
+#### Established
+
+A sandbox proven somewhere else is not a sandbox, so the diagnosis measurement
+above settles nothing on its own. `.github/workflows/ci.yml` runs the same proof
+in the pinned image, under the observer's own container options, as uid 1000.
+At `0963a53` (watson#9), verbatim:
+
+```text
+Watson browser sandbox proof — uid 1000, linux
+
+  ✓ running unprivileged (uid 1000)
+  ✓ the container PERMITS unprivileged user namespaces
+  · headless shell (Playwright default): 1 renderer(s), seccomp=2 on 1,
+    namespace-isolated 1 (by user+pid+net), chrome://sandbox not reportable
+  · chromium proper (channel: chromium): 2 renderer(s), seccomp=2 on 2,
+    namespace-isolated 2 (by user+pid+net), chrome://sandbox EFFECTIVE
+  ✓ no renderer of any measured build carries --no-sandbox (3 renderer(s) inspected)
+  ✓ 2/2 renderer(s) report Seccomp: 2 (seccomp-bpf) [chromium proper]
+  ✓ every renderer reports NoNewPrivs: 1
+  ✓ chrome://sandbox reports the layer-1 sandbox EFFECTIVE [chromium proper]
+  ✓ corroborated: 2/2 renderer(s) namespace-isolated by user+pid+net
+
+  SANDBOX PROVEN: non-root browser; namespace sandbox and seccomp-bpf both engaged.
+```
+
+Same image, same seccomp profile, same `no-new-privileges`, same
+`--cap-drop=NET_RAW`, same non-root uid as before the fix. **Nothing was
+weakened to get here**, and the run is the per-commit gate, so a regression is a
+red build rather than a conversation nobody has.
 
 #### What the proof does establish
 
@@ -344,6 +366,7 @@ user in the pinned container image and measures, independently:
 | no `--no-sandbox` | the **argv of every renderer it started**, read from `/proc/<pid>/cmdline` — not a grep of our source, which is what made this check vacuous |
 | seccomp filter attached | `Seccomp: 2` and `NoNewPrivs: 1` in the renderer's `/proc/<pid>/status` — **supporting telemetry, not proof of Chromium's own sandbox** |
 | Chromium's own sandbox | `chrome://sandbox` reporting *adequately sandboxed* — **authoritative** |
+| corroboration | the renderer's `/proc/<pid>/ns/{user,pid,net}` differing from the verifier's — read as corroboration, never as the test |
 
 Chromium's self-report is authoritative because Chromium knows which mechanism
 it chose and whether it came up. An earlier version of this proof demanded a
@@ -352,12 +375,13 @@ called adequately sandboxed; the lesson taken from that was to trust the
 self-report, which was right — the error was reading a field derived from it
 with a predicate that could not express "no".
 
-**Watson drives Chromium proper, not Playwright's default headless shell.** On
-the build measured when this was decided, the headless shell did not answer
-`chrome://sandbox` at all, and a sandbox this design cannot prove is not one it
-gets to claim. (A later build was observed to answer it. The channel stays
-explicit regardless: the point is that the engine drives a build whose sandbox it
-can read, not that one particular build is mute.)
+**Watson drives Chromium proper, not Playwright's default headless shell.** In
+the pinned build the headless shell still does not answer `chrome://sandbox`
+(`not reportable` in the transcript above), and a sandbox this design cannot
+prove is not one it gets to claim. A newer build was observed to answer it
+elsewhere; the channel stays explicit regardless, because the point is that the
+engine drives a build whose sandbox it can *read*, not that one particular build
+is mute.
 
 The proof reads `/proc/<pid>/cmdline` **tokenised on NUL *and* whitespace**.
 Chromium rewrites its own process title, so a renderer's whole command line
