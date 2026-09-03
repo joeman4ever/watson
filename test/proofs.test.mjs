@@ -404,3 +404,39 @@ async function withFetch(body, fn) {
   });
   try { return await fn(); } finally { globalThis.fetch = real; }
 }
+
+describe('YAML `null` is the predicate the author wrote', () => {
+  // `requires: { revoked_at: null }` is the natural way to say "this column is
+  // null", and YAML makes it the null VALUE, not the string. The declaration was
+  // rejected as an unknown predicate. Found by running the validator against
+  // nsc-eval's real contract; the unit tests had only ever passed the string
+  // form the JavaScript API uses.
+  const decl = (requires) => ({
+    proofs: [{ type: 'state_transition', source: 'trusted_setup', subject: 'expiredGrade',
+      probe: { table: 'g', column: 'grade', requires } }],
+  });
+
+  test('a YAML null predicate is accepted', () => {
+    assert.deepEqual(validateProofDeclarations(decl({ expires_at: 'in_past', revoked_at: null }), ['expiredGrade']), []);
+  });
+
+  test('and builds an IS NULL clause', () => {
+    assert.equal(
+      existenceSql({ table: 'g', column: 'grade', requires: { expires_at: 'in_past', revoked_at: null } }),
+      'SELECT 1 FROM g WHERE grade = $1 AND expires_at < now() AND revoked_at IS NULL LIMIT 1');
+  });
+
+  test('a genuinely unknown predicate is still refused', () => {
+    const p = validateProofDeclarations(decl({ revoked_at: 'sometimes' }), ['expiredGrade']);
+    assert.equal(p.length, 1);
+    assert.match(p[0], /unknown predicate/);
+  });
+
+  test('undefined is NOT quietly treated as null', () => {
+    // A missing key never reaches the loop — it is absent from `Object.entries`.
+    // An explicitly undefined one is a mistake, not a declaration.
+    const p = validateProofDeclarations(decl({ revoked_at: undefined }), ['expiredGrade']);
+    assert.equal(p.length, 1);
+    assert.match(p[0], /unknown predicate/);
+  });
+});

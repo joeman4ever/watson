@@ -76,6 +76,23 @@ const SAFE_IDENTIFIER = /^[a-z_][a-z0-9_]{0,62}$/;
 export const REQUIRE_PREDICATES = Object.freeze(['not_null', 'null', 'in_past', 'in_future']);
 
 /**
+ * The predicate a contract MEANT, as opposed to what YAML made of it.
+ *
+ * `requires: { revoked_at: null }` is the natural way to write "this column is
+ * null", and YAML parses it to the null VALUE rather than the string `"null"`.
+ * The declaration was rejected as an unknown predicate, which is a footgun in the
+ * contract language rather than a mistake by its author — found by running the
+ * validator against nsc-eval's real contract, not by the unit tests, which had
+ * only ever passed the string form the JavaScript API uses.
+ *
+ * A missing key never reaches here: it is absent from `Object.entries`. So JS
+ * `null` unambiguously means the author wrote `null`.
+ */
+function predicateOf(pred) {
+  return pred === null ? 'null' : pred;
+}
+
+/**
  * Problems with a profile's `proofs` block. Pure; runs before anything is
  * provisioned.
  */
@@ -118,7 +135,8 @@ export function validateProofDeclarations(fixtureProfile, verifierChosenNames = 
             );
           }
         }
-        for (const [col, pred] of Object.entries(probe.requires ?? {})) {
+        for (const [col, raw] of Object.entries(probe.requires ?? {})) {
+          const pred = predicateOf(raw);
           if (!SAFE_IDENTIFIER.test(col)) {
             problems.push(`${at}: probe requires an unsafe column name \`${col}\``);
           }
@@ -148,7 +166,8 @@ export function existenceSql(probe) {
     throw new Error('existenceSql: refusing to build a query from an unvalidated identifier');
   }
   const clauses = [`${probe.column} = $1`];
-  for (const [col, pred] of Object.entries(probe.requires ?? {})) {
+  for (const [col, raw] of Object.entries(probe.requires ?? {})) {
+    const pred = predicateOf(raw);
     if (!SAFE_IDENTIFIER.test(col)) throw new Error(`existenceSql: unsafe column \`${col}\``);
     if (pred === 'not_null') clauses.push(`${col} IS NOT NULL`);
     else if (pred === 'null') clauses.push(`${col} IS NULL`);
@@ -188,7 +207,7 @@ export async function runTrustedProofs(query, fixtureProfile, vars) {
       const { rows } = await query(existenceSql(p.probe), [String(value)]);
       record.established = rows.length > 0;
       record.detail = record.established
-        ? `${p.probe.table}.${p.probe.column} = the verifier's value${Object.keys(p.probe.requires ?? {}).length ? `, with ${Object.entries(p.probe.requires).map(([c, k]) => `${c} ${k}`).join(' and ')}` : ''}`
+        ? `${p.probe.table}.${p.probe.column} = the verifier's value${Object.keys(p.probe.requires ?? {}).length ? `, with ${Object.entries(p.probe.requires).map(([c, k]) => `${c} ${predicateOf(k)}`).join(' and ')}` : ''}`
         : `no row in ${p.probe.table} where ${p.probe.column} is the verifier's value`;
     } catch (err) {
       record.detail = `probe failed: ${String(err.message ?? err).slice(0, 200)}`;
