@@ -277,3 +277,89 @@ describe('expect_reached', () => {
     });
   }
 });
+
+// ---------------------------------------------------------------------------
+// EVERY step's operands are interpolated, whatever shape the step takes.
+//
+// The defect this exists for: `runStep` interpolated only string-shaped
+// arguments, so `expect_text_in: { selector, text: "${grantedCohortSize}" }`
+// compared against the LITERAL `${grantedCohortSize}` and could never pass.
+// Watson accused a correct product on every run for as long as that step
+// existed. A per-handler rule is one a handler can forget; this is the property.
+
+describe('step operands are interpolated at any depth', () => {
+  test('a nested string is resolved', () => {
+    assert.deepEqual(
+      drive.interpDeep({ selector: 'testid=x', text: '${size}' }, { size: 14 }),
+      { selector: 'testid=x', text: '14' });
+  });
+
+  test('non-strings pass through untouched — `max: 0` stays a number', () => {
+    const out = drive.interpDeep({ selector: 's', max: 0, on: false, list: ['${a}', 2] }, { a: 'A' });
+    assert.deepEqual(out, { selector: 's', max: 0, on: false, list: ['A', 2] });
+    assert.equal(typeof out.max, 'number');
+  });
+
+  test('an unresolved name still throws rather than asserting against a literal', () => {
+    assert.throws(() => drive.interpDeep({ text: '${nope}' }, {}), /could not be resolved/);
+  });
+
+  test('THE JOIN, on the step that actually broke: `expect_text_in`', async () => {
+    // `expect_reached` interpolates its own path, so driving THAT proves nothing
+    // about the boundary — the first version of this test used it and the
+    // negative control stayed green. `expect_text_in` is the handler that does
+    // NOT self-interpolate, and is the one that was comparing against a literal
+    // `${grantedCohortSize}` on every run.
+    const page = { getByTestId: () => ({ first: () => ({ innerText: async () => 'Cohort 14 players' }) }) };
+    const ctx = { page, evidence: { requests: [] }, vars: { grantedCohortSize: 14 }, timeout: 2000 };
+    const out = await drive.runStep(
+      { expect_text_in: { selector: 'testid=prospective-cohort', text: '${grantedCohortSize}' } }, ctx);
+    assert.match(out, /14/);
+  });
+
+  test('and it FAILS when the element does not contain the resolved value', async () => {
+    const page = { getByTestId: () => ({ first: () => ({ innerText: async () => 'Cohort 9 players' }) }) };
+    const ctx = { page, evidence: { requests: [] }, vars: { grantedCohortSize: 14 }, timeout: 1000 };
+    await assert.rejects(() => drive.runStep(
+      { expect_text_in: { selector: 'testid=prospective-cohort', text: '${grantedCohortSize}' } }, ctx));
+  });
+
+  test('THE JOIN: `runStep` actually uses it on an object-shaped step', async () => {
+    // The first version of this suite tested `interpDeep` alone, and the
+    // negative control stayed green when `runStep` was reverted to the broken
+    // string-only rule — a module that is correct and nothing calls it, which is
+    // the failure mode this project has now produced three times. Drive the real
+    // entry point and read back what was actually requested.
+    const srv = http.createServer((_req, res) => { res.writeHead(200); res.end('{}'); });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    const base = `http://127.0.0.1:${srv.address().port}`;
+    const ctx = {
+      page: { request: { get: async (p) => {
+        const r = await fetch(new URL(p, base));
+        return { status: () => r.status };
+      } } },
+      evidence: { requests: [] },
+      vars: { seasonId: 'SEASON-7' },
+    };
+    try {
+      await drive.runStep({ expect_reached: { path: '/api/seasons/${seasonId}/x' } }, ctx);
+      assert.equal(ctx.evidence.requests[0].path, '/api/seasons/SEASON-7/x');
+    } finally { srv.close(); }
+  });
+
+  test('PROPERTY: no `${...}` survives interpolation, in any shape a step can take', () => {
+    // Enumerated programmatically rather than by listing the handlers I happen
+    // to remember — which is exactly how the original defect survived review.
+    const shapes = [
+      '${a}',
+      { text: '${a}' },
+      { path: '/x/${a}?q=${b}' },
+      { selector: 's', text: '${a}', nested: { deep: ['${b}', { deeper: '${a}' }] } },
+      ['${a}', '${b}'],
+    ];
+    for (const shape of shapes) {
+      const out = JSON.stringify(drive.interpDeep(shape, { a: '1', b: '2' }));
+      assert.ok(!out.includes('${'), `unresolved operand survived: ${out}`);
+    }
+  });
+});

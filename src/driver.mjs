@@ -202,7 +202,24 @@ export async function runStep(step, ctx) {
   const kind = Object.keys(step).find((k) => STEPS.includes(k));
   if (!kind) throw new Error(`unknown step: ${JSON.stringify(step)}`);
   const raw = step[kind];
-  const arg = typeof raw === 'string' ? interp(raw, vars) : raw;
+  // INTERPOLATE THE WHOLE ARGUMENT, not only the string-shaped ones.
+  //
+  // This used to be `typeof raw === 'string' ? interp(raw, vars) : raw`, so an
+  // object-shaped step got its fields raw and each handler had to remember to
+  // interpolate its own. `expect_text_in` did not, and the consequence is the
+  // reason this is a property fix rather than a one-line one:
+  //
+  //     expect_text_in: { selector: "testid=prospective-cohort",
+  //                       text: "${grantedCohortSize}" }
+  //
+  // compared the element's text against the LITERAL `${grantedCohortSize}`. The
+  // assertion could never pass. It had been an `expect_text` string — correctly
+  // interpolated — until a commit on this branch scoped it to an element, and
+  // from that commit Watson accused a correct product on every run.
+  //
+  // Interpolating at the boundary means no future step kind can forget, and an
+  // unresolved `${name}` still throws rather than asserting against a literal.
+  const arg = interpDeep(raw, vars);
   const note = step.note ? ` (${step.note})` : '';
 
   switch (kind) {
@@ -489,6 +506,23 @@ export async function runStep(step, ctx) {
  * There is no safe default here. An expectation whose operand could not be
  * resolved is not an expectation, so the run says so.
  */
+/**
+ * `interp` over every string in a value, at any depth.
+ *
+ * Non-strings pass through untouched, so `max: 0` stays a number and a selector
+ * with no `${}` in it is unchanged. There is no shape a step can take that this
+ * misses, which is the point: the previous rule was per-handler and a handler
+ * forgot.
+ */
+export function interpDeep(value, vars) {
+  if (typeof value === 'string') return interp(value, vars);
+  if (Array.isArray(value)) return value.map((v) => interpDeep(v, vars));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, interpDeep(v, vars)]));
+  }
+  return value;
+}
+
 export function interp(str, vars) {
   return String(str).replace(/\$\{(\w+)\}/g, (_, k) => {
     const v = vars?.[k];
