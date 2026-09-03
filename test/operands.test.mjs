@@ -350,6 +350,32 @@ describe('denial-proof classes', () => {
     assert.deepEqual(proven, []);
   });
 
+  test('entity_existence: reaching it POSITIVELY satisfies it, in any journey of the run', () => {
+    // Restored by the #7 -> slice1+slice2 reconciliation. The monolith had
+    // `reaching it positively in the same feature satisfies it`; the behaviour
+    // survived the split and the test did not. It is run-wide now, not
+    // per-feature, so both shapes are asserted.
+    const sameFeature = validateDenialProofs([f([
+      { expect_api: { path: '/api/a/${otherGroupId}' } },
+      { expect_denied: { path: '/api/a/${otherGroupId}' }, proof: 'entity_existence' },
+    ])], profile);
+    assert.deepEqual(sameFeature, []);
+
+    const control = feature('control', [{ expect_api: { path: '/api/a/${otherGroupId}' } }]);
+    const denial = feature('denial', [
+      { expect_denied: { path: '/api/a/${otherGroupId}' }, proof: 'entity_existence' },
+    ]);
+    assert.deepEqual(validateDenialProofs([control, denial], profile), []);
+  });
+
+  test('entity_existence: a precondition that RESOLVES it satisfies it', () => {
+    // The other half of the same restored pair. This is the route D5 Class 1
+    // calls preferred — an authorized application read — and it is the only
+    // option where the identity under test must NOT be able to see the entity.
+    assert.deepEqual(validateDenialProofs(
+      [f([{ expect_denied: { path: '/api/a/${provenGroupId}' }, proof: 'entity_existence' }])], profile), []);
+  });
+
   test('domain_negative: needs a verifier-chosen value and a working sibling', () => {
     const noSibling = validateDenialProofs(
       [f([{ expect_denied: { path: '/api/x?grade=${ungrantedGrade}' }, proof: { class: 'domain_negative' } }])], profile);
