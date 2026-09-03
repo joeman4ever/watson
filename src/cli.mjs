@@ -29,7 +29,8 @@ import * as env from './environment.mjs';
 import * as drive from './driver.mjs';
 import * as plane from './plane.mjs';
 import { evaluate, featureVerdict } from './checks.mjs';
-import { buildEnvelope, runVerdict, writeResult, summary, downgradeForInexactHead, PRODUCT_CLAIMS } from './result.mjs';
+import { buildEnvelope, runVerdict, writeResult, summary, downgradeForInexactHead,
+  WITHHELD_WITHOUT_GOVERNANCE } from './result.mjs';
 
 const HERE = path.dirname(url.fileURLToPath(import.meta.url));
 const ROOT = path.join(HERE, '..');
@@ -893,7 +894,7 @@ async function cmdVerify(args) {
 
     // The run-level verdict, decided in one place that has its own tests.
     // `plan` is what was SELECTED; `features` is what actually executed.
-    const roll = runVerdict({ executed: features, plan });
+    const roll = runVerdict({ executed: features, plan, applicable: selection.applicable });
     const { notAttempted } = roll;
 
     if (notAttempted.length) {
@@ -956,7 +957,7 @@ function finish(runDir, run) {
   // accusation reached on semantics nobody trusted is not a better outcome than
   // an unearned pass; it is the same defect pointed the other way.
   if (run.verdict && run.governance) {
-    const gov = downgradeForUngovernedContract(run.verdict, run.governance, PRODUCT_CLAIMS);
+    const gov = downgradeForUngovernedContract(run.verdict, run.governance, WITHHELD_WITHOUT_GOVERNANCE);
     if (gov.verdict !== run.verdict) {
       log('');
       log(`  ⚠ ${gov.reason}`);

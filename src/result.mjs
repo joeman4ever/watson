@@ -44,6 +44,27 @@ const OBLIGATION = {
 export const PRODUCT_CLAIMS = new Set(['PASS', 'PASS_WITH_ADVISORIES', 'FAIL_PRODUCT']);
 
 /**
+ * Verdicts an UNGOVERNED run may not reach.
+ *
+ * Wider than `PRODUCT_CLAIMS`, and the difference is the whole point.
+ * `NOT_APPLICABLE` is not a statement about Watson — it says *this revision
+ * needed no verification*, which is a claim about the revision, decided by the
+ * contract's `selection` rules.
+ *
+ * When nothing governs the run those rules come from the PULL REQUEST. A head
+ * contract declaring `ignorable: ["**"]` with empty `runtime_roots` then makes
+ * every change non-runtime, the run drives zero journeys, and it reports
+ * `NOT_APPLICABLE` with `obligation: satisfied` — indistinguishable from a
+ * correct skip, while the product chose the semantics that produced it.
+ *
+ * Demonstrated by independent adversarial review with a full engine run: a diff
+ * touching `identity/enforcement.ts`, an auth guard and a repository was
+ * "positively established as non-runtime", 0 journeys, exit 0, and the trusted
+ * validator accepted it.
+ */
+export const WITHHELD_WITHOUT_GOVERNANCE = new Set([...PRODUCT_CLAIMS, 'NOT_APPLICABLE']);
+
+/**
  * A product claim requires that the source driven actually IS the revision
  * reported (Phase-1 defect W2, now a standing invariant).
  *
@@ -139,7 +160,23 @@ export function rollUp(features) {
  * fails its contract or its environment leaves its dependants just as unable to
  * execute meaningfully.
  */
-export function runVerdict({ executed = [], plan = [] } = {}) {
+export function runVerdict({ executed = [], plan = [], applicable = true } = {}) {
+  // SELECTED, APPLICABLE, AND NOTHING TO RUN IS A CONTRACT FAULT.
+  //
+  // `rollUp([])` answers `NOT_APPLICABLE`, which is right for a run that
+  // decided up front there was nothing to verify — and wrong for one that
+  // decided there WAS and then found no journeys: an escalation profile with no
+  // members, a profile fallback matching nothing. That run drove nothing and
+  // would report a satisfied obligation. Same defect class as an ungoverned
+  // `NOT_APPLICABLE`; named here rather than left to the caller.
+  if (applicable && !plan.length) {
+    return {
+      verdict: 'FAIL_CONTRACT',
+      reason: 'the run was applicable but the contract selected no journeys at all — '
+        + 'nothing was verified, and that is a contract fault rather than a skip',
+      notAttempted: [],
+    };
+  }
   const verdict = rollUp(executed);
 
   const attempted = new Set(executed.map((f) => f.id));

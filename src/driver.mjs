@@ -93,8 +93,23 @@ export async function probeSandbox(browser) {
     const text = (await page.evaluate(() => document.body.innerText)).trim();
     return {
       available: true,
-      // Chromium prints "You are adequately sandboxed." when layer 1 is effective.
-      effective: /adequately sandboxed/i.test(text),
+      // THE SUBSTRING TRAP, and why the negative is checked first.
+      //
+      // Chromium prints "You are adequately sandboxed." when layer 1 is
+      // effective and "You are NOT adequately sandboxed." when it is not. The
+      // second CONTAINS the first as a substring, so `/adequately sandboxed/`
+      // matched both and this field could never be false.
+      //
+      // Everything downstream was therefore decoration: the BLOCKED_ENVIRONMENT
+      // gate in `cli.mjs`, the trusted validator's `effective === false` check,
+      // and `test/browser-sandbox-proof.mjs`'s per-commit layer-1 claim. Three
+      // gates, none of which could fire, on the one runtime statement Watson
+      // makes about its OWN integrity — and every run bundle on disk carried
+      // `effective: true` beside a report reading "You are NOT adequately
+      // sandboxed."
+      //
+      // Found by independent adversarial review of slice 2, in slice 1 code.
+      effective: !/not\s+adequately\s+sandboxed/i.test(text) && /adequately sandboxed/i.test(text),
       report: text.slice(0, 2000),
     };
   } catch (err) {

@@ -401,3 +401,57 @@ describe('step operands are interpolated at any depth', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// The sandbox probe's own verdict — the string that made three gates vacuous.
+//
+// `/adequately sandboxed/i` matched BOTH of Chromium's verdicts, because the
+// negative one contains the positive as a substring. `effective` could never be
+// false, so the BLOCKED_ENVIRONMENT gate, the trusted validator's check, and the
+// per-commit layer-1 proof were all unreachable in the failing direction — while
+// every run bundle recorded `effective: true` beside a report saying the browser
+// was NOT sandboxed.
+//
+// Both literals are Chromium's own, verbatim.
+
+describe('probeSandbox reads Chromium\'s verdict, not a substring of it', () => {
+  // The predicate under test, applied to the page text `probeSandbox` reads.
+  const effective = (text) => JSON.parse(JSON.stringify({
+    v: !/not\s+adequately\s+sandboxed/i.test(text) && /adequately sandboxed/i.test(text),
+  })).v;
+
+  const NOT_SANDBOXED = [
+    'Sandbox Status', 'Layer 1 Sandbox\tNone', 'PID namespaces\tNo',
+    'Network namespaces\tNo', 'Seccomp-BPF sandbox\tNo', '', 'You are NOT adequately sandboxed.',
+  ].join('\n');
+  const SANDBOXED = [
+    'Sandbox Status', 'Layer 1 Sandbox\tNamespace', 'PID namespaces\tYes',
+    'Network namespaces\tYes', 'Seccomp-BPF sandbox\tYes', '', 'You are adequately sandboxed.',
+  ].join('\n');
+
+  test('Chromium saying NOT adequately sandboxed is NOT effective', () => {
+    assert.equal(effective(NOT_SANDBOXED), false);
+  });
+
+  test('Chromium saying adequately sandboxed IS effective', () => {
+    assert.equal(effective(SANDBOXED), true);
+  });
+
+  test('a report with no verdict line at all is not effective', () => {
+    // Absence of the sentence is not evidence of the sandbox.
+    assert.equal(effective('Sandbox Status\nLayer 1 Sandbox\tNone'), false);
+  });
+
+  test('the source uses a predicate that separates the two', () => {
+    // The join: it is the module that must read Chromium's verdict correctly,
+    // not this test's local copy of the regex. Asserted against the file so a
+    // future edit that reintroduces the bare substring is caught here.
+    const src = fs.readFileSync(new URL('../src/driver.mjs', import.meta.url), 'utf8');
+    const line = src.split('\n')
+      .filter((l) => !/^\s*(\/\/|\*)/.test(l))
+      .find((l) => l.includes('effective:') && l.includes('adequately'));
+    assert.ok(line, 'no `effective:` predicate found in driver.mjs');
+    assert.ok(/not\S*\s*adequately/.test(line),
+      `the predicate does not exclude Chromium's negative verdict: ${line.trim()}`);
+  });
+});

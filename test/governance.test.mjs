@@ -14,9 +14,9 @@ import {
   CONFIG_AUTHORITY, LAUNCH_AUTHORITY,
 } from '../src/governance.mjs';
 import { operationalConfigChange } from '../src/fingerprint.mjs';
+import { PRODUCT_CLAIMS, WITHHELD_WITHOUT_GOVERNANCE, checkFor, runVerdict } from '../src/result.mjs';
 import { contractDirFingerprint } from '../src/manifest.mjs';
 
-const PRODUCT_CLAIMS = new Set(['PASS', 'PASS_WITH_ADVISORIES', 'FAIL_PRODUCT']);
 
 const contract = (over = {}) => ({
   dir: '/x/.watson',
@@ -188,13 +188,14 @@ import { fileURLToPath } from 'node:url';
 
 const CLI = fileURLToPath(new URL('../src/cli.mjs', import.meta.url));
 
-function writeContract(root, { generatedRoots = [], featureIds = ['j1'], expectSeasons = 2 } = {}) {
+function writeContract(root, { generatedRoots = [], featureIds = ['j1'], expectSeasons = 2, selection = null } = {}) {
   const dir = path.join(root, '.watson');
   fs.mkdirSync(path.join(dir, 'features'), { recursive: true });
   fs.mkdirSync(path.join(dir, 'fixtures'), { recursive: true });
   fs.writeFileSync(path.join(dir, 'config.yaml'), [
     'contract_version: 4',
     `generated_roots: ${JSON.stringify(generatedRoots)}`,
+    ...(selection ? [`selection: ${JSON.stringify(selection)}`] : []),
     'identity: { issuer: "https://watson.local/x", client_id: "c" }',
     'injected_by_engine: []',
     // The run is stopped here, deliberately and before any database is created.
@@ -422,5 +423,136 @@ describe('operational config movement is visible on its own', () => {
 
   test('with no base contract, `changed` is null rather than a guess', () => {
     assert.equal(operationalConfigChange(null, cfg()).changed, null);
+  });
+});
+
+describe('an ungoverned run cannot report NOT_APPLICABLE either', () => {
+  // THE ATTACK THIS CLOSES, demonstrated by independent review with a full
+  // engine run: the head contract declares `ignorable: ["**"]` with empty
+  // `runtime_roots`, so a diff touching identity enforcement, an auth guard and
+  // a repository is "positively established as non-runtime". Zero journeys, exit
+  // 0, `obligation: satisfied` — and the trusted validator accepted it.
+  //
+  // `NOT_APPLICABLE` is not a statement about Watson. It says THIS REVISION
+  // needed no verification, which is a claim about the revision, decided by
+  // `selection` rules that in the ungoverned state come from the pull request.
+  test('NOT_APPLICABLE is withheld when nothing governed the run', () => {
+    const r = downgradeForUngovernedContract(
+      'NOT_APPLICABLE', { product_claims_permitted: false, note: 'nothing governed. ' },
+      WITHHELD_WITHOUT_GOVERNANCE);
+    assert.equal(r.verdict, 'INDETERMINATE');
+  });
+
+  test('and it is kept when a trusted contract DID govern', () => {
+    const r = downgradeForUngovernedContract(
+      'NOT_APPLICABLE', { product_claims_permitted: true }, WITHHELD_WITHOUT_GOVERNANCE);
+    assert.equal(r.verdict, 'NOT_APPLICABLE');
+  });
+
+  test('the withheld set is strictly wider than the product-claim set', () => {
+    // Stated as a property so the two cannot be silently unified again: the
+    // difference between them IS this finding.
+    for (const v of PRODUCT_CLAIMS) assert.ok(WITHHELD_WITHOUT_GOVERNANCE.has(v), v);
+    assert.ok(WITHHELD_WITHOUT_GOVERNANCE.has('NOT_APPLICABLE'));
+    assert.ok(!PRODUCT_CLAIMS.has('NOT_APPLICABLE'));
+  });
+
+  test('an obligation is never satisfied by an ungoverned run', () => {
+    // The end-to-end property, over every verdict the engine can reach.
+    for (const v of ['PASS', 'PASS_WITH_ADVISORIES', 'FAIL_PRODUCT', 'NOT_APPLICABLE',
+      'FAIL_CONTRACT', 'BLOCKED_ENVIRONMENT', 'INDETERMINATE']) {
+      const out = downgradeForUngovernedContract(
+        v, { product_claims_permitted: false, note: 'x. ' }, WITHHELD_WITHOUT_GOVERNANCE);
+      assert.notEqual(checkFor(out.verdict).obligation, 'satisfied',
+        `${v} -> ${out.verdict} still satisfied the obligation without a governing contract`);
+    }
+  });
+});
+
+describe('applicable with an empty plan is a contract fault, not a skip', () => {
+  test('the run cannot report a satisfied obligation over zero journeys', () => {
+    const r = runVerdict({ executed: [], plan: [], applicable: true });
+    assert.equal(r.verdict, 'FAIL_CONTRACT');
+    assert.match(r.reason, /selected no journeys at all/);
+  });
+
+  test('a genuine up-front skip is untouched', () => {
+    assert.equal(runVerdict({ executed: [], plan: [], applicable: false }).verdict, 'NOT_APPLICABLE');
+  });
+});
+
+describe('THE ATTACK: an ungoverned run cannot skip itself green', () => {
+  // Demonstrated end to end by independent adversarial review. With no governing
+  // contract the PULL REQUEST authors `selection`, so a head declaring
+  // `ignorable: ["**"]` with empty `runtime_roots` makes every change
+  // non-runtime. The run drove ZERO journeys and reported NOT_APPLICABLE with
+  // `obligation: satisfied` — indistinguishable from a correct skip, over a diff
+  // that in the reviewer's run touched identity enforcement, an auth guard and a
+  // repository.
+  //
+  // Driven through the real CLI, because the unit test above proves the gate and
+  // this proves the gate is reached.
+  const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'watson-skip-'));
+
+  const ATTACK_SELECTION = {
+    runtime_roots: [], governing_roots: [], cross_cutting: [],
+    ignorable: ['**'], escalation_profile: 'poc',
+  };
+
+  /** A product git repo with two commits, so impact selection has a real diff. */
+  function repoWithDiff(selection) {
+    const dir = tmp();
+    const g = (...a) => execFileSync('git', a, { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'] });
+    g('init', '-q', '-b', 'main');
+    g('config', 'user.email', 'w@example.invalid');
+    g('config', 'user.name', 'w');
+    fs.mkdirSync(path.join(dir, 'server', 'src'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'server', 'src', 'enforcement.ts'), 'export const v = 1;\n');
+    writeContract(dir, { selection });
+    g('add', '-A'); g('commit', '-q', '-m', 'base');
+    const base = g('rev-parse', 'HEAD').toString().trim();
+    fs.writeFileSync(path.join(dir, 'server', 'src', 'enforcement.ts'), 'export const v = 2;\n');
+    g('add', '-A'); g('commit', '-q', '-m', 'head');
+    return { dir, base, head: g('rev-parse', 'HEAD').toString().trim() };
+  }
+
+  const run = (repo, extra) => {
+    const out = path.join(repo.dir, 'result.json');
+    try {
+      execFileSync(process.execPath, [CLI, 'verify', '--repo', repo.dir, '--out', out,
+        '--sha', repo.head, '--base', repo.base, ...extra],
+      { stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 });
+    } catch { /* a non-product verdict exits non-zero */ }
+    return JSON.parse(fs.readFileSync(out, 'utf8'));
+  };
+
+  test('the head declares every change ignorable, and nothing governs: NOT NOT_APPLICABLE', () => {
+    const repo = repoWithDiff(ATTACK_SELECTION);
+    const env = run(repo, ['--base-contract', tmp()]);       // supplied but empty -> bootstrap
+    assert.equal(env.governing_contract.authority, 'bootstrap');
+    assert.notEqual(env.verdict, 'NOT_APPLICABLE');
+    assert.equal(env.verdict, 'INDETERMINATE');
+    assert.notEqual(env.check.obligation, 'satisfied');
+  });
+
+  test('...and with no base contract supplied at all, the same', () => {
+    const repo = repoWithDiff(ATTACK_SELECTION);
+    const env = run(repo, []);
+    assert.equal(env.governing_contract.authority, 'none');
+    assert.equal(env.verdict, 'INDETERMINATE');
+    assert.notEqual(env.check.obligation, 'satisfied');
+  });
+
+  test('a GOVERNED skip is still a legitimate NOT_APPLICABLE', () => {
+    // The fix must not turn every genuine skip into an INDETERMINATE — that
+    // would be the opposite failure, and it is what makes this a boundary rather
+    // than a blanket refusal.
+    const repo = repoWithDiff(ATTACK_SELECTION);
+    const baseContract = tmp();
+    writeContract(baseContract, { selection: ATTACK_SELECTION });
+    const env = run(repo, ['--base-contract', baseContract]);
+    assert.equal(env.governing_contract.authority, 'base');
+    assert.equal(env.verdict, 'NOT_APPLICABLE');
+    assert.equal(env.check.obligation, 'satisfied');
   });
 });
