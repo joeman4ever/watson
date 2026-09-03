@@ -107,9 +107,76 @@ export function rollUp(features) {
   if (!features.length) return 'NOT_APPLICABLE';
   if (has('FAIL_PRODUCT')) return 'FAIL_PRODUCT';
   if (has('FAIL_CONTRACT')) return 'FAIL_CONTRACT';
+  // A feature that ended BLOCKED_ENVIRONMENT did not verify anything, and used
+  // to fall through to PASS because nothing named it here. Found by the
+  // run-level property test, not by any test of this function.
+  if (has('BLOCKED_ENVIRONMENT')) return 'BLOCKED_ENVIRONMENT';
   if (has('INDETERMINATE')) return 'INDETERMINATE';
   if (has('PASS_WITH_ADVISORIES')) return 'PASS_WITH_ADVISORIES';
   return 'PASS';
+}
+
+/**
+ * The RUN-LEVEL verdict: what the whole run may claim, given what executed and
+ * what was planned.
+ *
+ * Extracted from `cli.mjs` so the property below is testable where it actually
+ * holds. Two defects lived in that inline code, both of them silent
+ * under-verification on the verdict path:
+ *
+ *   - a failing SETUP journey was excluded from the roll-up, so a prerequisite
+ *     failure aborted its dependants and the run reported PASS over whatever had
+ *     already executed;
+ *   - the aborted dependants vanished entirely, so the run reported on a subset
+ *     without saying it was a subset.
+ *
+ * THE PROPERTY, stated once and enforced here:
+ *
+ *     a prerequisite failure cannot make verification coverage disappear
+ *     while the run reports PASS or PASS_WITH_ADVISORIES.
+ *
+ * It holds for every failure kind, not only FAIL_PRODUCT — a dependency that
+ * fails its contract or its environment leaves its dependants just as unable to
+ * execute meaningfully.
+ */
+export function runVerdict({ executed = [], plan = [] } = {}) {
+  const verdict = rollUp(executed);
+
+  const attempted = new Set(executed.map((f) => f.id));
+  const notAttempted = plan
+    .filter((p) => p.role === 'verified' && !attempted.has(p.feature?.id ?? p.id))
+    .map((p) => p.feature?.id ?? p.id);
+
+  const failed = executed.filter((f) => f.verdict === 'FAIL_PRODUCT');
+  const drift = executed.filter((f) => f.verdict === 'FAIL_CONTRACT');
+
+  // A selected journey that produced no result at all cannot be spoken for, so a
+  // PASS-shaped verdict becomes INDETERMINATE.
+  //
+  // Only PASS-shaped. A run that established a real FAIL_PRODUCT keeps it: the
+  // failure is evidence, the incompleteness is additional, and converting the
+  // finding into INDETERMINATE would hide it. `PRODUCT_CLAIMS` includes
+  // FAIL_PRODUCT and is the wrong set for this.
+  const PASS_SHAPED = new Set(['PASS', 'PASS_WITH_ADVISORIES']);
+  if (notAttempted.length && PASS_SHAPED.has(verdict)) {
+    return {
+      verdict: 'INDETERMINATE',
+      reason: `${notAttempted.length} selected journey(s) never ran (${notAttempted.join(', ')}), `
+        + 'so this run cannot speak for them',
+      notAttempted,
+    };
+  }
+  return {
+    verdict,
+    reason: failed.length
+      ? `${failed.length} of ${executed.length} feature(s) failed their proof`
+      : drift.length
+        ? `${drift.length} feature(s) could not be verified — the map names something that no longer exists`
+        : notAttempted.length
+          ? `${notAttempted.length} selected journey(s) never ran (${notAttempted.join(', ')})`
+          : `${executed.length} feature(s) met their proof`,
+    notAttempted,
+  };
 }
 
 export function buildEnvelope(run) {

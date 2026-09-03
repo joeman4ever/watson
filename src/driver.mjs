@@ -396,31 +396,52 @@ export async function runStep(step, ctx) {
       return `${want} allowed ${res.status()}`;
     }
     case 'expect_reached': {
-      // THE ROUTE EXISTS AND THIS IDENTITY WAS NOT TURNED AWAY.
+      // AUTHORIZATION PASSED, PROVED BY A CONDITION ONLY REACHABLE AFTER IT.
       //
-      // A weaker claim than `expect_allowed`, made deliberately, for the routes
-      // where a 200 would require building data the fixture has no business
-      // building. `/reporting/session-comparison` needs two DISTINCT sessions;
-      // the POC fixture seeds one, and adding a second only so a control can be
-      // green changes the world under test to suit the checker.
+      // A weaker claim than `expect_allowed`, made deliberately, for routes where
+      // a 200 would require building data the fixture has no business building.
+      // `/reporting/session-comparison` needs two DISTINCT sessions; seeding a
+      // second only so a control can be green changes the world under test to
+      // suit the checker.
       //
-      // What the `capability` obligation actually needs is that a denial
-      // elsewhere is not satisfied by a product which denies everyone. A 400
-      // `sessionA_and_sessionB_required` from an admin-guarded route establishes
-      // that precisely — arguably better than a 200 does, because it proves the
-      // guard admitted the caller and the HANDLER RAN.
+      // WHAT IT MUST NOT BE. An earlier version of this step passed on anything
+      // that was not 401/403/404/405/5xx. That is a vacuous proof: it accepts a
+      // status the caller never reasoned about, and "not denied" is not the same
+      // as "authorized". Not all 400s prove authorization succeeded.
       //
-      // 401 and 403 are turned away. 404 is the route or entity not being there,
-      // which is the case this exists to exclude. 405 is the method not existing.
-      // 5xx is the server failing, which proves nothing about authorization.
+      // So the contract states the EXACT downstream condition, per route: the
+      // status, and — wherever the product exposes one — the stable error code
+      // that identifies the downstream validation. Both are base-governed. A
+      // declaration with neither is refused by `validateReachedConditions`
+      // before anything runs, unless it carries a written justification that a
+      // reviewer can check against the product's own middleware order.
       const want = interp(arg.path ?? arg, vars);
       const res = await page.request.get(want, { failOnStatusCode: false });
       const status = res.status();
       evidence.requests.push({ path: want, status, method: 'GET' });
-      if ([401, 403, 404, 405].includes(status) || status >= 500) {
-        throw new Error(`expected ${want} to be reached by this identity, got ${status}${note}`);
+
+      const wantStatus = arg.status;
+      if (status !== wantStatus) {
+        throw new Error(
+          `expected ${want} to answer ${wantStatus} downstream of authorization, got ${status}${note}`,
+        );
       }
-      return `${want} reached ${status}`;
+      // The status alone can be produced by things other than the condition
+      // named — so where the contract declares body fields, they are checked.
+      const wantBody = arg.body ?? null;
+      if (wantBody) {
+        let body = null;
+        try { body = await res.json(); } catch { /* not JSON — reported below */ }
+        const bad = Object.entries(wantBody).filter(([k, v]) => String(body?.[k]) !== String(v));
+        if (bad.length) {
+          throw new Error(
+            `${want} answered ${status} but not the declared downstream condition: `
+            + `${bad.map(([k, v]) => `${k} wanted ${JSON.stringify(v)}, got ${JSON.stringify(body?.[k])}`).join('; ')}${note}`,
+          );
+        }
+        return `${want} reached — ${status} ${Object.entries(wantBody).map(([k, v]) => `${k}=${v}`).join(' ')}`;
+      }
+      return `${want} reached — ${status} (status-only, justified in the contract)`;
     }
     case 'expect_json': {
       // Assert on what a route RESOLVED TO, not merely that it answered.

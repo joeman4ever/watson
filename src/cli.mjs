@@ -15,7 +15,8 @@ import url from 'node:url';
 import {
   loadContract, selectByProfile, withDependencies,
   validateFeatureVars, validateEnvOwnership, validateBrowserOwnership, validateContractVersion, validateStepOrder,
-  validateAssertionOperands, validateDenialProofs, fixtureValues, fixtureValueEnv, reconcileFixtureValues,
+  validateAssertionOperands, validateDenialProofs, validateReachedConditions,
+  fixtureValues, fixtureValueEnv, reconcileFixtureValues,
   normaliseChosen,
 } from './contract.mjs';
 import { validateProofDeclarations } from './proofs.mjs';
@@ -28,7 +29,7 @@ import * as env from './environment.mjs';
 import * as drive from './driver.mjs';
 import * as plane from './plane.mjs';
 import { evaluate, featureVerdict } from './checks.mjs';
-import { buildEnvelope, rollUp, writeResult, summary, downgradeForInexactHead, PRODUCT_CLAIMS } from './result.mjs';
+import { buildEnvelope, runVerdict, writeResult, summary, downgradeForInexactHead, PRODUCT_CLAIMS } from './result.mjs';
 
 const HERE = path.dirname(url.fileURLToPath(import.meta.url));
 const ROOT = path.join(HERE, '..');
@@ -660,6 +661,7 @@ async function cmdVerify(args) {
     ),
     ...validateAssertionOperands(plan.map((p) => p.feature), fixtureProfile),
     ...validateDenialProofs(plan.map((p) => p.feature), fixtureProfile),
+    ...validateReachedConditions(plan.map((p) => p.feature)),
     ...validateBrowserOwnership(contract.config),
     ...validateFeatureVars(plan.map((p) => p.feature), fixtureProfile),
   ];
@@ -875,42 +877,18 @@ async function cmdVerify(args) {
 
     await browser.close();
 
-    // A SETUP FEATURE'S FAILURE IS NOT INVISIBLE.
-    //
-    // The roll-up used to run over `verified` features only. A setup journey
-    // that failed then aborted its dependants — correctly — and the run reported
-    // PASS over whatever happened to have run already. Two under-verifications
-    // in one: a real product failure dropped, and journeys silently not
-    // attempted. Every executed feature counts, whatever its role.
-    const verdict = rollUp(features);
-    const failed = features.filter((f) => f.verdict === 'FAIL_PRODUCT');
+    // The run-level verdict, decided in one place that has its own tests.
+    // `plan` is what was SELECTED; `features` is what actually executed.
+    const roll = runVerdict({ executed: features, plan });
+    const { notAttempted } = roll;
 
-    // JOURNEYS THAT WERE SELECTED AND NEVER RAN.
-    //
-    // The loop breaks when a prerequisite fails, so the plan can end with
-    // journeys that produced no result at all. A run cannot claim PASS over
-    // assertions it did not make; if the verdict is not already a failure, it
-    // becomes INDETERMINATE and names them.
-    const attempted = new Set(features.map((f) => f.id));
-    const notAttempted = plan
-      .filter((p) => p.role === 'verified' && !attempted.has(p.feature.id))
-      .map((p) => p.feature.id);
     if (notAttempted.length) {
       log(`\n  ⚠ ${notAttempted.length} selected journey(s) never ran: ${notAttempted.join(', ')}`);
     }
     return finish(runDir, {
       ...base, dbName: up.dbName, baseUrl: up.baseUrl,
-      verdict: notAttempted.length && PRODUCT_CLAIMS.has(verdict) ? 'INDETERMINATE' : verdict,
-      verdictReason: (() => {
-        const drift = features.filter((f) => f.verdict === 'FAIL_CONTRACT');
-        if (failed.length) return `${failed.length} of ${features.length} feature(s) failed their proof`;
-        if (drift.length) return `${drift.length} feature(s) could not be verified — the map names something that no longer exists`;
-        if (notAttempted.length) {
-          return `${notAttempted.length} selected journey(s) never ran (${notAttempted.join(', ')}), `
-            + 'so this run cannot speak for them';
-        }
-        return `${features.length} feature(s) met their proof`;
-      })(),
+      verdict: roll.verdict,
+      verdictReason: roll.reason,
       notAttempted,
       doctor: dr, features, findings, qualitySignals: signals,
       evidence: {

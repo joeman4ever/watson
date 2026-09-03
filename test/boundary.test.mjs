@@ -232,50 +232,88 @@ describe('the entry point actually starts', () => {
 // because what this step means is entirely a claim about status codes, and a
 // stub would only re-state the table I wrote.
 
-describe('expect_reached', () => {
-  const serve = async (status) => {
-    const srv = http.createServer((_req, res) => { res.writeHead(status); res.end('{}'); });
+describe('expect_reached asserts a DECLARED downstream condition', () => {
+  // The rule this replaced was "anything that is not 401/403/404/405/5xx", and
+  // that is another vacuous proof — it accepts a status the contract author
+  // never reasoned about. Not all 400s prove authorization succeeded: a request
+  // can be rejected before any guard runs, by a body parser or a router.
+  const serve = async (status, body) => {
+    const srv = http.createServer((_req, res) => {
+      res.writeHead(status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(body ?? {}));
+    });
     await new Promise((r) => srv.listen(0, '127.0.0.1', r));
     return { url: `http://127.0.0.1:${srv.address().port}`, close: () => srv.close() };
   };
-
-  // A minimal stand-in for Playwright's `page.request`, using the same fetch the
-  // engine's own probes use. The step's logic is the subject; the transport is not.
   const ctxFor = (base) => ({
     page: { request: { get: async (p) => {
       const r = await fetch(new URL(p, base));
-      return { status: () => r.status };
+      return { status: () => r.status, json: async () => r.json() };
     } } },
     evidence: { requests: [] },
     vars: {},
   });
 
-  const REACHED = [200, 201, 204, 302, 400, 409, 422];
-  const TURNED_AWAY = [401, 403, 404, 405, 500, 503];
+  test('the declared status AND error code both match', async () => {
+    const s = await serve(400, { error: 'grade_required' });
+    try {
+      const out = await drive.runStep(
+        { expect_reached: { path: '/api/x', status: 400, body: { error: 'grade_required' } } }, ctxFor(s.url));
+      assert.match(out, /reached — 400 error=grade_required/);
+    } finally { s.close(); }
+  });
 
-  for (const status of REACHED) {
-    test(`${status} counts as reached`, async () => {
-      const s = await serve(status);
+  test('THE CASE THIS EXISTS FOR: the right status, the WRONG reason', async () => {
+    // A 400 from a body parser, a router, or any pre-guard rejection is not
+    // evidence the guard admitted the caller. The old rule accepted every one.
+    const s = await serve(400, { error: 'malformed_json' });
+    try {
+      await assert.rejects(
+        () => drive.runStep(
+          { expect_reached: { path: '/api/x', status: 400, body: { error: 'grade_required' } } }, ctxFor(s.url)),
+        /not the declared downstream condition/);
+    } finally { s.close(); }
+  });
+
+  test('a different status fails even when the body would have matched', async () => {
+    const s = await serve(422, { error: 'grade_required' });
+    try {
+      await assert.rejects(
+        () => drive.runStep(
+          { expect_reached: { path: '/api/x', status: 400, body: { error: 'grade_required' } } }, ctxFor(s.url)),
+        /to answer 400 downstream of authorization, got 422/);
+    } finally { s.close(); }
+  });
+
+  for (const status of [401, 403, 404, 405, 500]) {
+    test(`${status} fails a declaration expecting a downstream condition`, async () => {
+      const s = await serve(status, { error: 'grade_required' });
       try {
-        const out = await drive.runStep({ expect_reached: { path: '/api/x' } }, ctxFor(s.url));
-        assert.match(out, new RegExp(`reached ${status}`));
+        await assert.rejects(() => drive.runStep(
+          { expect_reached: { path: '/api/x', status: 400, body: { error: 'grade_required' } } }, ctxFor(s.url)));
       } finally { s.close(); }
     });
   }
 
-  for (const status of TURNED_AWAY) {
-    test(`${status} does NOT`, async () => {
-      // 401/403: turned away. 404: the route or entity is not there, which is
-      // the case this step exists to exclude. 405: no such method. 5xx: the
-      // server failed, which proves nothing about authorization.
-      const s = await serve(status);
-      try {
-        await assert.rejects(
-          () => drive.runStep({ expect_reached: { path: '/api/x' } }, ctxFor(s.url)),
-          new RegExp(`to be reached by this identity, got ${status}`));
-      } finally { s.close(); }
-    });
-  }
+  test('a status-only declaration still checks the exact status', async () => {
+    const s = await serve(409);
+    try {
+      const out = await drive.runStep({ expect_reached: { path: '/api/x', status: 409 } }, ctxFor(s.url));
+      assert.match(out, /409 \(status-only/);
+      await assert.rejects(() => drive.runStep({ expect_reached: { path: '/api/x', status: 400 } }, ctxFor(s.url)));
+    } finally { s.close(); }
+  });
+
+  test('a non-JSON body fails a declaration that names body fields', async () => {
+    const srv = http.createServer((_req, res) => { res.writeHead(400); res.end('<html>nope'); });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    try {
+      await assert.rejects(() => drive.runStep(
+        { expect_reached: { path: '/api/x', status: 400, body: { error: 'grade_required' } } },
+        ctxFor(`http://127.0.0.1:${srv.address().port}`)),
+      /not the declared downstream condition/);
+    } finally { srv.close(); }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -336,13 +374,13 @@ describe('step operands are interpolated at any depth', () => {
     const ctx = {
       page: { request: { get: async (p) => {
         const r = await fetch(new URL(p, base));
-        return { status: () => r.status };
+        return { status: () => r.status, json: async () => r.json() };
       } } },
       evidence: { requests: [] },
       vars: { seasonId: 'SEASON-7' },
     };
     try {
-      await drive.runStep({ expect_reached: { path: '/api/seasons/${seasonId}/x' } }, ctx);
+      await drive.runStep({ expect_reached: { path: '/api/seasons/${seasonId}/x', status: 200 } }, ctx);
       assert.equal(ctx.evidence.requests[0].path, '/api/seasons/SEASON-7/x');
     } finally { srv.close(); }
   });

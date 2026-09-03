@@ -669,6 +669,79 @@ export function validateDenialProofs(features, fixtureProfile) {
   return problems;
 }
 
+/**
+ * Statuses an `expect_reached` step may NOT declare as its downstream condition.
+ *
+ * 401 and 403 ARE the authorization boundary: expecting one would make the step
+ * assert the opposite of what it exists to prove. 404 is the route or entity not
+ * being there, which is the case it exists to exclude. 405 is no such method.
+ * 5xx is the server failing, which says nothing about authorization.
+ */
+export const NOT_DOWNSTREAM_OF_AUTH = Object.freeze([401, 403, 404, 405]);
+
+/**
+ * `expect_reached` must name a base-governed condition specifically known to
+ * occur DOWNSTREAM of the authorization boundary it is testing.
+ *
+ * The rule this replaces was "anything that is not 401/403/404/405/5xx", and
+ * that is another vacuous proof: it accepts a status the contract author never
+ * reasoned about. Not all 400s prove authorization succeeded — a request can be
+ * rejected before any guard runs, by a body parser or a router.
+ *
+ * So the declaration has to say WHICH condition, and the preferred form pairs a
+ * status with the product's own stable error code:
+ *
+ *     expect_reached:
+ *       path: "/api/seasons/${id}/formation-drafts"
+ *       status: 400
+ *       body: { error: grade_required }
+ *
+ * Status-only is permitted where the product exposes no stable marker, and only
+ * with a written `justification` naming why that status is emitted downstream of
+ * the guard. That is not enforcement — no predicate can check a sentence — it is
+ * the reviewable artifact, and its absence IS enforced.
+ */
+export function validateReachedConditions(features) {
+  const problems = [];
+  for (const feature of features) {
+    for (const [index, step] of (feature.steps ?? []).entries()) {
+      if (!('expect_reached' in step)) continue;
+      const at = `${feature.__file ?? feature.id} step ${index + 1}`;
+      const arg = step.expect_reached;
+
+      if (!arg || typeof arg !== 'object' || typeof arg.path !== 'string') {
+        problems.push(`${at}: \`expect_reached\` needs a \`path\`.`);
+        continue;
+      }
+      if (!Number.isInteger(arg.status)) {
+        problems.push(
+          `${at}: \`expect_reached\` must declare the exact \`status\` it expects downstream of `
+          + 'authorization. "Not denied" is not "authorized", and a step that accepts any status the '
+          + 'author never reasoned about proves nothing.',
+        );
+        continue;
+      }
+      if (NOT_DOWNSTREAM_OF_AUTH.includes(arg.status) || arg.status >= 500) {
+        problems.push(
+          `${at}: \`expect_reached\` declares status ${arg.status}, which is not downstream of the `
+          + 'authorization boundary — it is that boundary (401/403), the route or entity being absent '
+          + '(404/405), or the server failing (5xx).',
+        );
+      }
+      const hasBody = arg.body && typeof arg.body === 'object' && Object.keys(arg.body).length > 0;
+      if (!hasBody && !(typeof arg.justification === 'string' && arg.justification.trim().length >= 40)) {
+        problems.push(
+          `${at}: \`expect_reached\` declares status ${arg.status} with no \`body\` condition. `
+          + 'Name the product\'s own stable error code, or supply a `justification` (40+ characters) '
+          + 'stating why this status is emitted downstream of the guard, checkable against the '
+          + 'product\'s middleware order.',
+        );
+      }
+    }
+  }
+  return problems;
+}
+
 export function validateAssertionOperands(features, fixtureProfile, engineSupplied = ['runId']) {
   const chosen = new Set([
     ...normaliseChosen(fixtureProfile?.verifier_chosen ?? []).map(([n]) => n),

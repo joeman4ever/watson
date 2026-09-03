@@ -17,8 +17,9 @@ import assert from 'node:assert/strict';
 
 import {
   assertionVars, validateAssertionOperands, fixtureValues, fixtureValueEnv, normaliseChosen, validateDenialProofs, reconcileFixtureValues, routeOf, withDependencies,
+  validateReachedConditions,
 } from '../src/contract.mjs';
-import { rollUp } from '../src/result.mjs';
+import { rollUp, runVerdict } from '../src/result.mjs';
 
 const feature = (id, steps) => ({ id, __file: `${id}.yaml`, steps });
 
@@ -565,5 +566,110 @@ describe('the roll-up counts every feature that ran', () => {
       { verdict: 'PASS', role: 'verified' },
       { verdict: 'FAIL_PRODUCT', role: 'setup' },
     ]), 'FAIL_PRODUCT');
+  });
+});
+
+describe('an expect_reached declaration must name its downstream condition', () => {
+  const step = (over) => feature('f', [{ expect_reached: { path: '/api/x', ...over } }]);
+
+  test('no status at all is refused — "not denied" is not "authorized"', () => {
+    const p = validateReachedConditions([step({})]);
+    assert.equal(p.length, 1);
+    assert.match(p[0], /must declare the exact `status`/);
+  });
+
+  for (const status of [401, 403, 404, 405, 502]) {
+    test(`${status} cannot be the declared downstream condition`, () => {
+      const p = validateReachedConditions([step({ status, body: { error: 'x' } })]);
+      assert.ok(p.some((x) => /not downstream of the authorization boundary/.test(x)), JSON.stringify(p));
+    });
+  }
+
+  test('a status with a body condition is accepted', () => {
+    assert.deepEqual(validateReachedConditions([step({ status: 400, body: { error: 'grade_required' } })]), []);
+  });
+
+  test('a status ALONE is refused without a written justification', () => {
+    const p = validateReachedConditions([step({ status: 409 })]);
+    assert.equal(p.length, 1);
+    assert.match(p[0], /stable error code, or supply a `justification`/);
+  });
+
+  test('a token justification does not count', () => {
+    // No predicate can check a sentence. What is enforced is that one exists and
+    // is substantial enough to be a reviewable artifact rather than a checkbox.
+    const p = validateReachedConditions([step({ status: 409, justification: 'because' })]);
+    assert.equal(p.length, 1);
+  });
+
+  test('a real justification is accepted', () => {
+    assert.deepEqual(validateReachedConditions([step({
+      status: 409,
+      justification: 'the conflict is raised by the handler itself, which runs after adminGuard in app.ts',
+    })]), []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// THE RUN-LEVEL PROPERTY.
+//
+//     A prerequisite failure cannot make verification coverage disappear
+//     while the run reports PASS or PASS_WITH_ADVISORIES.
+//
+// Asserted over `runVerdict` — the function the CLI actually calls to decide
+// what a run may claim — and not over the dependency helper alone. Both defects
+// this exists for lived in the run-level code while the helpers were correct.
+
+describe('a prerequisite failure cannot hide behind a PASS', () => {
+  const plan = (...ids) => ids.map(([id, role]) => ({ feature: { id }, role }));
+  const ran = (...pairs) => pairs.map(([id, verdict, role]) => ({ id, verdict, role: role ?? 'verified' }));
+
+  for (const failure of ['FAIL_PRODUCT', 'FAIL_CONTRACT', 'BLOCKED_ENVIRONMENT']) {
+    test(`a setup journey that ends ${failure} keeps the run off PASS`, () => {
+      const r = runVerdict({
+        executed: ran(['control', failure, 'setup'], ['main', 'PASS']),
+        plan: plan(['control', 'setup'], ['main', 'verified']),
+      });
+      assert.ok(!['PASS', 'PASS_WITH_ADVISORIES'].includes(r.verdict), `${failure} -> ${r.verdict}`);
+    });
+
+    test(`...and so does a VERIFIED journey that ends ${failure}`, () => {
+      const r = runVerdict({
+        executed: ran(['a', 'PASS'], ['b', failure]),
+        plan: plan(['a', 'verified'], ['b', 'verified']),
+      });
+      assert.ok(!['PASS', 'PASS_WITH_ADVISORIES'].includes(r.verdict), `${failure} -> ${r.verdict}`);
+    });
+  }
+
+  test('a selected journey that never ran is named, and the run cannot claim PASS', () => {
+    const r = runVerdict({
+      executed: ran(['control', 'PASS', 'setup'], ['a', 'PASS']),
+      plan: plan(['control', 'setup'], ['a', 'verified'], ['b', 'verified'], ['c', 'verified']),
+    });
+    assert.equal(r.verdict, 'INDETERMINATE');
+    assert.deepEqual(r.notAttempted, ['b', 'c']);
+    assert.match(r.reason, /never ran \(b, c\)/);
+  });
+
+  test('THE SHAPE THAT SHIPPED THE BUG: prerequisite fails, dependants never run', () => {
+    // Exactly what the engine did before: the loop breaks on a failing
+    // prerequisite, the dependants produce no result, and the run reported PASS
+    // over the two journeys that happened to execute first.
+    const r = runVerdict({
+      executed: ran(['setup-x', 'FAIL_PRODUCT', 'setup'], ['early', 'PASS']),
+      plan: plan(['setup-x', 'setup'], ['early', 'verified'], ['late-1', 'verified'], ['late-2', 'verified']),
+    });
+    assert.equal(r.verdict, 'FAIL_PRODUCT');
+    assert.deepEqual(r.notAttempted, ['late-1', 'late-2']);
+  });
+
+  test('a run where everything selected ran and passed is still PASS', () => {
+    const r = runVerdict({
+      executed: ran(['control', 'PASS', 'setup'], ['a', 'PASS'], ['b', 'PASS']),
+      plan: plan(['control', 'setup'], ['a', 'verified'], ['b', 'verified']),
+    });
+    assert.equal(r.verdict, 'PASS');
+    assert.deepEqual(r.notAttempted, []);
   });
 });
