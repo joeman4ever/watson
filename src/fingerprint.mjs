@@ -254,8 +254,39 @@ function resolveNpmScripts(command, read, exists, into) {
  *      remembering to.
  *   3. `verdict_bearing_paths`, declared in the contract for what extraction
  *      cannot see — `npm run migrate:up` names no path. This is BASE-GOVERNED
- *      (`CONFIG_AUTHORITY`), so a pull request cannot shrink the list that
- *      decides whether its own changes are reported.
+ *      (`CONFIG_AUTHORITY`).
+ *
+ * WHAT A PULL REQUEST CAN AND CANNOT DO TO THIS LIST.
+ *
+ * This comment used to say "a pull request cannot shrink the list that decides
+ * whether its own changes are reported". That is FALSE as a statement about the
+ * list, and it is worth saying why rather than quietly narrowing it.
+ *
+ * Source 2 extracts paths from the contract's own command strings, and
+ * `install`, `provision`, `build` and `launch.command` are HEAD-AUTHORED by
+ * decision (`CONFIG_AUTHORITY`) — they must match the pull request's own tree or
+ * nothing runs. So a pull request rewriting its own `provision` from
+ * `npm run migrate:up --workspace=@nsc-eval/server` to `npm run migrate:up`
+ * drops `server/migrations` out of the extracted scope. Executed against
+ * nsc-eval's real contract: 8 paths become 7.
+ *
+ * The true property is narrower, and is what this function actually guarantees:
+ *
+ *   CANNOT be shrunk by the head    `.watson` (unconditional)
+ *                                   the install surface, where it exists
+ *                                   `verdict_bearing_paths` (base-governed)
+ *   CAN be shrunk by the head       paths reachable only through head-authored
+ *                                   command strings
+ *
+ * That is a real gap, and three things bound it. It is REPORTING, not a gate:
+ * `contract_change` is reported and Sherlock reviews it; nothing in the verdict
+ * depends on it. The shrink is itself VISIBLE — rewriting `provision` moves
+ * `operational_config.changed_keys`, the trusted validator warns naming the
+ * changed key, and `contract_scope` is recorded on every result so the two
+ * scopes can be compared directly. And the remedy is in the contract's own
+ * hands: any path that must stay in scope regardless of how the head writes its
+ * commands belongs in base-governed `verdict_bearing_paths`, which is exactly
+ * what source 3 is for.
  *
  * `exists` is injected so this stays a pure function over the contract and one
  * predicate — the caller decides whether "exists" means the working tree or a

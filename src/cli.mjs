@@ -600,10 +600,15 @@ async function cmdVerify(args) {
     contractVersion: contract.config?.contract_version ?? null,
     productFingerprint: productFingerprint(repoRoot, headSha),
     // D2: the fingerprint covers everything verdict-bearing, which is more than
-    // `.watson/`. The scope is derived from the GOVERNING contract — a pull
-    // request cannot shrink the list that decides whether its own changes are
-    // reported — and is recorded beside the digest, because a fingerprint whose
-    // scope is invisible is one nobody can check.
+    // `.watson/`. The scope is derived from the GOVERNING contract and recorded
+    // beside the digest, because a fingerprint whose scope is invisible is one
+    // nobody can check — and here that visibility is load-bearing rather than
+    // decorative. `.watson`, the install surface and base-governed
+    // `verdict_bearing_paths` cannot be shrunk by the head; paths reachable only
+    // through head-authored command strings CAN be, because those commands must
+    // match the pull request's own tree. See `verdictBearingPaths` for what that
+    // does and does not buy. Watson reports contract movement; it does not gate
+    // on it.
     contractFingerprint: contractFingerprint(repoRoot, headSha, contractScope),
     contractScope,
     // Resolves the contract at BOTH SHAs so the diff can name what changed, not

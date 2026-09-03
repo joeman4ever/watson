@@ -19,7 +19,7 @@ import { execFileSync } from 'node:child_process';
 
 import {
   verdictBearingPaths, contractFingerprint, contractChange, pathExistsAt,
-  canonicalContract, deepDiffPaths,
+  canonicalContract, deepDiffPaths, operationalConfigChange,
 } from '../src/fingerprint.mjs';
 import { loadContract } from '../src/contract.mjs';
 import { CONFIG_AUTHORITY } from '../src/governance.mjs';
@@ -68,12 +68,94 @@ describe('the scope is derived from the contract, not remembered', () => {
   test('what extraction cannot see is DECLARED — and declared in the BASE contract', () => {
     // `npm run migrate:up` names no path, so migrations need a declaration. The
     // declaration being base-governed is the whole reason it is not another
-    // `generated_roots`: a pull request cannot shrink the list that decides
-    // whether its own changes get reported.
+    // `generated_roots`.
     const c = contract();
     c.config.verdict_bearing_paths = ['server/migrations'];
     assert.ok(verdictBearingPaths(c, () => true).includes('server/migrations'));
     assert.equal(CONFIG_AUTHORITY.verdict_bearing_paths, 'base');
+  });
+
+  // WHAT THE HEAD CAN SHRINK, STATED EXACTLY.
+  //
+  // The comment above this test used to end "a pull request cannot shrink the
+  // list that decides whether its own changes get reported". The independent
+  // review of #9 (NB4) was right that this is false as written, and the honest
+  // response is a test that draws the line rather than a softer sentence.
+  //
+  // `install`, `provision`, `build` and `launch.command` are HEAD-AUTHORED by
+  // decision — they must match the pull request's own tree or nothing runs — so
+  // every path reachable only through them is reachable only through something
+  // the pull request writes.
+  describe('the head can shrink the extracted half, and only the extracted half', () => {
+    const present = new Set([
+      'server/migrations', 'server/package.json', 'package.json',
+      'package-lock.json', 'server/scripts/watson-fixture.ts',
+    ]);
+    const exists = (x) => present.has(x);
+    const manifests = {
+      'package.json': JSON.stringify({ workspaces: ['client', 'server'] }),
+      'server/package.json': JSON.stringify({
+        name: '@nsc-eval/server',
+        scripts: { 'migrate:up': 'node-pg-migrate up -m migrations' },
+      }),
+    };
+    const read = (p) => manifests[p] ?? null;
+
+    const withProvision = (cmd) => {
+      const c = contract();
+      c.config.provision = [cmd];
+      return c;
+    };
+
+    test('dropping `--workspace` from its own provision command drops a path', () => {
+      // This is the defect, reproduced. It is not hypothetical: run against
+      // nsc-eval's real contract the same edit takes the scope from 8 to 7.
+      const full = verdictBearingPaths(
+        withProvision('npm run migrate:up --workspace=@nsc-eval/server'), exists, read,
+      );
+      const shrunk = verdictBearingPaths(withProvision('npm run migrate:up'), exists, read);
+
+      assert.ok(full.includes('server/migrations'),
+        'the workspace hop is what puts migrations in scope');
+      assert.ok(!shrunk.includes('server/migrations'),
+        'HEAD-AUTHORED provision decides whether migrations are fingerprinted');
+      assert.deepEqual(full.filter((p) => !shrunk.includes(p)), ['server/migrations']);
+    });
+
+    test('the base-governed declaration puts it back, and the head cannot take it out', () => {
+      // The remedy is not engine code. It is source 3, used: a path that must
+      // stay in scope however the head writes its commands is declared in the
+      // BASE contract, where the head has no authority over it.
+      const c = withProvision('npm run migrate:up');
+      c.config.verdict_bearing_paths = ['server/migrations'];
+      assert.ok(verdictBearingPaths(c, exists, read).includes('server/migrations'));
+      assert.equal(CONFIG_AUTHORITY.verdict_bearing_paths, 'base');
+    });
+
+    test('and the unconditional half is not reachable from any command at all', () => {
+      // `.watson` and the install surface do not come from a command string, so
+      // no rewrite of one can remove them. Emptying EVERY head-authored command
+      // is the strongest version of the attack, and it still leaves these.
+      const c = contract();
+      c.config.install = []; c.config.provision = []; c.config.build = [];
+      c.config.launch = { command: '' };
+      c.fixtures = { profiles: {} };
+      const p = verdictBearingPaths(c, exists, read);
+      assert.ok(p.includes('.watson'));
+      assert.ok(p.includes('package.json'));
+      assert.ok(p.includes('package-lock.json'));
+    });
+
+    test('the shrink is reported: rewriting provision moves operational_config', () => {
+      // The gap is bounded by being VISIBLE. A reviewer sees the changed key and
+      // can compare `contract_scope` between the two results directly.
+      const base = withProvision('npm run migrate:up --workspace=@nsc-eval/server');
+      const head = withProvision('npm run migrate:up');
+      const change = operationalConfigChange(base.config, head.config);
+      assert.equal(change.changed, true);
+      assert.ok(change.changed_keys.includes('provision'));
+      assert.notEqual(change.base_fingerprint, change.head_fingerprint);
+    });
   });
 
   test('a declared path cannot escape the repository', () => {
