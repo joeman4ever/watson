@@ -16,8 +16,9 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  assertionVars, validateAssertionOperands, fixtureValues, fixtureValueEnv, normaliseChosen, validateDenialProofs, reconcileFixtureValues, routeOf,
+  assertionVars, validateAssertionOperands, fixtureValues, fixtureValueEnv, normaliseChosen, validateDenialProofs, reconcileFixtureValues, routeOf, withDependencies,
 } from '../src/contract.mjs';
+import { rollUp } from '../src/result.mjs';
 
 const feature = (id, steps) => ({ id, __file: `${id}.yaml`, steps });
 
@@ -519,5 +520,50 @@ describe('expect_reached: the route answered this identity', () => {
     const p = validateDenialProofs([control, d], { preconditions: [] });
     assert.equal(p.length, 1);
     assert.match(p[0], /nothing proves/);
+  });
+});
+
+describe('a selected journey is never demoted to setup', () => {
+  // OBSERVED, NOT THEORISED. Adding `depends_on: [prospective-report-boundary]`
+  // to another journey turned a real FAIL_PRODUCT into a run reporting
+  // PASS_WITH_ADVISORIES: the dependency edge was walked first, `seen` stopped
+  // the second visit, and the journey was labelled `setup` — a role the roll-up
+  // used to exclude. 320 passing tests did not see it; one real run did.
+  const f = (id, deps) => ({ id, __file: `${id}.md`, steps: [], ...(deps ? { depends_on: deps } : {}) });
+
+  test('a journey that is both selected and a dependency stays `verified`', () => {
+    const dep = f('control');
+    const main = f('main', ['control']);
+    const plan = withDependencies([main, dep], [main, dep]);
+    assert.equal(plan.find((p) => p.feature.id === 'control').role, 'verified');
+  });
+
+  test('order does not decide the role', () => {
+    const dep = f('control');
+    const main = f('main', ['control']);
+    for (const selected of [[main, dep], [dep, main]]) {
+      const plan = withDependencies(selected, [main, dep]);
+      assert.deepEqual(plan.map((p) => p.role), ['verified', 'verified'], JSON.stringify(plan.map((p) => p.feature.id)));
+    }
+  });
+
+  test('a dependency that was NOT selected is still setup', () => {
+    const dep = f('control');
+    const main = f('main', ['control']);
+    const plan = withDependencies([main], [main, dep]);
+    assert.equal(plan.find((p) => p.feature.id === 'control').role, 'setup');
+    assert.equal(plan.find((p) => p.feature.id === 'main').role, 'verified');
+  });
+});
+
+describe('the roll-up counts every feature that ran', () => {
+  test('a setup feature that FAILED is not dropped from the verdict', () => {
+    // It used to be: the roll-up ran over `verified` only, so a failing setup
+    // journey aborted its dependants and the run reported PASS over whatever had
+    // already executed. Two under-verifications in one.
+    assert.equal(rollUp([
+      { verdict: 'PASS', role: 'verified' },
+      { verdict: 'FAIL_PRODUCT', role: 'setup' },
+    ]), 'FAIL_PRODUCT');
   });
 });

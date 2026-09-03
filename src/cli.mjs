@@ -875,18 +875,43 @@ async function cmdVerify(args) {
 
     await browser.close();
 
-    const verified = features.filter((f) => f.role === 'verified');
-    const verdict = rollUp(verified.length ? verified : features);
+    // A SETUP FEATURE'S FAILURE IS NOT INVISIBLE.
+    //
+    // The roll-up used to run over `verified` features only. A setup journey
+    // that failed then aborted its dependants — correctly — and the run reported
+    // PASS over whatever happened to have run already. Two under-verifications
+    // in one: a real product failure dropped, and journeys silently not
+    // attempted. Every executed feature counts, whatever its role.
+    const verdict = rollUp(features);
     const failed = features.filter((f) => f.verdict === 'FAIL_PRODUCT');
+
+    // JOURNEYS THAT WERE SELECTED AND NEVER RAN.
+    //
+    // The loop breaks when a prerequisite fails, so the plan can end with
+    // journeys that produced no result at all. A run cannot claim PASS over
+    // assertions it did not make; if the verdict is not already a failure, it
+    // becomes INDETERMINATE and names them.
+    const attempted = new Set(features.map((f) => f.id));
+    const notAttempted = plan
+      .filter((p) => p.role === 'verified' && !attempted.has(p.feature.id))
+      .map((p) => p.feature.id);
+    if (notAttempted.length) {
+      log(`\n  ⚠ ${notAttempted.length} selected journey(s) never ran: ${notAttempted.join(', ')}`);
+    }
     return finish(runDir, {
       ...base, dbName: up.dbName, baseUrl: up.baseUrl,
-      verdict,
+      verdict: notAttempted.length && PRODUCT_CLAIMS.has(verdict) ? 'INDETERMINATE' : verdict,
       verdictReason: (() => {
         const drift = features.filter((f) => f.verdict === 'FAIL_CONTRACT');
         if (failed.length) return `${failed.length} of ${features.length} feature(s) failed their proof`;
         if (drift.length) return `${drift.length} feature(s) could not be verified — the map names something that no longer exists`;
+        if (notAttempted.length) {
+          return `${notAttempted.length} selected journey(s) never ran (${notAttempted.join(', ')}), `
+            + 'so this run cannot speak for them';
+        }
         return `${features.length} feature(s) met their proof`;
       })(),
+      notAttempted,
       doctor: dr, features, findings, qualitySignals: signals,
       evidence: {
         bundle: path.relative(ROOT, runDir),

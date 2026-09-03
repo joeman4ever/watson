@@ -931,6 +931,18 @@ export function fixtureValueEnv(values) {
  */
 export function withDependencies(selected, all) {
   const byId = new Map(all.map((f) => [f.id, f]));
+  // A FEATURE THAT WAS SELECTED IS VERIFIED, whatever order it is reached in.
+  //
+  // Without this set, a journey that is BOTH selected in its own right AND a
+  // dependency of another selected journey is demoted to `setup` — because the
+  // dependency edge is walked first and `seen` stops the second visit. Setup
+  // verdicts are excluded from the run roll-up, so the demotion silently removed
+  // a journey from the verdict.
+  //
+  // Observed, not theorised: adding `depends_on: [prospective-report-boundary]`
+  // to another journey turned a real FAIL_PRODUCT into a run that reported
+  // PASS_WITH_ADVISORIES. Selection, not visit order, decides the role.
+  const selectedIds = new Set(selected.map((f) => f.id));
   const seen = new Set();
   const ordered = [];
   const visit = (f, isSetup) => {
@@ -940,7 +952,7 @@ export function withDependencies(selected, all) {
       const d = byId.get(dep);
       if (d) visit(d, true);
     }
-    ordered.push({ feature: f, role: isSetup ? 'setup' : 'verified' });
+    ordered.push({ feature: f, role: isSetup && !selectedIds.has(f.id) ? 'setup' : 'verified' });
   };
   for (const f of selected) visit(f, false);
   return ordered;

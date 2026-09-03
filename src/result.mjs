@@ -233,6 +233,10 @@ export function buildEnvelope(run) {
     },
 
     selection: run.selection,
+    // Selected journeys that produced no result at all — a prerequisite failed
+    // and the loop stopped. Named, because a run that quietly reports on the
+    // subset which happened to execute is under-verifying without saying so.
+    not_attempted: run.notAttempted ?? [],
     doctor: run.doctor,
     features: run.features,
     runtime_findings: run.findings,
