@@ -497,3 +497,27 @@ describe('a route is a template, not a URL', () => {
     assert.deepEqual(p, []);
   });
 });
+
+describe('expect_reached: the route answered this identity', () => {
+  const denial = (path, cls) => feature('d', [{ expect_denied: { path }, proof: cls }]);
+
+  test('it satisfies a capability control', () => {
+    const control = feature('ctl', [{ expect_reached: { path: '/api/seasons/${primarySeasonId}/reporting/session-comparison' } }]);
+    const d = denial('/api/seasons/${primarySeasonId}/reporting/session-comparison', 'capability');
+    const p = validateDenialProofs([control, d], {
+      preconditions: [{ as: 'A', get: '/api/seasons/${primarySeasonId}/x', expect: { authorized: true } }],
+    });
+    assert.deepEqual(p, []);
+  });
+
+  test('it does NOT satisfy entity_existence — a 400 says nothing about the entity', () => {
+    // The distinction that keeps this from being a general-purpose loophole: a
+    // 400 for a missing query parameter proves the guard admitted the caller,
+    // and proves nothing whatever about the season in the URL.
+    const control = feature('ctl', [{ expect_reached: { path: '/api/seasons/${foreignSeasonId}/x' } }]);
+    const d = denial('/api/seasons/${foreignSeasonId}/x', 'entity_existence');
+    const p = validateDenialProofs([control, d], { preconditions: [] });
+    assert.equal(p.length, 1);
+    assert.match(p[0], /nothing proves/);
+  });
+});

@@ -82,7 +82,7 @@ export function parseFrontmatter(text, sourceLabel) {
 // does not read it — so it would run the journeys with product-chosen assertion
 // operands and report a confident PASS over exactly the hole v4 exists to close.
 // Silent under-verification is what contract versions are for.
-export const SUPPORTED_CONTRACT_VERSIONS = Object.freeze([1, 2, 3, 4]);
+export const SUPPORTED_CONTRACT_VERSIONS = Object.freeze([1, 2, 3, 4, 5]);
 
 /** Problems with a contract's declared version. Checked before anything is provisioned. */
 export function validateContractVersion(config, supported = SUPPORTED_CONTRACT_VERSIONS) {
@@ -537,6 +537,18 @@ export function validateDenialProofs(features, fixtureProfile) {
       for (const [key, value] of Object.entries(step)) {
         if (key === 'expect_allowed' || key === 'expect_api' || key === 'expect_json') {
           referencedVars(value?.path, runPositiveVars);
+          if (typeof value?.path === 'string') runPositiveRoutes.add(routeOf(value.path));
+          runPositiveSteps += 1;
+        }
+        // `expect_reached` counts for the ROUTE and NOT for the entities in it.
+        //
+        // It establishes that this identity got past authorization on this
+        // route — which is exactly the `capability` obligation. It does NOT
+        // establish that the entities named in the path exist: a 400 for a
+        // missing query parameter says nothing about the season in the URL. So
+        // `entity_existence` and the `domain_negative` sibling check, which are
+        // about entities, do not see it.
+        if (key === 'expect_reached') {
           if (typeof value?.path === 'string') runPositiveRoutes.add(routeOf(value.path));
           runPositiveSteps += 1;
         }

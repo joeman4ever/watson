@@ -155,7 +155,7 @@ export async function openIdentity(browser, { baseUrl, token, viewport }) {
 export const STEPS = [
   'goto', 'reload', 'back', 'click', 'fill', 'select', 'wait_for_text',
   'expect_text', 'expect_text_in', 'expect_no_text', 'expect_no_uuid', 'expect_url_contains',
-  'expect_api', 'expect_denied', 'expect_allowed', 'expect_json',
+  'expect_api', 'expect_denied', 'expect_allowed', 'expect_reached', 'expect_json',
   'expect_count_at_most', 'expect_count_at_least',
   'set_viewport', 'expect_no_overflow',
 ];
@@ -175,7 +175,7 @@ export const STEPS = [
  */
 export const ASSERTION_STEPS = new Set([
   'wait_for_text', 'expect_text', 'expect_text_in', 'expect_no_text', 'expect_url_contains',
-  'expect_api', 'expect_denied', 'expect_allowed', 'expect_json',
+  'expect_api', 'expect_denied', 'expect_allowed', 'expect_reached', 'expect_json',
   'expect_count_at_most', 'expect_count_at_least',
 ]);
 
@@ -377,6 +377,33 @@ export async function runStep(step, ctx) {
         throw new Error(`expected ${want} to be allowed, got ${res.status()}${note}`);
       }
       return `${want} allowed ${res.status()}`;
+    }
+    case 'expect_reached': {
+      // THE ROUTE EXISTS AND THIS IDENTITY WAS NOT TURNED AWAY.
+      //
+      // A weaker claim than `expect_allowed`, made deliberately, for the routes
+      // where a 200 would require building data the fixture has no business
+      // building. `/reporting/session-comparison` needs two DISTINCT sessions;
+      // the POC fixture seeds one, and adding a second only so a control can be
+      // green changes the world under test to suit the checker.
+      //
+      // What the `capability` obligation actually needs is that a denial
+      // elsewhere is not satisfied by a product which denies everyone. A 400
+      // `sessionA_and_sessionB_required` from an admin-guarded route establishes
+      // that precisely — arguably better than a 200 does, because it proves the
+      // guard admitted the caller and the HANDLER RAN.
+      //
+      // 401 and 403 are turned away. 404 is the route or entity not being there,
+      // which is the case this exists to exclude. 405 is the method not existing.
+      // 5xx is the server failing, which proves nothing about authorization.
+      const want = interp(arg.path ?? arg, vars);
+      const res = await page.request.get(want, { failOnStatusCode: false });
+      const status = res.status();
+      evidence.requests.push({ path: want, status, method: 'GET' });
+      if ([401, 403, 404, 405].includes(status) || status >= 500) {
+        throw new Error(`expected ${want} to be reached by this identity, got ${status}${note}`);
+      }
+      return `${want} reached ${status}`;
     }
     case 'expect_json': {
       // Assert on what a route RESOLVED TO, not merely that it answered.

@@ -4,6 +4,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import url from 'node:url';
 import { spawnSync } from 'node:child_process';
+import http from 'node:http';
+
+import * as drive from '../src/driver.mjs';
 
 import { summary, buildEnvelope } from '../src/result.mjs';
 
@@ -220,4 +223,57 @@ describe('the entry point actually starts', () => {
       assert.match(src, new RegExp(`cmd === '${cmd}'`), `usage advertises \`${cmd}\`, which the CLI does not handle`);
     }
   });
+});
+
+// ---------------------------------------------------------------------------
+// `expect_reached` — the status boundary IS the assertion.
+//
+// Driven against a real HTTP server rather than a stubbed `page.request`,
+// because what this step means is entirely a claim about status codes, and a
+// stub would only re-state the table I wrote.
+
+describe('expect_reached', () => {
+  const serve = async (status) => {
+    const srv = http.createServer((_req, res) => { res.writeHead(status); res.end('{}'); });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    return { url: `http://127.0.0.1:${srv.address().port}`, close: () => srv.close() };
+  };
+
+  // A minimal stand-in for Playwright's `page.request`, using the same fetch the
+  // engine's own probes use. The step's logic is the subject; the transport is not.
+  const ctxFor = (base) => ({
+    page: { request: { get: async (p) => {
+      const r = await fetch(new URL(p, base));
+      return { status: () => r.status };
+    } } },
+    evidence: { requests: [] },
+    vars: {},
+  });
+
+  const REACHED = [200, 201, 204, 302, 400, 409, 422];
+  const TURNED_AWAY = [401, 403, 404, 405, 500, 503];
+
+  for (const status of REACHED) {
+    test(`${status} counts as reached`, async () => {
+      const s = await serve(status);
+      try {
+        const out = await drive.runStep({ expect_reached: { path: '/api/x' } }, ctxFor(s.url));
+        assert.match(out, new RegExp(`reached ${status}`));
+      } finally { s.close(); }
+    });
+  }
+
+  for (const status of TURNED_AWAY) {
+    test(`${status} does NOT`, async () => {
+      // 401/403: turned away. 404: the route or entity is not there, which is
+      // the case this step exists to exclude. 405: no such method. 5xx: the
+      // server failed, which proves nothing about authorization.
+      const s = await serve(status);
+      try {
+        await assert.rejects(
+          () => drive.runStep({ expect_reached: { path: '/api/x' } }, ctxFor(s.url)),
+          new RegExp(`to be reached by this identity, got ${status}`));
+      } finally { s.close(); }
+    });
+  }
 });
