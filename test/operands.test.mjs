@@ -16,7 +16,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  assertionVars, validateAssertionOperands, fixtureValues, fixtureValueEnv, normaliseChosen, validateDenialAddresses, reconcileFixtureValues,
+  assertionVars, validateAssertionOperands, fixtureValues, fixtureValueEnv, normaliseChosen, validateDenialProofs, reconcileFixtureValues,
 } from '../src/contract.mjs';
 
 const feature = (id, steps) => ({ id, __file: `${id}.yaml`, steps });
@@ -307,73 +307,117 @@ describe('the usability check does not reject values a product legitimately emit
   });
 });
 
-// A denial proves nothing unless the thing denied exists. This is the check that
-// replaced a FALSE justification: `expect_denied.path` was exempted from the
-// ownership rule on the grounds that a nonexistent id would 404 into
-// FAIL_CONTRACT. nsc-eval's authorization layer answers 403 for anything outside
-// the caller's scope, with no existence check — deliberately, so it is not an
-// existence oracle. So the exemption needed a different guarantee, not a better
-// excuse.
-describe('a denial has to be denying something', () => {
+// The four denial-proof classes.
+//
+// A denial is the easiest assertion to satisfy by accident: 403 comes back from a
+// product that denies correctly, one that denies everything, and one asked about
+// something that does not exist. The three are indistinguishable at the status
+// line, so what a denial must PROVE depends on which claim it is making — and the
+// claim is declared, never inferred from a variable's name.
+describe('denial-proof classes', () => {
   const f = (steps) => ({ id: 'x', __file: 'x.md', steps });
+  const profile = {
+    verifier_chosen: ['grantedGrade', 'ungrantedGrade', 'revokedGrade'],
+    preconditions: [
+      { as: 'W-ADMIN', get: '/api/seasons/${s}/groups/${provenGroupId}', expect: { authorized: true } },
+      { as: 'W-P', get: '/api/x?grade=${revokedGrade}', expect: { authorized: false } },
+    ],
+  };
 
-  test('the attack the review demonstrated: a decoy id nothing can resolve', () => {
-    // A product where EVERY evaluator can open EVERY group passes this journey,
-    // because the group named was never created.
-    const problems = validateDenialAddresses([f([
-      { expect_denied: { path: '/api/seasons/${s}/groups/${unassignedGroupId}/scoring-workspace' } },
-    ])], { preconditions: [{ as: 'W-EVALUATOR', get: '/api/seasons/${s}/x', expect: { authorized: true } }] });
-    assert.equal(problems.length, 1);
-    assert.match(problems[0], /unassignedGroupId/);
-    assert.match(problems[0], /denies everything AND by one that denies nothing/);
+  test('an undeclared class fails closed', () => {
+    const p = validateDenialProofs([f([{ expect_denied: { path: '/api/a/${g}' } }])], profile);
+    assert.equal(p.length, 1);
+    assert.match(p[0], /does not declare which kind of denial/);
+    assert.match(p[0], /is not a weak proof, it is no proof/);
   });
 
-  test('reaching it positively in the same feature satisfies it', () => {
-    assert.deepEqual(validateDenialAddresses([f([
-      { expect_allowed: { path: '/api/seasons/${s}/groups/${g}/scoring-workspace' } },
-      { expect_denied: { path: '/api/seasons/${s}/groups/${g}/my-scores' } },
-    ])], {}), []);
+  test('an unrecognised class fails closed rather than defaulting', () => {
+    const p = validateDenialProofs([f([{ expect_denied: { path: '/api/a' }, proof: 'vibes' }])], profile);
+    assert.equal(p.length, 1);
+    assert.match(p[0], /unknown denial-proof class/);
   });
 
-  test('a precondition that RESOLVES it satisfies it — the only option when this identity must not', () => {
-    assert.deepEqual(validateDenialAddresses(
-      [f([{ expect_denied: { path: '/api/seasons/${s}/groups/${g}/scoring-workspace' } }])],
-      { preconditions: [{ as: 'W-ADMIN', get: '/api/seasons/${s}/groups/${g}/scoring-workspace', expect: { authorized: true } }] },
-    ), []);
+  test('entity_existence: a decoy id is refused, a proven one is accepted', () => {
+    const decoy = validateDenialProofs(
+      [f([{ expect_denied: { path: '/api/a/${decoyId}' }, proof: 'entity_existence' }])], profile);
+    assert.equal(decoy.length, 1);
+    assert.match(decoy[0], /denies exactly like one that does/);
+
+    const proven = validateDenialProofs(
+      [f([{ expect_denied: { path: '/api/a/${provenGroupId}' }, proof: 'entity_existence' }])], profile);
+    assert.deepEqual(proven, []);
   });
 
-  test('a precondition that expects a DENIAL does not satisfy it', () => {
-    // Two denials are not an existence proof. This is the shape that would have
-    // let the check be satisfied by restating the thing being tested.
-    const problems = validateDenialAddresses(
-      [f([{ expect_denied: { path: '/api/seasons/${s}/groups/${g}/scoring-workspace' } }])],
-      { preconditions: [{ as: 'W-EVALUATOR', get: '/api/seasons/${s}/groups/${g}/x', expect: { authorized: false } }] },
-    );
-    assert.equal(problems.length, 1);
+  test('domain_negative: needs a verifier-chosen value and a working sibling', () => {
+    const noSibling = validateDenialProofs(
+      [f([{ expect_denied: { path: '/api/x?grade=${ungrantedGrade}' }, proof: { class: 'domain_negative' } }])], profile);
+    assert.match(noSibling[0], /must name the known-positive `sibling`/);
+
+    // The sibling has to actually be exercised, or the capability itself is unproven.
+    const unexercised = validateDenialProofs(
+      [f([{ expect_denied: { path: '/api/x?grade=${ungrantedGrade}' }, proof: { class: 'domain_negative', sibling: 'grantedGrade' } }])],
+      profile);
+    assert.match(unexercised[0], /never positively exercised/);
+
+    const good = validateDenialProofs([f([
+      { expect_api: { path: '/api/x?grade=${grantedGrade}' } },
+      { expect_denied: { path: '/api/x?grade=${ungrantedGrade}' }, proof: { class: 'domain_negative', sibling: 'grantedGrade' } },
+    ])], profile);
+    assert.deepEqual(good, []);
+  });
+
+  test('state_transition: a never-granted value is not a substitute for a revoked one', () => {
+    // `revokedGrade` is only ever resolved by a precondition that EXPECTS A DENIAL,
+    // which is not evidence the grant ever existed.
+    const p = validateDenialProofs(
+      [f([{ expect_denied: { path: '/api/x?grade=${revokedGrade}' }, proof: 'state_transition' }])], profile);
+    assert.equal(p.length, 1);
+    assert.match(p[0], /was ALLOWED before the transition/);
+  });
+
+  test('capability: the route must succeed for someone, or every denial is free', () => {
+    const noControl = validateDenialProofs(
+      [f([{ expect_denied: { path: '/api/seasons/x/audit-log' }, proof: 'capability' }])], profile);
+    assert.equal(noControl.length, 1);
+    assert.match(noControl[0], /satisfied by a product that denies everything/);
+
+    const withControl = validateDenialProofs([f([
+      { expect_allowed: { path: '/api/seasons/x/my-scores' } },
+      { expect_denied: { path: '/api/seasons/x/audit-log' }, proof: 'capability' },
+    ])], profile);
+    assert.deepEqual(withControl, []);
   });
 });
 
-// Reconciliation, against the SHAPES the engine actually produces.
+// Reconciling what the fixture built with what the verifier chose, against the
+// SHAPES the engine actually produces.
 //
-// Every test here used strings, and the engine's `integer` shape returns a
-// number. `reconcileFixtureValues` stringified one side of the comparison and
-// not the other, so `"13" !== 13` made every integer-shaped value report as
-// ignored — on every run, against a fixture that had done nothing wrong. It was
-// found by the first local end-to-end run, not by 193 passing unit tests.
-describe('reconciling what the fixture built with what the verifier chose', () => {
+// Every other test here used strings, and the `integer` shape returns a number.
+// `reconcileFixtureValues` stringified one side of the comparison and not the
+// other, so `"13" !== 13` made every integer-shaped value report as ignored — on
+// every run, against a fixture that had done exactly what it was told. Found by
+// the first local end-to-end run, not by the unit suite.
+describe('reconciling the fixture against the verifier', () => {
   test('an integer-shaped value the fixture used correctly is NOT flagged', () => {
     const chosen = fixtureValues('wtsn-x', [{ grantedCohortSize: { integer: { min: 12, max: 18 } } }]);
-    assert.equal(typeof chosen.grantedCohortSize, 'number', 'the shape still returns a number');
-    // The fixture reports back what it built, as a number, exactly as seeded.
-    const { ignored } = reconcileFixtureValues({ grantedCohortSize: chosen.grantedCohortSize }, chosen);
-    assert.deepEqual(ignored, []);
+    assert.equal(typeof chosen.grantedCohortSize, 'number');
+    assert.deepEqual(reconcileFixtureValues({ grantedCohortSize: chosen.grantedCohortSize }, chosen).ignored, []);
   });
 
   test('a fixture that really did use a different number IS flagged', () => {
     const chosen = fixtureValues('wtsn-x', [{ grantedCohortSize: { integer: { min: 12, max: 18 } } }]);
     const { ignored } = reconcileFixtureValues({ grantedCohortSize: chosen.grantedCohortSize + 1 }, chosen);
     assert.equal(ignored.length, 1);
-    assert.match(ignored[0], /grantedCohortSize/);
+  });
+
+  test('OMITTING a chosen value is caught, not just contradicting one', () => {
+    // The omission matters most where it is least visible. A fixture that never
+    // grants-then-revokes the verifier's `revokedGrade` still passes "the revoked
+    // grant is denied", because a never-granted grade denies identically.
+    const chosen = fixtureValues('wtsn-x', ['grantedGrade', 'revokedGrade']);
+    const { ignored } = reconcileFixtureValues({ grantedGrade: chosen.grantedGrade }, chosen);
+    assert.equal(ignored.length, 1);
+    assert.match(ignored[0], /revokedGrade/);
   });
 
   test('the verifier\'s value wins whatever the fixture said', () => {

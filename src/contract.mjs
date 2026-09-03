@@ -372,68 +372,152 @@ export function assertionVars(feature) {
  * that assigns the id also decides what the assertion sees.
  */
 /**
- * Refuse a journey that proves a denial against an address nothing shows exists.
+ * The four denial-proof classes, and what each one obliges a journey to show.
  *
- * WHY THIS EXISTS. `expect_denied.path` is exempt from the ownership rule on the
- * grounds that the path is an address, not proof. The original justification for
- * that was: "choosing a nonexistent id gets a 404, which the engine classifies as
- * FAIL_CONTRACT rather than a pass." Against nsc-eval that is false.
- * `requireAssignmentScope` answers **403 for anything outside the caller's
- * scope, with no existence check** — deliberately, so the endpoint is not an
- * existence oracle. Correct security; fatal to the argument.
+ * A denial is the easiest assertion in the world to satisfy by accident. `403`
+ * comes back from a product that denies correctly, from a product that denies
+ * everything, and from a product asked about something that does not exist — and
+ * the three are indistinguishable at the status line.
  *
- * The consequence, reproduced: a product in which every evaluator can open every
- * group in the season — AC-03 broken outright — passes all three `expect_denied`
- * steps of `evaluator-assignment-scope`, because the fixture chose an
- * `unassignedGroupId` that does not exist. Nothing was denied. Nothing existed.
+ * `expect_denied` therefore has NO universal operand rule. What it must prove
+ * depends on what kind of negative claim it is making, and the kind is DECLARED in
+ * the trusted contract. Never inferred from a variable's name: `unassignedGroupId`
+ * and `ungrantedGrade` need opposite obligations, and nothing in the spelling says
+ * so.
  *
- * The fix is not to make every id verifier-supplied; that would force a change to
- * a product's data-access boundary to satisfy a verifier. It is to make the
- * journey carry the property it was always relying on: SOMETHING must establish
- * that the address resolves. Either
- *
- *   - a positive assertion in the same feature reaches it (`expect_allowed`,
- *     `expect_api`, `expect_json`), which is how `assignedGroupId` already works,
- *     or
- *   - a fixture PRECONDITION resolves it through the product's own read paths as
- *     an identity that is allowed to see it — which is the only option when, as
- *     here, the journey's own identity must not be able to reach it.
- *
- * A decoy id satisfies neither, and the contract is refused before anything is
- * provisioned rather than passing against a broken product.
+ * An undeclared or unrecognised class fails closed. That is the whole point: a
+ * denial whose meaning the engine cannot establish is not a weak proof, it is no
+ * proof, and shipping it as a green step is how a product that denies everything
+ * passes a security journey.
  */
-export function validateDenialAddresses(features, fixtureProfile) {
+export const DENIAL_PROOF_CLASSES = Object.freeze([
+  // The denied ENTITY must be real, and must stand in the relationship the denial
+  // is about. `unassignedGroupId` is the case: a group that does not exist denies
+  // exactly like a group this evaluator was not assigned to.
+  'entity_existence',
+  // The denied VALUE is a legal member of the domain for which no grant exists.
+  // Demanding a positive read of it would invert the condition under test, so
+  // what is required instead is a known-positive SIBLING that works.
+  'domain_negative',
+  // The denial follows a lifecycle: allowed, then a transition, then denied. A
+  // never-granted value denies identically and proves nothing about the
+  // transition, which is the entire property.
+  'state_transition',
+  // The route and target are real and the operation works for an authorized
+  // caller; the denied caller differs in exactly the authorization predicate
+  // under test. This is the common shape — role, scope, assignment, tier — and it
+  // is most of any real map.
+  'capability',
+]);
+
+/**
+ * Check every `expect_denied` step against the obligation its declared class
+ * carries. Returns human-readable problems; empty means the map's denials are
+ * capable of meaning something.
+ */
+export function validateDenialProofs(features, fixtureProfile) {
   const problems = [];
 
-  // Names a precondition proves resolve. A precondition that EXPECTS a denial
-  // proves nothing about existence, for exactly the reason this check exists.
-  const provenByPrecondition = new Set();
+  // Names a precondition RESOLVES. A precondition that expects a denial proves
+  // nothing about existence — two denials are not an existence proof.
+  const resolvedByPrecondition = new Set();
   for (const pre of fixtureProfile?.preconditions ?? []) {
-    const denies = pre.expect?.authorized === false;
-    if (denies) continue;
-    referencedVars(pre.get, provenByPrecondition);
+    if (pre.expect?.authorized === false) continue;
+    referencedVars(pre.get, resolvedByPrecondition);
   }
+  const chosen = new Set(normaliseChosen(fixtureProfile?.verifier_chosen ?? []).map(([n]) => n));
 
   for (const feature of features) {
-    const denied = new Set();
+    const label = feature.__file ?? feature.id;
     const positive = new Set();
+    let positiveSteps = 0;
     for (const step of feature.steps ?? []) {
       for (const [key, value] of Object.entries(step)) {
-        if (key === 'expect_denied') referencedVars(value?.path, denied);
-        else if (key === 'expect_allowed' || key === 'expect_api') referencedVars(value?.path, positive);
-        else if (key === 'expect_json') referencedVars(value?.path, positive);
+        if (key === 'expect_allowed' || key === 'expect_api' || key === 'expect_json') {
+          referencedVars(value?.path, positive);
+          positiveSteps += 1;
+        }
       }
     }
-    const unproven = [...denied].filter((v) => !positive.has(v) && !provenByPrecondition.has(v));
-    if (unproven.length) {
-      problems.push(
-        `${feature.__file ?? feature.id}: asserts a DENIAL against `
-        + `${unproven.map((v) => `\`\${${v}}\``).join(', ')}, which nothing in this run proves exists. `
-        + 'A denial against an address that resolves to nothing is satisfied by a product that denies '
-        + 'everything AND by one that denies nothing, so it proves neither. Reach it with an '
-        + '`expect_allowed`/`expect_api` in this feature, or resolve it in a fixture precondition as an '
-        + 'identity permitted to see it.',
-      );
+
+    for (const [index, step] of (feature.steps ?? []).entries()) {
+      if (!('expect_denied' in step)) continue;
+      const at = `${label} step ${index + 1}`;
+      const declared = step.proof ?? null;
+      const cls = typeof declared === 'string' ? declared : declared?.class ?? null;
+
+      if (!cls) {
+        problems.push(
+          `${at}: \`expect_denied\` does not declare which kind of denial it proves. `
+          + `Add \`proof:\` naming one of ${DENIAL_PROOF_CLASSES.join(', ')}. A denial whose meaning `
+          + 'the engine cannot establish is not a weak proof, it is no proof.',
+        );
+        continue;
+      }
+      if (!DENIAL_PROOF_CLASSES.includes(cls)) {
+        problems.push(`${at}: unknown denial-proof class \`${cls}\` (expected one of ${DENIAL_PROOF_CLASSES.join(', ')}).`);
+        continue;
+      }
+
+      const vars = new Set();
+      referencedVars(step.expect_denied?.path, vars);
+
+      if (cls === 'entity_existence') {
+        const unproven = [...vars].filter((v) => !positive.has(v) && !resolvedByPrecondition.has(v));
+        if (unproven.length) {
+          problems.push(
+            `${at}: declares \`entity_existence\` but nothing proves ${unproven.map((v) => `\`\${${v}}\``).join(', ')} `
+            + 'exists. Reach it with a positive assertion in this feature, or resolve it in a precondition '
+            + 'as an identity permitted to see it. An entity that does not exist denies exactly like one '
+            + 'that does.',
+          );
+        }
+      } else if (cls === 'domain_negative') {
+        const sibling = declared?.sibling ?? null;
+        const denied = [...vars];
+        if (!sibling) {
+          problems.push(`${at}: \`domain_negative\` must name the known-positive \`sibling\` that the same capability accepts.`);
+        } else if (!positive.has(sibling) && !resolvedByPrecondition.has(sibling)) {
+          problems.push(
+            `${at}: the sibling \`\${${sibling}}\` is never positively exercised, so the capability itself is `
+            + 'unproven and the denial is satisfied by a product that denies everything.',
+          );
+        }
+        const unchosen = denied.filter((v) => !chosen.has(v));
+        if (unchosen.length) {
+          problems.push(
+            `${at}: \`domain_negative\` requires the denied value to be verifier-chosen from the trusted `
+            + `domain; ${unchosen.map((v) => `\`\${${v}}\``).join(', ')} is not declared in \`verifier_chosen\`.`,
+          );
+        }
+        if (sibling && denied.includes(sibling)) {
+          problems.push(`${at}: the denied value and its sibling are the same name (\`${sibling}\`).`);
+        }
+      } else if (cls === 'state_transition') {
+        const established = [...vars].filter((v) => !resolvedByPrecondition.has(v));
+        if (established.length) {
+          problems.push(
+            `${at}: \`state_transition\` needs trusted evidence that ${established.map((v) => `\`\${${v}}\``).join(', ')} `
+            + 'was ALLOWED before the transition. A never-granted value denies identically, so without the '
+            + 'prior state this step proves nothing about the transition it names.',
+          );
+        }
+      } else if (cls === 'capability') {
+        if (positiveSteps === 0) {
+          problems.push(
+            `${at}: \`capability\` requires the route or capability to be positively demonstrated somewhere `
+            + 'in this feature — an authorized control that SUCCEEDS. Without one, every denial here is '
+            + 'satisfied by a product that denies everything.',
+          );
+        }
+        const context = [...vars].filter((v) => !positive.has(v) && !resolvedByPrecondition.has(v));
+        if (context.length) {
+          problems.push(
+            `${at}: the context ${context.map((v) => `\`\${${v}}\``).join(', ')} is never shown to exist, so the `
+            + 'denied request may be denied for the wrong reason.',
+          );
+        }
+      }
     }
   }
   return problems;

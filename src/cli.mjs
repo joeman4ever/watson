@@ -15,7 +15,7 @@ import url from 'node:url';
 import {
   loadContract, loadContractAt, selectByProfile, withDependencies,
   validateFeatureVars, validateEnvOwnership, validateBrowserOwnership, validateContractVersion, validateStepOrder,
-  validateAssertionOperands, fixtureValues, fixtureValueEnv, reconcileFixtureValues,
+  validateAssertionOperands, validateDenialProofs, fixtureValues, fixtureValueEnv, reconcileFixtureValues,
 } from './contract.mjs';
 import { productFingerprint, contractFingerprint, resolveSha, contractChange, productIdentity, changedPaths, engineProvenance } from './fingerprint.mjs';
 import { readManifest } from './manifest.mjs';
@@ -603,6 +603,10 @@ async function cmdVerify(args) {
     ...validateStepOrder(plan.map((p) => p.feature)),
     ...validateEnvOwnership(contract.config),
     ...validateAssertionOperands(
+      plan.map((p) => p.feature),
+      contract.fixtures.profiles?.[contract.config.launch.fixture_profile],
+    ),
+    ...validateDenialProofs(
       plan.map((p) => p.feature),
       contract.fixtures.profiles?.[contract.config.launch.fixture_profile],
     ),
