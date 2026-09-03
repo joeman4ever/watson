@@ -7,7 +7,14 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
+import { ASSERTION_STEPS } from './driver.mjs';
 import { execFileSync } from 'node:child_process';
+// The hardened wrapper, so the claim that EVERY git invocation goes through it
+// is true rather than nearly true. This one reads a base-branch tree, which the
+// pull request's author does not write — but 'not exploitable today' is a worse
+// property than 'covered'.
+import { git } from './fingerprint.mjs';
 import YAML from 'yaml';
 
 /** Parse `---\nyaml\n---\nmarkdown` into { data, body }. */
@@ -63,7 +70,13 @@ export function parseFrontmatter(text, sourceLabel) {
  * silent under-verification this list exists to make impossible, and nothing but
  * a version refusal catches it.
  */
-export const SUPPORTED_CONTRACT_VERSIONS = Object.freeze([1, 2, 3]);
+// v4 adds `verifier_chosen` (with shapes and closed domains), `generated_roots`,
+// and the `expect_text_in` step. The bump is load-bearing for the first of those:
+// an engine that predates `verifier_chosen` does not error on the key, it simply
+// does not read it — so it would run the journeys with product-chosen assertion
+// operands and report a confident PASS over exactly the hole v4 exists to close.
+// Silent under-verification is what contract versions are for.
+export const SUPPORTED_CONTRACT_VERSIONS = Object.freeze([1, 2, 3, 4]);
 
 /** Problems with a contract's declared version. Checked before anything is provisioned. */
 export function validateContractVersion(config, supported = SUPPORTED_CONTRACT_VERSIONS) {
@@ -195,6 +208,493 @@ export function validateFeatureVars(features, fixtureProfile, alwaysAvailable = 
 }
 
 /**
+ * Check the VALUES the fixture actually emitted, not only that their names were
+ * declared.
+ *
+ * `validateFeatureVars` above proves a journey only interpolates names the
+ * profile promises. It says nothing about what comes back, and what comes back
+ * is authored by the product — the seed command runs in the product's own
+ * checkout, on the untrusted side of the boundary.
+ *
+ * That matters because these values land in ASSERTION OPERANDS, not merely in
+ * inputs: `expect_text: "${seasonName}"`, `expect_url_contains: "${sessionId}"`,
+ * the expected values of `expect_json`, and doctor's read-path preconditions. An
+ * empty string interpolates to an empty expectation, and an empty expectation is
+ * satisfied by anything:
+ *
+ *     expect_text ""            -> true against a blank page
+ *     expect_url_contains ""    -> true against any URL
+ *
+ * So a product could neutralise the journeys that judge it by emitting `""`, and
+ * the run would report PASS having proved nothing. Refusing here makes that a
+ * BLOCKED_ENVIRONMENT — a statement about the world Watson was given, which is
+ * exactly what it is — rather than a green tick.
+ */
+/**
+ * Sanity-check the values a fixture emitted. See `degenerateOperand`: this is
+ * usability, not a boundary. The boundary is `validateAssertionOperands`.
+ */
+export function validateSeedValues(vars, fixtureProfile) {
+  const declared = fixtureProfile?.emits ?? [];
+  const problems = [];
+  for (const name of declared) {
+    if (!(name in (vars ?? {}))) {
+      problems.push(`the fixture declares \`${name}\` in \`emits\` but did not emit it`);
+      continue;
+    }
+    const bad = degenerateOperand(vars[name]);
+    if (bad) problems.push(`\`${name}\` ${bad}`);
+  }
+  return problems;
+}
+
+/**
+ * A USABILITY CHECK. Not a trust control, and no longer described as one.
+ *
+ * It began as a defence: reject values too unspecific to prove anything, and a
+ * hostile fixture would find it harder to neutralise its own journeys. That was
+ * never going to work, and two reviews said so — `http`, `Sign` and `Home` are
+ * all plausible and all make a substring assertion true against a generic error
+ * page. No predicate over a string separates a real season name from a string
+ * chosen because it appears on the failure page.
+ *
+ * `validateAssertionOperands` closes that properly, by taking the choice away.
+ * What survives here is worth keeping for a different and much smaller reason:
+ * a fixture that emits an empty or malformed value for a name a journey uses as
+ * INPUT produces a confusing failure three steps later, and saying so at the
+ * source is kinder than debugging it.
+ */
+export function degenerateOperand(value) {
+  if (value === null || value === undefined) return 'is null, so nothing can be interpolated from it';
+  if (typeof value === 'object') return 'is not a scalar; a fixture variable must be a string or number';
+  if (String(value).trim() === '') return 'came back empty, which interpolates to nothing';
+  return null;
+}
+
+// A length floor lived here briefly and has been removed, which is worth
+// recording because removing a check usually deserves more suspicion than adding
+// one.
+//
+// It was introduced as a defence — reject operands too short to prove anything —
+// and it never worked, because `http` and `Sign` are long enough and still
+// vacuous. `validateAssertionOperands` closes that properly. What the floor DID
+// do, once it was no longer defending anything, was reject values a product
+// legitimately emits: nsc-eval's grades are `'5'` and `'7'`, and a threshold it
+// displays is `10`. A usability check that fails valid contracts is not a
+// usability check.
+
+/**
+ * The variables a feature uses AS PROOF, as opposed to as input.
+ *
+ * Only assertion steps count. A value that merely gets typed into a form can be
+ * anything; a value that makes an assertion true cannot be chosen by the thing
+ * the assertion is about.
+ */
+/**
+ * Within an assertion step, WHICH FIELD carries the proof.
+ *
+ * The first version of this rule counted every `${...}` inside an assertion step,
+ * and that is too coarse: in `expect_denied` the assertion is an AUTHORIZATION
+ * OUTCOME and the path names WHICH thing. But "address" never meant "harmless",
+ * and the first cut of this table got two things wrong.
+ *
+ * WRONG ONE — a selector is not an address. `locator()` resolves `text=...`
+ * through `page.getByText`, so
+ *
+ *     expect_count_at_least: { selector: "text=${sessionName}", min: 1 }
+ *
+ * IS `expect_text: "${sessionName}"` wearing a different hat, and the table said
+ * it carried no proof at all. Anything that can name content — a `text=`
+ * selector, `:has-text(...)` — is proof, so selectors are counted. A selector
+ * that addresses structurally (`testid=`, `css=`) simply has no variables in it
+ * and costs nothing.
+ *
+ * WRONG TWO — see `validateDenialAddresses` below. The justification for
+ * exempting `expect_denied.path` rested on a claim about the product ("a
+ * nonexistent id gets a 404, which is FAIL_CONTRACT, not a pass") that is FALSE
+ * against nsc-eval, whose authorization layer deliberately has no existence
+ * oracle and answers 403 for anything outside the caller's scope. The exemption
+ * survives, because the alternative — forcing every id to be verifier-supplied —
+ * would push a product architecture change for a property a journey can carry
+ * itself. What replaces the false justification is an enforced obligation:
+ * something has to prove the address resolves.
+ *
+ * Contrast `expect_text: "${seasonName}"`, where the operand IS the proof: a
+ * product that picks the string picks whether the assertion holds.
+ */
+const PROOF_FIELDS = {
+  // Both fields: the text is the proof, and a `text=` selector is also proof.
+  expect_text_in: ['text', 'selector'],
+  expect_json: ['contains', 'body', 'expect'],
+  // `path` addresses; the assertion is the status class it comes back with. The
+  // obligation that makes this safe is enforced by `validateDenialAddresses`.
+  expect_api: [],
+  expect_denied: [],
+  expect_allowed: [],
+  // The BOUND is a number from the contract, but the selector can name content.
+  expect_count_at_most: ['selector'],
+  expect_count_at_least: ['selector'],
+};
+
+export function assertionVars(feature) {
+  const into = new Set();
+  for (const step of feature.steps ?? []) {
+    for (const [key, value] of Object.entries(step)) {
+      if (!ASSERTION_STEPS.has(key)) continue;
+      if (!(key in PROOF_FIELDS)) { referencedVars(value, into); continue; }
+      for (const field of PROOF_FIELDS[key]) referencedVars(value?.[field], into);
+    }
+  }
+  return into;
+}
+
+/**
+ * Refuse a contract in which the PRODUCT chooses the values that make Watson's
+ * assertions true.
+ *
+ * This is the rule three rounds of review converged on, and it is the one
+ * property that closes the class rather than raising its cost:
+ *
+ *   The thing being tested cannot choose the value that makes the verifier's
+ *   assertion true.
+ *
+ * The heuristic this replaces — refusing values that look vacuous — could never
+ * establish it. `http`, `Sign` and `Home` are all syntactically plausible and all
+ * make a substring assertion true against a generic error page. There is no
+ * predicate over a string that distinguishes "a real season name" from "a string
+ * chosen because it appears on the failure page", because the difference is not
+ * in the string. It is in who picked it.
+ *
+ * So the contract must declare, per fixture profile, which names the VERIFIER
+ * supplies. Anything a journey asserts on must be one of those. A journey that
+ * wants to assert on a database-assigned id has to stop, and assert on something
+ * the verifier named instead — which is the right pressure, because a product
+ * that assigns the id also decides what the assertion sees.
+ */
+/**
+ * Refuse a journey that proves a denial against an address nothing shows exists.
+ *
+ * WHY THIS EXISTS. `expect_denied.path` is exempt from the ownership rule on the
+ * grounds that the path is an address, not proof. The original justification for
+ * that was: "choosing a nonexistent id gets a 404, which the engine classifies as
+ * FAIL_CONTRACT rather than a pass." Against nsc-eval that is false.
+ * `requireAssignmentScope` answers **403 for anything outside the caller's
+ * scope, with no existence check** — deliberately, so the endpoint is not an
+ * existence oracle. Correct security; fatal to the argument.
+ *
+ * The consequence, reproduced: a product in which every evaluator can open every
+ * group in the season — AC-03 broken outright — passes all three `expect_denied`
+ * steps of `evaluator-assignment-scope`, because the fixture chose an
+ * `unassignedGroupId` that does not exist. Nothing was denied. Nothing existed.
+ *
+ * The fix is not to make every id verifier-supplied; that would force a change to
+ * a product's data-access boundary to satisfy a verifier. It is to make the
+ * journey carry the property it was always relying on: SOMETHING must establish
+ * that the address resolves. Either
+ *
+ *   - a positive assertion in the same feature reaches it (`expect_allowed`,
+ *     `expect_api`, `expect_json`), which is how `assignedGroupId` already works,
+ *     or
+ *   - a fixture PRECONDITION resolves it through the product's own read paths as
+ *     an identity that is allowed to see it — which is the only option when, as
+ *     here, the journey's own identity must not be able to reach it.
+ *
+ * A decoy id satisfies neither, and the contract is refused before anything is
+ * provisioned rather than passing against a broken product.
+ */
+export function validateDenialAddresses(features, fixtureProfile) {
+  const problems = [];
+
+  // Names a precondition proves resolve. A precondition that EXPECTS a denial
+  // proves nothing about existence, for exactly the reason this check exists.
+  const provenByPrecondition = new Set();
+  for (const pre of fixtureProfile?.preconditions ?? []) {
+    const denies = pre.expect?.authorized === false;
+    if (denies) continue;
+    referencedVars(pre.get, provenByPrecondition);
+  }
+
+  for (const feature of features) {
+    const denied = new Set();
+    const positive = new Set();
+    for (const step of feature.steps ?? []) {
+      for (const [key, value] of Object.entries(step)) {
+        if (key === 'expect_denied') referencedVars(value?.path, denied);
+        else if (key === 'expect_allowed' || key === 'expect_api') referencedVars(value?.path, positive);
+        else if (key === 'expect_json') referencedVars(value?.path, positive);
+      }
+    }
+    const unproven = [...denied].filter((v) => !positive.has(v) && !provenByPrecondition.has(v));
+    if (unproven.length) {
+      problems.push(
+        `${feature.__file ?? feature.id}: asserts a DENIAL against `
+        + `${unproven.map((v) => `\`\${${v}}\``).join(', ')}, which nothing in this run proves exists. `
+        + 'A denial against an address that resolves to nothing is satisfied by a product that denies '
+        + 'everything AND by one that denies nothing, so it proves neither. Reach it with an '
+        + '`expect_allowed`/`expect_api` in this feature, or resolve it in a fixture precondition as an '
+        + 'identity permitted to see it.',
+      );
+    }
+  }
+  return problems;
+}
+
+export function validateAssertionOperands(features, fixtureProfile, engineSupplied = ['runId']) {
+  const chosen = new Set([
+    ...normaliseChosen(fixtureProfile?.verifier_chosen ?? []).map(([n]) => n),
+    ...engineSupplied,
+  ]);
+  const problems = [];
+  for (const f of features) {
+    const used = [...assertionVars(f)].filter((v) => !chosen.has(v)).sort();
+    if (used.length) {
+      problems.push(
+        `${f.__file ?? f.id}: asserts on ${used.map((m) => `\`\${${m}}\``).join(', ')}, which the ` +
+          'fixture profile does not declare in `verifier_chosen`. The product would be choosing the ' +
+          'value that makes its own test pass.',
+      );
+    }
+  }
+  return problems;
+}
+
+/**
+ * The values the verifier supplies to the fixture.
+ *
+ * Deterministic per run, derived from the run identity the verifier owns, so a
+ * re-run of the same run is reproducible and two concurrent runs never collide.
+ * Not random, because flakiness bought nothing here.
+ *
+ * THE PROPERTY IS "CANNOT CHOOSE", NOT "CANNOT PREDICT", and the difference is
+ * worth stating because the docs used to claim the second. The product CAN
+ * predict these: the run id is passed to the fixture on its own command line
+ * (nsc-eval's `command:` interpolates `${RUN_ID}`), a contract's `env:` block can
+ * put it in front of the running application, and this derivation is public. A
+ * hostile application can recompute every value at startup and render them.
+ *
+ * That is survivable, and choosing would not be. An application that renders
+ * `${primarySeasonName}` on every page makes `expect_text` pass — and fails the
+ * negative journeys, which assert that the same string does NOT appear where it
+ * must not, and the denials, which are status-class assertions it cannot paint
+ * its way out of. What the old design allowed was different in kind: the fixture
+ * picked a string that was ALREADY on the failure page, so the product did not
+ * have to do anything at all.
+ *
+ * Long enough that a substring assertion on one is meaningful: 16 hex characters
+ * do not appear on an error page by accident.
+ */
+export function fixtureValues(runId, declared = []) {
+  const chosen = normaliseChosen(declared);
+  const out = {};
+
+  // POOLS FIRST. Names drawn from the same closed domain usually have to differ
+  // from each other — nsc-eval takes five grades from one fourteen-member set,
+  // and a journey whose "granted" and "ungranted" grades collide does not test
+  // an authorization boundary, it tests nothing, non-deterministically.
+  //
+  // Hashing each name independently makes that collision a matter of luck. A
+  // pool takes the choice out of luck as well as out of the product's hands.
+  const pools = new Map();
+  for (const [name, shape, domain, pool] of chosen) {
+    if (shape !== 'enum' || !pool) continue;
+    if (!pools.has(pool)) pools.set(pool, { domain, names: [] });
+    const p = pools.get(pool);
+    if (JSON.stringify(p.domain) !== JSON.stringify(domain)) {
+      throw new Error(`pool \`${pool}\` is declared with two different domains; a pool is one set`);
+    }
+    p.names.push(name);
+  }
+  for (const [pool, { domain, names }] of pools) {
+    if (names.length > domain.length) {
+      throw new Error(
+        `pool \`${pool}\` needs ${names.length} distinct values but its domain has ${domain.length}`,
+      );
+    }
+    // A deterministic permutation of the domain, keyed on the run and the pool,
+    // dealt out in declaration order. Every member is as likely as any other and
+    // no two names collide.
+    const order = [...domain]
+      .map((v) => [v, crypto.createHash('sha256').update(`watson-pool\0${runId}\0${pool}\0${v}`).digest('hex')])
+      .sort((a, b) => (a[1] < b[1] ? -1 : 1))
+      .map(([v]) => v);
+    names.forEach((name, i) => { out[name] = order[i]; });
+  }
+
+  for (const [name, shape, domain] of chosen) {
+    if (name in out) continue;
+    const h = crypto.createHash('sha256').update(`watson-fixture\0${runId}\0${name}`).digest('hex');
+    if (shape === 'enum') out[name] = pickFromDomain(h, name, domain);
+    else if (shape === 'integer' && domain) out[name] = pickInteger(h, domain);
+    else out[name] = SHAPES[shape](h, name);
+  }
+  return out;
+}
+
+/**
+ * A verifier-chosen value still has to be something the product can store.
+ *
+ * A season NAME can be any string; a season ID is a uuid column; a cohort SIZE
+ * is an integer the fixture has to actually create that many rows for. Handing
+ * the fixture `watson-primarySeasonId-3f2a…` where a uuid belongs would fail at
+ * the insert and read as a broken world, so the contract declares the shape and
+ * the verifier generates something that fits it.
+ *
+ * Every shape is derived from the same run-scoped hash, so all of them are
+ * deterministic per run, not chosen by the product,
+ * and distinct from each other.
+ */
+export const SHAPES = {
+  text: (h, name) => `watson-${name}-${h.slice(0, 16)}`,
+  // RFC 4122 layout, deterministic content. Version 4 nibble and variant bits are
+  // set so a strict uuid column or validator accepts it.
+  uuid: (h) => [
+    h.slice(0, 8), h.slice(8, 12),
+    `4${h.slice(13, 16)}`,
+    `${((parseInt(h.slice(16, 17), 16) & 0x3) | 0x8).toString(16)}${h.slice(17, 20)}`,
+    h.slice(20, 32),
+  ].join('-'),
+  // Small and positive: the fixture has to create this many rows, and a cohort
+  // of 4 billion is not a test, it is an outage. A range narrows it further when
+  // the product's own semantics require one — see `pickInteger`.
+  integer: (h) => pickInteger(h, { min: 3, max: 9 }),
+};
+
+/**
+ * An integer the verifier chooses, optionally within a range the contract
+ * declares.
+ *
+ * The range exists because some numbers are not free. nsc-eval seeds a cohort
+ * that must be ABOVE its disclosure threshold, so that the journey observes a
+ * reportable aggregate; a verifier that picked 4 would produce a suppressed
+ * cohort, the journey would see a suppression notice where it expected a count,
+ * and Watson would report FAIL_PRODUCT against a product that did exactly the
+ * right thing. A false accusation is the most expensive kind of wrong a verifier
+ * can be.
+ *
+ * A declared range is a RESTATEMENT of something the product decides, and that
+ * coupling is real: if the product's threshold moves past the range, the journey
+ * breaks. It breaks LOUDLY rather than silently — the contract is then stale and
+ * says so in review — but it is a coupling, and a contract that declares one
+ * should say why beside it.
+ */
+function pickInteger(h, { min, max }) {
+  if (!Number.isInteger(min) || !Number.isInteger(max) || max < min) {
+    throw new Error(`integer range { min: ${min}, max: ${max} } is not a usable range`);
+  }
+  return min + (parseInt(h.slice(0, 8), 16) % (max - min + 1));
+}
+
+/**
+ * A CLOSED DOMAIN the verifier picks from.
+ *
+ * Some values cannot be invented. A school grade is one: nsc-eval constrains it
+ * to `PK, K, 1..12` with a database CHECK mirroring its own domain module, so a
+ * verifier-generated `watson-grantedGrade-a1b2…` fails at the insert. Refusing
+ * to let the verifier choose at all would hand the fixture back the decision
+ * this whole mechanism exists to take away — it could pick whichever member of
+ * the domain makes an assertion most vacuous.
+ *
+ * So the CONTRACT declares the domain and the VERIFIER picks the member. The set
+ * is product-authored, which is fine and visible: it is reviewed in the pull
+ * request, it is covered by the contract fingerprint, and a change to it shows up
+ * as a contract change. What the product no longer does is choose which one the
+ * assertion rests on.
+ *
+ * WHAT THIS DOES NOT FIX, because it cannot: an assertion on a one-character
+ * value from a fourteen-member domain is weak whoever picks it — `expect_text:
+ * "5"` matches almost any page. That is a JOURNEY design problem, not a value
+ * ownership problem, and it needs a different answer: assert on something
+ * specific and scope the grade with a selector, rather than asserting the grade
+ * as text.
+ */
+function pickFromDomain(h, name, domain) {
+  if (!Array.isArray(domain) || domain.length === 0) {
+    throw new Error(`\`${name}\` declares an enum shape with no values to choose from`);
+  }
+  return domain[parseInt(h.slice(0, 8), 16) % domain.length];
+}
+
+/**
+ * `[name, shape, domain, pool]` from a bare list, a name -> shape mapping, or a
+ * name -> `{ enum: [...], pool?: string }` mapping. Names sharing a pool are
+ * guaranteed distinct values from the same domain.
+ */
+export function normaliseChosen(declared) {
+  const entries = Array.isArray(declared)
+    ? declared.map((n) => (typeof n === 'string' ? [n, 'text'] : Object.entries(n)[0]))
+    : Object.entries(declared ?? {});
+
+  return entries.map(([name, spec]) => {
+    if (spec && typeof spec === 'object' && Array.isArray(spec.enum)) {
+      return [name, 'enum', spec.enum, spec.pool ?? null];
+    }
+    if (spec && typeof spec === 'object' && spec.integer) {
+      return [name, 'integer', spec.integer, null];
+    }
+    if (!SHAPES[spec]) {
+      throw new Error(
+        `\`${name}\` declares verifier-chosen shape \`${JSON.stringify(spec)}\`, which the engine does not ` +
+          `generate. Known shapes: ${Object.keys(SHAPES).join(', ')}, or \`{ enum: [...] }\` for a closed domain.`,
+      );
+    }
+    return [name, spec, null, null];
+  });
+}
+
+/**
+ * The environment the fixture receives them in. A product that ignores these and
+ * invents its own values fails the cross-check at the call site rather than here.
+ */
+/**
+ * Reconcile what the fixture reports it built against what the verifier chose.
+ *
+ * Lives here rather than in `cli.mjs` because it is fixture-value logic, and
+ * because `cli.mjs` runs the CLI on import — so anything in it is untestable
+ * without launching the tool. That is not a hypothetical cost: this function was
+ * untested, and shipped a comparison that flagged every integer-shaped value as
+ * ignored on every run.
+ */
+export function reconcileFixtureValues(emitted, chosen) {
+  const out = emitted ?? {};
+  const ignored = [];
+  for (const [k, v] of Object.entries(chosen)) {
+    if (!(k in out)) {
+      // OMISSION, not contradiction. This used to be invisible: the filter
+      // required the key to be present, so a fixture that simply never reported
+      // back on a value passed — and then the engine back-filled it from
+      // `chosen`, so `validateSeedValues` could not see it either.
+      //
+      // It matters most for the negative journeys, which is where it is hardest
+      // to notice. A fixture that never grants-then-revokes the verifier's
+      // `revokedGrade` still passes "the revoked grant is denied", because a
+      // grade that was never granted denies identically to one that was
+      // revoked. The assertion holds and the property it names was never built.
+      ignored.push(
+        `\`${k}\`: the verifier supplied \`${v}\`, and the fixture did not report building anything with it. `
+        + 'A world that does not contain the value the assertions are about is not the world that was asked for.',
+      );
+      continue;
+    }
+    // BOTH sides stringified. `pickInteger` returns a NUMBER, so comparing
+    // `String(emitted) !== chosen` was `"13" !== 13` — always true. Every run
+    // with an integer-shaped verifier-chosen value failed as a broken world,
+    // reporting `fixture used 13, verifier supplied 13`. Unit tests missed it
+    // because they all used strings; the first local end-to-end run found it
+    // immediately, which is the whole argument for running them.
+    if (String(out[k]) !== String(v)) {
+      ignored.push(`\`${k}\`: fixture used \`${out[k]}\`, verifier supplied \`${v}\``);
+    }
+  }
+  return { vars: { ...out, ...chosen }, ignored };
+}
+
+export function fixtureValueEnv(values) {
+  return Object.fromEntries(
+    Object.entries(values).map(([k, v]) => [`WATSON_FIXTURE_${k.replace(/[^A-Za-z0-9]/g, '_').toUpperCase()}`, v]),
+  );
+}
+
+/**
  * Expand `depends_on` into an ordered setup list. A prerequisite runs as SETUP,
  * not as its own verdict — a failing prerequisite blocks its dependants rather
  * than silently passing them.
@@ -231,7 +731,7 @@ export function loadContractAt(repoRoot, sha) {
     tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'watson-contract-'));
     // `git archive` writes only what the commit contains — nothing from the
     // working tree, so a dirty checkout cannot contaminate the base side.
-    const tar = execFileSync('git', ['archive', '--format=tar', sha, '.watson'], {
+    const tar = git(['archive', '--format=tar', sha, '.watson'], {
       cwd: repoRoot, maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'],
     });
     execFileSync('tar', ['-x', '-C', tmp], { input: tar, stdio: ['pipe', 'ignore', 'ignore'] });

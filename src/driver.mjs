@@ -15,6 +15,7 @@
 import { chromium } from 'playwright';
 import fs from 'node:fs';
 import path from 'node:path';
+import { degenerateOperand } from './contract.mjs';
 
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
@@ -153,11 +154,30 @@ export async function openIdentity(browser, { baseUrl, token, viewport }) {
  */
 export const STEPS = [
   'goto', 'reload', 'back', 'click', 'fill', 'select', 'wait_for_text',
-  'expect_text', 'expect_no_text', 'expect_no_uuid', 'expect_url_contains',
+  'expect_text', 'expect_text_in', 'expect_no_text', 'expect_no_uuid', 'expect_url_contains',
   'expect_api', 'expect_denied', 'expect_allowed', 'expect_json',
   'expect_count_at_most', 'expect_count_at_least',
   'set_viewport', 'expect_no_overflow',
 ];
+
+/**
+ * Steps whose operands are PROOF, not input.
+ *
+ * The distinction decides who is allowed to choose a value. A `fill` operand is
+ * something Watson types into the product; the product may well have chosen it,
+ * and nothing rests on it. An `expect_text` operand is the thing that makes the
+ * assertion true — so if the product picks it, the product decides whether it
+ * passes its own test.
+ *
+ * `wait_for_text` is here deliberately: it asserts what the application
+ * eventually says, and a journey that waits for a string the product chose has
+ * proved only that the product can echo itself.
+ */
+export const ASSERTION_STEPS = new Set([
+  'wait_for_text', 'expect_text', 'expect_text_in', 'expect_no_text', 'expect_url_contains',
+  'expect_api', 'expect_denied', 'expect_allowed', 'expect_json',
+  'expect_count_at_most', 'expect_count_at_least',
+]);
 
 function locator(page, sel) {
   if (typeof sel !== 'string') throw new Error(`selector must be a string, got ${JSON.stringify(sel)}`);
@@ -252,6 +272,33 @@ export async function runStep(step, ctx) {
       }
       if (!(await seen())) throw new Error(`expected page text to contain "${arg}"${note}`);
       return `page contains "${arg}"`;
+    }
+    case 'expect_text_in': {
+      // The same assertion as `expect_text`, SCOPED to one element.
+      //
+      // It exists because a journey in the product's own map said the quiet part
+      // out loud: "searching for the bare count as a string matches any
+      // incidental digit and proves nothing." That is true of every short
+      // operand — a grade, a cohort size, a threshold — and page-wide
+      // `expect_text` cannot distinguish "the stat shows 7" from "a 7 appears
+      // somewhere on the page".
+      //
+      // Polls, for the same reason `expect_text` does: this is a claim about
+      // eventual state, and sampling once races the render.
+      const el = locator(page, arg.selector);
+      const want = String(arg.text);
+      const seen = async () => {
+        try { return ((await el.first().innerText({ timeout: 1000 })) ?? '').includes(want); }
+        catch { return false; }
+      };
+      const deadline = Date.now() + timeout;
+      while (!(await seen()) && Date.now() < deadline) {
+        await page.waitForTimeout(100);
+      }
+      if (!(await seen())) {
+        throw new Error(`expected ${arg.selector} to contain "${want}"${note}`);
+      }
+      return `${arg.selector} contains "${want}"`;
     }
     case 'expect_no_text': {
       // Deliberately does NOT poll, unlike `expect_text` above. The asymmetry is
@@ -403,8 +450,35 @@ export async function runStep(step, ctx) {
   }
 }
 
+/**
+ * Substitute `${name}` from the run's variables.
+ *
+ * FAIL-CLOSED on an unknown name. It used to leave the literal `${name}` in
+ * place, which turns a map typo into an assertion against a string no page will
+ * ever contain — reported as a product failure. And it is one small step from
+ * the sibling bug the engine also had, where an unknown name became the EMPTY
+ * string and the assertion became vacuously true.
+ *
+ * There is no safe default here. An expectation whose operand could not be
+ * resolved is not an expectation, so the run says so.
+ */
 export function interp(str, vars) {
-  return String(str).replace(/\$\{(\w+)\}/g, (_, k) => (vars?.[k] ?? `\${${k}}`));
+  return String(str).replace(/\$\{(\w+)\}/g, (_, k) => {
+    const v = vars?.[k];
+    if (v === undefined) {
+      throw new Error(
+        `\${${k}} could not be resolved to a value. An unresolved operand is not an ` +
+          'expectation; refusing to assert against it.',
+      );
+    }
+    // The SAME predicate `validateSeedValues` applies at the source. Two rules
+    // for one variable namespace is how a value rejected in one place arrives
+    // through the other — which is what happened when this accepted `" "` and
+    // the source check rejected it.
+    const bad = degenerateOperand(v);
+    if (bad) throw new Error(`\${${k}} ${bad}`);
+    return String(v);
+  });
 }
 
 // ------------------------------------------------------------------- evidence

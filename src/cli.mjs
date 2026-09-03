@@ -15,6 +15,7 @@ import url from 'node:url';
 import {
   loadContract, loadContractAt, selectByProfile, withDependencies,
   validateFeatureVars, validateEnvOwnership, validateBrowserOwnership, validateContractVersion, validateStepOrder,
+  validateAssertionOperands, fixtureValues, fixtureValueEnv, reconcileFixtureValues,
 } from './contract.mjs';
 import { productFingerprint, contractFingerprint, resolveSha, contractChange, productIdentity, changedPaths, engineProvenance } from './fingerprint.mjs';
 import { readManifest } from './manifest.mjs';
@@ -202,11 +203,16 @@ async function bringUp({ repoRoot, contract, runDir, runId, adminUrl, policy }) 
     t = Date.now();
     const fixture = contract.fixtures.profiles?.[cfg.launch.fixture_profile];
     if (!fixture) throw new Error(`fixture profile \`${cfg.launch.fixture_profile}\` not declared`);
+    // THE VERIFIER PICKS THE VALUES ITS ASSERTIONS REST ON, and hands them to the
+    // fixture as input. The fixture may SEE them — a running application observes
+    // its own data, and Phase 1 does not claim otherwise — but it may not CHOOSE
+    // them (ADR-049 D4).
+    const chosen = fixtureValues(runId, fixture.verifier_chosen ?? []);
     const seed = await env.runStep(
       env.interpolate(fixture.command, { RUN_ID: runId, DATABASE_URL: databaseUrl }),
       {
         cwd: repoRoot,
-        env: { ...appEnv, DATABASE_URL: databaseUrl },
+        env: { ...appEnv, DATABASE_URL: databaseUrl, ...fixtureValueEnv(chosen) },
         label: 'seed',
         policy,
       },
@@ -217,6 +223,21 @@ async function bringUp({ repoRoot, contract, runDir, runId, adminUrl, policy }) 
     } catch (e) {
       throw new Error(`seed did not emit parseable JSON vars: ${e.message}\n${seed.stdout.slice(-400)}`);
     }
+    // The fixture is held to what it was given. Contradicting a chosen value, or
+    // never reporting one back at all, means the world the journeys are about to
+    // assert on is not the world the verifier asked for — a broken environment,
+    // not a product defect.
+    //
+    // This is NOT by itself proof that the required world EXISTS: an untrusted
+    // fixture echoing an id back proves it received the id. That gap is F1, and
+    // trusted precondition evidence is what closes it.
+    const reconciled = reconcileFixtureValues(vars, chosen);
+    if (reconciled.ignored.length) {
+      throw new Error(
+        `the fixture did not build its world from the values the verifier supplied:\n  - ${reconciled.ignored.join('\n  - ')}`,
+      );
+    }
+    vars = reconciled.vars;
     step(`seeded: ${Object.keys(vars).join(', ')}`);
     timings.seed_ms = Date.now() - t;
 
@@ -398,14 +419,29 @@ async function bringUpRemote({ contract, runId, adminUrl, planeUrl, productBaseU
     t = Date.now();
     const fixture = contract.fixtures.profiles?.[cfg.launch.fixture_profile];
     if (!fixture) throw new Error(`fixture profile \`${cfg.launch.fixture_profile}\` not declared`);
+    const chosen = fixtureValues(runId, fixture.verifier_chosen ?? []);
     const seeded = await plane('/seed', {
       runId,
       seed: fixture.command,
-      env: { ...appEnv, DATABASE_URL: databaseUrl },
+      env: { ...appEnv, DATABASE_URL: databaseUrl, ...fixtureValueEnv(chosen) },
     });
     if (!seeded?.ok) {
       throw new Error(
         `product plane failed during seed: ${seeded?.message ?? 'no message'}\n${(seeded?.log ?? '').slice(-1500)}`,
+      );
+    }
+    // The fixture is held to what it was given. Contradicting a chosen value, or
+    // never reporting one back at all, means the world the journeys are about to
+    // assert on is not the world the verifier asked for — a broken environment,
+    // not a product defect.
+    //
+    // This is NOT by itself proof that the required world EXISTS: an untrusted
+    // fixture echoing an id back proves it received the id. That gap is F1, and
+    // trusted precondition evidence is what closes it.
+    const reconciledPlane = reconcileFixtureValues(seeded.vars, chosen);
+    if (reconciledPlane.ignored.length) {
+      throw new Error(
+        `the fixture did not build its world from the values the verifier supplied:\n  - ${reconciledPlane.ignored.join('\n  - ')}`,
       );
     }
     timings.seed_ms = Date.now() - t;
@@ -413,7 +449,7 @@ async function bringUpRemote({ contract, runId, adminUrl, planeUrl, productBaseU
 
     return {
       dbName, databaseUrl, baseUrl: productBaseUrl, appPort: productPort,
-      vars: seeded.vars, timings, dbServerVersion: provisioned?.serverVersion ?? null, planeTree,
+      vars: reconciledPlane.vars, timings, dbServerVersion: provisioned?.serverVersion ?? null, planeTree,
       tokens: started.identity.tokens, identity: started.identity, teardown,
     };
   } catch (err) {
@@ -566,6 +602,10 @@ async function cmdVerify(args) {
     ...validateContractVersion(contract.config),
     ...validateStepOrder(plan.map((p) => p.feature)),
     ...validateEnvOwnership(contract.config),
+    ...validateAssertionOperands(
+      plan.map((p) => p.feature),
+      contract.fixtures.profiles?.[contract.config.launch.fixture_profile],
+    ),
     ...validateBrowserOwnership(contract.config),
     ...validateFeatureVars(
       plan.map((p) => p.feature),
