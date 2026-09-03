@@ -16,7 +16,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  assertionVars, validateAssertionOperands, fixtureValues, fixtureValueEnv, normaliseChosen, validateDenialProofs, reconcileFixtureValues,
+  assertionVars, validateAssertionOperands, fixtureValues, fixtureValueEnv, normaliseChosen, validateDenialProofs, reconcileFixtureValues, routeOf,
 } from '../src/contract.mjs';
 
 const feature = (id, steps) => ({ id, __file: `${id}.yaml`, steps });
@@ -468,5 +468,32 @@ describe('reconciling the fixture against the verifier', () => {
     const chosen = fixtureValues('wtsn-x', ['primarySeasonName']);
     const { vars } = reconcileFixtureValues({ primarySeasonName: 'something else' }, chosen);
     assert.equal(vars.primarySeasonName, chosen.primarySeasonName);
+  });
+});
+
+describe('a route is a template, not a URL', () => {
+  test('the same route on a different season is the same route', () => {
+    // Otherwise a denial on a season the admin does not administer demands a
+    // positive control ON THAT SEASON — which could only be built by granting
+    // the access the journey exists to prove is absent.
+    assert.equal(routeOf('/api/seasons/${foreignSeasonId}/players'),
+                 routeOf('/api/seasons/${primarySeasonId}/players'));
+  });
+
+  test('different routes stay different', () => {
+    assert.notEqual(routeOf('/api/seasons/${x}/players'), routeOf('/api/seasons/${x}/results'));
+  });
+
+  test('the query string is still dropped', () => {
+    assert.equal(routeOf('/api/x?grade=${g}'), routeOf('/api/x'));
+  });
+
+  test('a cross-season capability denial is satisfied by the same route elsewhere', () => {
+    const control = feature('control', [{ expect_api: { path: '/api/seasons/${primarySeasonId}/reporting/prospective?grade=${grantedGrade}' } }]);
+    const denial = feature('denial', [{ expect_denied: { path: '/api/seasons/${secondarySeasonId}/reporting/prospective?grade=${grantedGrade}' }, proof: 'capability' }]);
+    const p = validateDenialProofs([control, denial], {
+      preconditions: [{ as: 'W-ADMIN', get: '/api/seasons/${secondarySeasonId}/players', expect: { authorized: true } }],
+    });
+    assert.deepEqual(p, []);
   });
 });

@@ -473,7 +473,17 @@ export function provenSubjects(fixtureProfile) {
  * reachable by somebody.
  */
 export function routeOf(path) {
-  return String(path ?? '').split('?')[0];
+  // `${var}` becomes a positional placeholder, because a parameter's VALUE is not
+  // part of a route. `/api/seasons/${foreignSeasonId}/players` and
+  // `/api/seasons/${primarySeasonId}/players` are one route asked about two
+  // seasons — and "which season" is an `entity_existence` or scope question with
+  // its own obligations, not a question about whether the route exists.
+  //
+  // Without this, a denial on a season the admin does not administer would demand
+  // a positive control on that same season, which is the property under test
+  // inverted: the control could only be built by granting the access the journey
+  // exists to prove is absent.
+  return String(path ?? '').split('?')[0].replace(/\$\{[^}]*\}/g, ':param');
 }
 
 export function validateDenialProofs(features, fixtureProfile) {
