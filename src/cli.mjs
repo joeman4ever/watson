@@ -816,12 +816,22 @@ async function cmdVerify(args) {
     // Recorded AND acted on. Recording that the browser said it was not
     // sandboxed, and then producing a verdict anyway, is the shape of a control
     // that exists only on paper.
-    if (base.execution.browser_sandbox_probe.effective === false) {
+    //
+    // POSITIVE, not merely `!== false`. The earlier form let a build that will
+    // not render `chrome://sandbox` — `available: false`, `effective`
+    // undefined — through to a product verdict with no layer-1 evidence at all.
+    // "An unprovable sandbox is not one this design gets to claim" was written
+    // in the README and not implemented here. A run that reaches this point has
+    // already opened a browser (a NOT_APPLICABLE run returns terminally before
+    // bring-up), so there is no legitimate case that needs the softer test.
+    if (base.execution.browser_sandbox_probe.effective !== true) {
       await browser.close();
       return finish(runDir, {
         ...base, dbName: up.dbName, baseUrl: up.baseUrl,
         verdict: 'BLOCKED_ENVIRONMENT',
-        verdictReason: 'Chromium reports it is not adequately sandboxed; the browser is part of the verifier and the pages it loads come from the product',
+        verdictReason: base.execution.browser_sandbox_probe.available
+          ? 'Chromium reports it is not adequately sandboxed; the browser is part of the verifier and the pages it loads come from the product'
+          : 'this browser build will not report its sandbox state, so the layer-1 sandbox cannot be established; the browser is part of the verifier and the pages it loads come from the product',
         doctor: dr, features: [], findings: [], qualitySignals: zeroSignals(),
         evidence: { bundle: path.relative(ROOT, runDir), retention_days: 7 },
         timings: { ...up.timings, total_ms: Date.now() - t0 },

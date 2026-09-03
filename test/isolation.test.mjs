@@ -357,9 +357,61 @@ describe('the browser is part of the verifier, not a lesser concern', () => {
   test('`--no-sandbox` does not appear anywhere in the driver', () => {
     // A grep, deliberately. The flag is one edit away from coming back for a
     // plausible-sounding reason, and this is the cheapest thing that notices.
+    //
+    // ON ITS OWN THIS TEST IS NEARLY WORTHLESS, and it is worth being precise
+    // about why rather than deleting it. It passed for the entire life of the
+    // project while every browser Watson launched carried `--no-sandbox`,
+    // because Playwright was adding the flag and this only looks at OUR source.
+    // The absence of a string in a file is not a property of a process. The two
+    // tests below are what make the claim, and the container proof is what
+    // establishes it against a real browser.
     const src = fs.readFileSync(new URL('../src/driver.mjs', import.meta.url), 'utf8');
     const uses = src.split('\n').filter((l) => l.includes('--no-sandbox') && !l.trim().startsWith('*') && !l.trim().startsWith('//'));
     assert.deepEqual(uses, [], 'the browser must not be launched unsandboxed');
+  });
+
+  test('launchBrowser passes `chromiumSandbox: true` to Playwright', async () => {
+    // THE DEFECT THIS PINS. playwright-core, at the exact version this
+    // repository pins, contains:
+    //
+    //     if (options.chromiumSandbox !== true) chromeArguments.push('--no-sandbox');
+    //
+    // so omitting the option is not "leaving the default alone", it is asking
+    // for an unsandboxed browser. Measured as an unprivileged user: without the
+    // option, `chrome://sandbox` reports `Layer 1 Sandbox: None` and every
+    // renderer carries `--no-sandbox`; with it, `Layer 1 Sandbox: Namespace` and
+    // none does.
+    //
+    // The option is intercepted rather than inferred, so this fails if the call
+    // stops passing it, whatever the source happens to look like.
+    const { chromium } = await import('playwright');
+    const real = chromium.launch;
+    let seen = null;
+    chromium.launch = async (opts) => { seen = opts; throw new Error('intercepted'); };
+    try {
+      await launchBrowser({ cdpPort: 0 }).catch(() => {});
+    } finally {
+      chromium.launch = real;
+    }
+    if (IS_ROOT) {
+      // launchBrowser refuses before it ever calls launch(), which is its own
+      // (separately tested) property. Nothing to intercept.
+      assert.equal(seen, null);
+      return;
+    }
+    assert.ok(seen, 'launchBrowser did not call chromium.launch');
+    assert.equal(seen.chromiumSandbox, true);
+  });
+
+  test('the pinned Playwright really does add `--no-sandbox` without it', async () => {
+    // R4, applied to a dependency: who controls this input? The claim above is
+    // about playwright-core's behaviour, so it is checked against playwright-core
+    // rather than believed. If an upgrade changes the default, this fails and the
+    // comment above stops being true — which is the point.
+    const url = new URL('../node_modules/playwright-core/lib/server/chromium/chromium.js', import.meta.url);
+    const src = fs.readFileSync(url, 'utf8');
+    assert.match(src, /options\.chromiumSandbox !== true.*--no-sandbox/,
+      'playwright-core no longer gates --no-sandbox on chromiumSandbox; re-read the launch path');
   });
 });
 

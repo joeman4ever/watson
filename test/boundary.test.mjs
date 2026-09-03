@@ -454,4 +454,35 @@ describe('probeSandbox reads Chromium\'s verdict, not a substring of it', () => 
     assert.ok(/not\S*\s*adequately/.test(line),
       `the predicate does not exclude Chromium's negative verdict: ${line.trim()}`);
   });
+
+  test('the gate demands a POSITIVE probe, not merely the absence of a negative', () => {
+    // `effective === false` let a build that will not render `chrome://sandbox`
+    // — `available: false`, `effective` undefined — through to a product
+    // verdict with no layer-1 evidence at all. "An unprovable sandbox is not one
+    // this design gets to claim" was written in the README and not implemented.
+    //
+    // Asserted against `cli.mjs` rather than re-stated here, because the gate is
+    // the thing that has to be right; a local copy of the condition would pass
+    // while the engine shipped the softer one.
+    const src = fs.readFileSync(new URL('../src/cli.mjs', import.meta.url), 'utf8');
+    const line = src.split('\n')
+      .filter((l) => !/^\s*(\/\/|\*)/.test(l))
+      .find((l) => l.includes('browser_sandbox_probe') && l.includes('effective'));
+    assert.ok(line, 'no sandbox gate found in cli.mjs');
+    assert.match(line, /effective !== true/,
+      `the sandbox gate does not demand a positive probe: ${line.trim()}`);
+  });
+
+  test('the engine asks for a sandboxed browser, and says why in the same place', () => {
+    // Playwright adds `--no-sandbox` unless `chromiumSandbox: true` is passed,
+    // so the option is the whole claim. Kept here beside the probe tests because
+    // a probe that reads Chromium's verdict correctly is worthless if the
+    // browser was asked to run without a sandbox in the first place.
+    const src = fs.readFileSync(new URL('../src/driver.mjs', import.meta.url), 'utf8');
+    const line = src.split('\n')
+      .filter((l) => !/^\s*(\/\/|\*)/.test(l))
+      .find((l) => l.includes('chromiumSandbox'));
+    assert.ok(line, 'launchBrowser does not pass chromiumSandbox at all');
+    assert.match(line, /chromiumSandbox:\s*true/);
+  });
 });

@@ -231,11 +231,12 @@ Chromium refuses to start as root with its sandbox on; the response is to refuse
 to be root, never to pass `--no-sandbox`. `launchBrowser` throws as root, the
 flag appears nowhere in `src/`, and a test greps for it. Those parts hold.
 
-> **THE SANDBOX IS NOT CURRENTLY ENGAGED, AND THIS SECTION USED TO SAY IT WAS.**
->
-> Read this before relying on anything below it.
+> **THE SANDBOX WAS NOT ENGAGED FOR THE WHOLE LIFE OF THIS PROJECT, AND THIS
+> SECTION USED TO SAY IT WAS.** The cause is found and fixed; the real-topology
+> proof is what settles it, and until that job is green this repository does not
+> claim a sandboxed browser.
 
-#### What was claimed, and what is true
+#### What was claimed, what was true, and why
 
 `probeSandbox` decided the layer-1 question with
 `/adequately sandboxed/i.test(text)`. Chromium's negative verdict — *"You are
@@ -244,8 +245,8 @@ the field was `true` for both answers and **could never be false**. Three gates
 read it (the `BLOCKED_ENVIRONMENT` gate, the trusted validator, and this repo's
 own per-commit proof); none could fire.
 
-With the predicate corrected, the proof job runs for the first time as a real
-assertion, and reports:
+With the predicate corrected, the proof job ran for the first time as a real
+assertion, and reported:
 
 ```text
 chromium proper (channel: chromium): 2 renderer(s), seccomp=2 on 2,
@@ -256,6 +257,32 @@ Layer 1 Sandbox                      None
 Seccomp-BPF sandbox                  No
 You are NOT adequately sandboxed.
 ```
+
+**The cause was not the container.** It was one option Watson never passed.
+playwright-core, at the version this repository pins, contains:
+
+```js
+if (options.chromiumSandbox !== true) chromeArguments.push('--no-sandbox');
+```
+
+Playwright's default is `chromiumSandbox: false`, so **the library added the flag
+Watson was careful never to write**. Measured as an unprivileged user, one
+variable changed and nothing else — no container option, no seccomp edit, no
+privilege added:
+
+| `chromium.launch(…)` | Layer 1 | renderer argv |
+| --- | --- | --- |
+| `{}` — what the engine did | `None`, *NOT adequately sandboxed* | every renderer carries `--no-sandbox` |
+| `{ chromiumSandbox: true }` | `Namespace`, PID + net namespaces, seccomp-bpf, *adequately sandboxed* | none does |
+
+Two checks stood between this and being noticed, and both were vacuous. The
+first is the substring bug above. The second is worse, because it was the one
+aimed straight at the cause: the proof printed *"Chromium started with no
+`--no-sandbox` flag"* on the strength of a browser having started at all — it
+never read a command line. Beside it, a unit test grepped `src/` for the string
+and passed, truthfully, while every renderer carried the flag. **The absence of a
+string in our source is not a property of the process we start**, and both checks
+now read the argv of the processes actually launched.
 
 Two measurements that were being conflated:
 
@@ -283,21 +310,28 @@ promotion gate: the browser consumes product-controlled content inside the
 verifier plane, so an unsandboxed browser bears directly on *the untrusted pull
 request cannot alter the verifier or fabricate its evidence*.
 
-So the corrected probe stays, the gate stays, and the engine correctly refuses a
-product verdict while Chromium reports it is not sandboxed. **A red build is the
-right outcome here**; the previous green was false. The fix is to make the
-sandbox genuinely engage in this container, not to relax the check.
+So the corrected probe stays and the gate stays — and it is now **stronger** than
+it was. It used to fire only on `effective === false`, which let a browser build
+that will not render `chrome://sandbox` through to a product verdict with no
+layer-1 evidence at all. "An unprovable sandbox is not one this design gets to
+claim" was written here and not implemented; the gate now demands
+`effective === true`, and the trusted validator does the same.
 
 `seccomp/` and `tools/seccomp-profile.mjs` still derive a profile from Docker's
-default with an asserted two-edit delta, and that machinery is unchanged. What is
-now unsupported is the *reason* it was adopted: the earlier claim that Docker's
+default with an asserted two-edit delta, and that machinery is deliberately
+**unchanged**. It was not the cause, and one variable was changed at a time. What
+is now unsupported is the *reason* it was adopted: the earlier claim that Docker's
 default profile was the thing forbidding Chromium's namespace sandbox rested on
-the same vacuous measurement. Whether the derived profile is sufficient,
-necessary, or beside the point is exactly what the diagnosis has to establish
-from the runtime the red job actually uses.
+the same vacuous measurement. Whether it is necessary is a separate question, to
+be answered by measurement rather than by removing it and seeing.
 
-Until an executed real-topology proof establishes it, this repository does not
-claim a sandboxed browser.
+**What is established, and where.** The fix was measured as an unprivileged user
+against Chromium 131, going from *NOT adequately sandboxed* to *adequately
+sandboxed* with `chromiumSandbox` as the only variable — but that was not the
+verifier's container, and a sandbox proven somewhere else is not a sandbox. The
+CI job in `.github/workflows/ci.yml` runs the same proof in the pinned image
+under the observer's own container options, and it is the only thing that settles
+this. Until it is green, this repository does not claim a sandboxed browser.
 
 #### What the proof does establish
 
@@ -306,9 +340,10 @@ user in the pinned container image and measures, independently:
 
 | layer | how it is established |
 | --- | --- |
-| non-root, no `--no-sandbox` | uid, and the absent flag |
+| non-root | the verifier's uid |
+| no `--no-sandbox` | the **argv of every renderer it started**, read from `/proc/<pid>/cmdline` — not a grep of our source, which is what made this check vacuous |
 | seccomp filter attached | `Seccomp: 2` and `NoNewPrivs: 1` in the renderer's `/proc/<pid>/status` — **supporting telemetry, not proof of Chromium's own sandbox** |
-| Chromium's own sandbox | `chrome://sandbox` reporting *adequately sandboxed* — **authoritative, and currently failing** |
+| Chromium's own sandbox | `chrome://sandbox` reporting *adequately sandboxed* — **authoritative** |
 
 Chromium's self-report is authoritative because Chromium knows which mechanism
 it chose and whether it came up. An earlier version of this proof demanded a
@@ -317,9 +352,19 @@ called adequately sandboxed; the lesson taken from that was to trust the
 self-report, which was right — the error was reading a field derived from it
 with a predicate that could not express "no".
 
-**Watson drives Chromium proper, not Playwright's default headless shell.** The
-headless shell does not answer `chrome://sandbox` at all, and a sandbox this
-design cannot prove is not one it gets to claim.
+**Watson drives Chromium proper, not Playwright's default headless shell.** On
+the build measured when this was decided, the headless shell did not answer
+`chrome://sandbox` at all, and a sandbox this design cannot prove is not one it
+gets to claim. (A later build was observed to answer it. The channel stays
+explicit regardless: the point is that the engine drives a build whose sandbox it
+can read, not that one particular build is mute.)
+
+The proof reads `/proc/<pid>/cmdline` **tokenised on NUL *and* whitespace**.
+Chromium rewrites its own process title, so a renderer's whole command line
+arrives as a single element; splitting on NUL alone produced one token that
+matched nothing, and the flag check reported "clean" on a browser demonstrably
+started with `--no-sandbox`. That was caught by running the negative control, not
+by reading the code.
 
 ### Within one process, when that is what you have
 

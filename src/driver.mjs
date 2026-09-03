@@ -63,6 +63,36 @@ export async function launchBrowser({ executablePath, cdpPort, headless = true, 
   return chromium.launch({
     executablePath,
     headless,
+    // THE FLAG WAS COMING FROM THE LIBRARY, NOT FROM US.
+    //
+    // Playwright's default is `chromiumSandbox: false`, and playwright-core
+    // implements that as, verbatim:
+    //
+    //     if (options.chromiumSandbox !== true) chromeArguments.push('--no-sandbox');
+    //
+    // So every browser Watson has ever launched ran with `--no-sandbox`, added by
+    // the dependency. "`--no-sandbox` appears nowhere in `src/`" was true, and it
+    // was measuring the wrong thing: the absence of a string in our source says
+    // nothing about the argv of the process we start. Measured as an unprivileged
+    // user against Chromium 131:
+    //
+    //     launch({})                       Layer 1 Sandbox  None
+    //                                      NOT adequately sandboxed
+    //                                      every renderer carries --no-sandbox
+    //     launch({ chromiumSandbox: true}) Layer 1 Sandbox  Namespace
+    //                                      PID/net namespaces yes, seccomp-bpf yes
+    //                                      adequately sandboxed
+    //                                      no renderer carries --no-sandbox
+    //
+    // One variable, nothing else changed — no container option, no seccomp edit,
+    // no privilege added. The container was never the problem.
+    //
+    // This is NOT a convenience default to be dropped when a launch is awkward.
+    // The pages Chromium loads are served by the product under verification, so a
+    // renderer outside the sandbox is a hole in the boundary that protects the
+    // evidence. If a browser will not start with this true, the run is
+    // BLOCKED_ENVIRONMENT — that is the gate working.
+    chromiumSandbox: true,
     // Explicit, so a caller that needs to know WHICH build it measured can say
     // so — and so nothing silently falls back to the headless shell.
     ...(channel ? { channel } : {}),
