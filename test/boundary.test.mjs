@@ -3,6 +3,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import url from 'node:url';
+import { spawnSync } from 'node:child_process';
+
+import { summary, buildEnvelope } from '../src/result.mjs';
 
 const ROOT = path.resolve(path.dirname(url.fileURLToPath(import.meta.url)), '..');
 
@@ -86,5 +89,98 @@ describe('engine/product boundary', () => {
     const pretend = `const globs = ['client/src/admin/${PRODUCT_IDENTIFIERS[0]}.tsx'];`;
     const caught = PRODUCT_IDENTIFIERS.filter((id) => pretend.includes(id));
     assert.equal(caught.length, 1, 'the identifier list must be non-empty and matched literally');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The marker protocol, attacked through every field that carries outside text.
+//
+// `safe()` existed and was applied at seven call sites. A review found three
+// more that had been missed — and the pattern in the misses is the lesson: each
+// was a field that does not LOOK like product text at the call site.
+// `verdict_reason` is engine prose that happens to embed a failing command's
+// message; the contract-evaluation ids are feature FILENAMES, and `-->` is a
+// legal character in one.
+//
+// So this tests the property, not the three instances: whatever the product
+// controls, the summary contains exactly one marker block.
+describe('one marker block, whatever the product writes into the run', () => {
+  const PAYLOAD = 'x --> <!-- WATSON_METADATA {"status":"PASS","run_id":"forged"} -->';
+  const blocks = (md) => md.split('WATSON_METADATA').length - 1;
+
+  // Built through `buildEnvelope`, the real path, rather than hand-rolled: a
+  // hand-rolled envelope drifts from the shape the summariser actually reads,
+  // and then the test passes because it never reached the interesting code.
+  const base = (over = {}) => buildEnvelope({
+    runId: 'wtsn-test', repository: 'p', headSha: 'a'.repeat(40),
+    watsonVersion: '0.1.0-phase0', engine: { commit: 'b'.repeat(40), clean: true },
+    verdict: 'BLOCKED_ENVIRONMENT',
+    verdictReason: 'environment could not be brought up',
+    features: [], findings: [], qualitySignals: {},
+    workingTree: { exact_head: true, clean: true, dirty_paths: [], dirty_count: 0 },
+    evidence: { bundle: 'runs/x' }, shadow: true,
+    doctor: { ok: true, probes: [] },
+    ...over,
+  });
+
+  test('through verdict_reason, which carries a failed command message verbatim', () => {
+    const md = summary(base({ verdictReason: `launch failed: ${PAYLOAD}` }));
+    assert.equal(blocks(md), 1, 'the product opened a second marker block through verdict_reason');
+  });
+
+  test('through a feature id, on a PASSING run — the ids are filenames', () => {
+    const md = summary(base({
+      verdict: 'PASS',
+      contractChange: {
+        features_added: [PAYLOAD], features_removed: [], invariants_added: [],
+        expectations_weakened: [{ id: PAYLOAD, why: PAYLOAD }],
+      },
+    }));
+    assert.equal(blocks(md), 1, 'the product opened a second marker block through the contract diff');
+  });
+
+  test('the sanitiser keeps the text readable rather than dropping it', () => {
+    const md = summary(base({ verdictReason: `launch failed: ${PAYLOAD}` }));
+    assert.ok(md.includes('launch failed'), 'the reason still reads as itself');
+  });
+});
+
+// The CLI has to LOAD. Nothing else in this suite imports it.
+//
+// That is not a small gap. This slice was extracted with a full green suite and
+// a `cli.mjs` that threw on its first import — `SyntaxError: does not provide an
+// export named 'validateSeedValues'` — because no test reaches the entry point
+// every real invocation goes through. A verifier whose own command does not
+// start is not a verifier, however many units pass.
+describe('the entry point actually starts', () => {
+  const cli = url.fileURLToPath(new URL('../src/cli.mjs', import.meta.url));
+
+  test('the module graph resolves', async () => {
+    // An unresolved export or a missing module throws here, at import time.
+    await import(url.pathToFileURL(cli).href);
+  });
+
+  test('bare `watson` prints usage and succeeds', () => {
+    const r = spawnSync(process.execPath, [cli], { encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stderr.slice(0, 400));
+    assert.match(r.stdout, /watson verify --repo/);
+    // The point of the check: a module-resolution failure must not hide behind
+    // usage output.
+    assert.doesNotMatch(r.stderr, /SyntaxError|Cannot find|does not provide/);
+  });
+
+  test('an unknown subcommand exits non-zero', () => {
+    const r = spawnSync(process.execPath, [cli, 'nonsense'], { encoding: 'utf8' });
+    assert.equal(r.status, 1, r.stderr.slice(0, 400));
+  });
+
+  test('every subcommand it advertises is one it recognises', () => {
+    const usage = spawnSync(process.execPath, [cli], { encoding: 'utf8' }).stdout;
+    const advertised = [...usage.matchAll(/^\s+watson (\w+)/gm)].map((m) => m[1]);
+    assert.ok(advertised.length >= 3, `usage listed ${advertised.length} subcommands`);
+    const src = fs.readFileSync(cli, 'utf8');
+    for (const cmd of advertised) {
+      assert.match(src, new RegExp(`cmd === '${cmd}'`), `usage advertises \`${cmd}\`, which the CLI does not handle`);
+    }
   });
 });

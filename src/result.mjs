@@ -44,8 +44,21 @@ const OBLIGATION = {
 export const PRODUCT_CLAIMS = new Set(['PASS', 'PASS_WITH_ADVISORIES', 'FAIL_PRODUCT']);
 
 /**
- * A product claim requires that the checkout driven actually IS the revision
+ * A product claim requires that the source driven actually IS the revision
  * reported (Phase-1 defect W2, now a standing invariant).
+ *
+ * WHAT THIS ESTABLISHES, worded carefully because the looser version is easy to
+ * write and is wrong:
+ *
+ *   At the verifier's measurement point, the materialised committed product
+ *   source matched the reported product HEAD X.
+ *
+ * NOT: the bytes loaded into the running process are nothing but the committed
+ * bytes. Generated build output is outside the measurement, the
+ * source is measured at two instants rather than continuously, and nothing here
+ * binds the artefact that was actually launched to the commit. Those are real
+ * and separate, tracked as C4, and required to be closed or consciously accepted
+ * before Watson becomes a required merge check.
  *
  * Reporting the dirt was not enough. Every result carries a 40-char SHA and two
  * fingerprints computed from git, while the contract that executed and the product
@@ -65,11 +78,15 @@ export function downgradeForInexactHead(verdict, workingTree) {
   if (!PRODUCT_CLAIMS.has(verdict)) return { verdict, reason: null };
   if (workingTree?.exact_head === true) return { verdict, reason: null };
 
-  const what = workingTree?.contract_dirty
-    ? 'the CONTRACT that executed is not the one at the reported SHA'
-    : workingTree?.clean === null
-      ? 'the checkout could not be compared against the reported SHA'
-      : 'the checkout is not the revision it reports';
+  const what = workingTree?.head_matches === false
+    // Checked first: a clean tree at the WRONG commit would otherwise fall through
+    // to the dirt wording and describe the least important thing that is wrong.
+    ? `the checkout is at ${workingTree.head_sha ?? 'an unknown commit'}, not the reported commit`
+    : workingTree?.contract_dirty
+      ? 'the CONTRACT that executed is not the one at the reported SHA'
+      : workingTree?.clean === null
+        ? 'the checkout could not be compared against the reported SHA'
+        : 'the checkout is not the revision it reports';
   return {
     verdict: 'INDETERMINATE',
     reason:
@@ -145,6 +162,18 @@ export function buildEnvelope(run) {
       fixture_profile: run.fixtureProfile,
       node: process.version,
 
+      // What actually executed this run. Recorded because a runtime verdict is
+      // only as interpretable as the world it was produced in: "PASS on Node
+      // 22.11 / Ubuntu 24.04 / Chromium via Playwright 1.49.1" is a fact
+      // somebody can act on months later; "PASS" alone is not.
+      //
+      // This is PROVENANCE, not reproducibility. Nothing here claims the run
+      // could be reproduced bit-for-bit — it could not, and saying so would be
+      // the kind of overstatement this envelope exists to avoid. It records what
+      // was used, so that a difference between two results can be explained
+      // instead of argued about.
+      execution: run.execution ?? null,
+
       // Everything under this key describes WATSON'S OWN synthetic verification
       // environment, never the product's production posture. It was previously a
       // bare `admin_mfa_enforced: false` sitting beside the environment fields,
@@ -206,10 +235,27 @@ export function marker(env) {
 const ICON = { PASS: '✓', PASS_WITH_ADVISORIES: '✓', FAIL_PRODUCT: '✗', FAIL_CONTRACT: '⚠', BLOCKED_ENVIRONMENT: '⚠', INDETERMINATE: '?', NOT_APPLICABLE: '–' };
 
 export function summary(env) {
+  // Product-controlled text reaches this document: a failing command's stderr
+  // travels through the plane's error message into `doctor.probes[].detail` and
+  // into step observations. The document ends with a WATSON_METADATA marker that
+  // a consumer parses, so anything able to write `<!-- ... -->` into the body can
+  // offer a second, forged one. Neutralise the two sequences that matter; the
+  // text stays readable and stops being able to close or open a marker block.
+  // THE RULE: every value that reaches this document from outside the engine
+  // goes through `safe()`. Not "every value that looks dangerous" — a review
+  // found three that had been missed (`verdict_reason`, which carries a failing
+  // command's message straight from the plane, and the contract-evaluation ids,
+  // which are FEATURE FILENAMES and so product-authored). Each had been left out
+  // because it did not look like product text at the call site. It was.
+  const safe = (v) => String(v ?? '')
+    .replaceAll('<!--', '<!-\u2011-')
+    .replaceAll('-->', '--\u2011>')
+    .replaceAll('WATSON_METADATA', 'WATSON\u2011METADATA');
+
   const L = [];
   L.push(`## Watson — ${env.verdict}`);
   L.push('');
-  L.push(`**${env.verdict_reason}**`);
+  L.push(`**${safe(env.verdict_reason)}**`);
   L.push('');
   L.push(`| | |`);
   L.push(`| --- | --- |`);
@@ -222,7 +268,7 @@ export function summary(env) {
 
   if (env.doctor && !env.doctor.ok) {
     L.push('### Doctor failed — the environment was not worth driving');
-    for (const p of env.doctor.probes) L.push(`- ${p.ok ? '✓' : '✗'} **${p.name}** — ${p.detail}`);
+    for (const p of env.doctor.probes) L.push(`- ${p.ok ? '✓' : '✗'} **${safe(p.name)}** — ${safe(p.detail)}`);
     L.push('');
   }
 
@@ -232,7 +278,7 @@ export function summary(env) {
     L.push('| | Feature | Role | Steps | Time |');
     L.push('| --- | --- | --- | --- | --- |');
     for (const f of env.features) {
-      L.push(`| ${ICON[f.verdict] ?? '·'} ${f.verdict} | ${f.title} | ${f.role} | ${f.steps.filter((s) => s.result === 'ok').length}/${f.steps.length} | ${(f.duration_ms / 1000).toFixed(1)}s |`);
+      L.push(`| ${ICON[f.verdict] ?? '·'} ${f.verdict} | ${safe(f.title)} | ${f.role} | ${f.steps.filter((s) => s.result === 'ok').length}/${f.steps.length} | ${(f.duration_ms / 1000).toFixed(1)}s |`);
     }
     L.push('');
   }
@@ -242,23 +288,23 @@ export function summary(env) {
   if (blocking.length) {
     L.push('### Blocking findings');
     for (const f of blocking) {
-      L.push(`- **${f.summary}** _(${f.rule}, ${f.feature})_`);
-      if (f.required_action) L.push(`  - Required: ${f.required_action}`);
+      L.push(`- **${safe(f.summary)}** _(${safe(f.rule)}, ${safe(f.feature)})_`);
+      if (f.required_action) L.push(`  - Required: ${safe(f.required_action)}`);
     }
     L.push('');
   }
   for (const f of env.features.filter((x) => x.verdict === 'FAIL_PRODUCT')) {
     const bad = f.steps.find((s) => s.result === 'fail');
     if (!bad) continue;
-    L.push(`### Failure detail — ${f.title}`);
-    L.push(`Step ${bad.n} (\`${bad.action}\`): ${bad.observed}`);
-    if (bad.expected) L.push(`Expected: ${bad.expected}`);
+    L.push(`### Failure detail — ${safe(f.title)}`);
+    L.push(`Step ${bad.n} (\`${safe(bad.action)}\`): ${safe(bad.observed)}`);
+    if (bad.expected) L.push(`Expected: ${safe(bad.expected)}`);
     if (f.evidence?.length) L.push(`Evidence: ${f.evidence.map((e) => `\`${e}\``).join(', ')}`);
     L.push('');
   }
   if (advisory.length) {
     L.push('### Advisories');
-    for (const f of advisory) L.push(`- ${f.summary} _(${f.rule}, ${f.feature})_`);
+    for (const f of advisory) L.push(`- ${safe(f.summary)} _(${safe(f.rule)}, ${safe(f.feature)})_`);
     L.push('');
   }
 
@@ -271,11 +317,11 @@ export function summary(env) {
     const ce = env.contract_evaluation;
     if (ce.expectations_weakened?.length) {
       L.push('Expectations **weakened**:');
-      for (const w of ce.expectations_weakened) L.push(`- \`${w.id}\` — ${w.why}`);
+      for (const w of ce.expectations_weakened) L.push(`- \`${safe(w.id)}\` — ${safe(w.why)}`);
     }
-    if (ce.features_removed?.length) L.push(`Features removed: ${ce.features_removed.map((f) => `\`${f}\``).join(', ')}`);
-    if (ce.features_added?.length) L.push(`Features added: ${ce.features_added.map((f) => `\`${f}\``).join(', ')}`);
-    if (ce.invariants_added?.length) L.push(`Invariants added: ${ce.invariants_added.map((f) => `\`${f}\``).join(', ')}`);
+    if (ce.features_removed?.length) L.push(`Features removed: ${ce.features_removed.map((f) => `\`${safe(f)}\``).join(', ')}`);
+    if (ce.features_added?.length) L.push(`Features added: ${ce.features_added.map((f) => `\`${safe(f)}\``).join(', ')}`);
+    if (ce.invariants_added?.length) L.push(`Invariants added: ${ce.invariants_added.map((f) => `\`${safe(f)}\``).join(', ')}`);
     if (ce.base_contract_available === false) {
       L.push('The base contract could not be read, so only the FACT of a change is reported — review the `.watson/` diff directly.');
     } else if (!ce.expectations_weakened?.length && !ce.features_removed?.length) {
@@ -300,7 +346,7 @@ export function summary(env) {
       L.push('');
       L.push('**The contract itself is modified.** This run verified expectations that do not exist at that SHA, so its result cannot be cited for that commit.');
     }
-    if (wt.dirty_paths?.length) L.push('', 'Modified: ' + wt.dirty_paths.map((p) => `\`${p}\``).join(', '));
+    if (wt.dirty_paths?.length) L.push('', 'Modified: ' + wt.dirty_paths.map((p) => `\`${safe(p)}\``).join(', '));
     L.push('');
   }
 
@@ -310,10 +356,29 @@ export function summary(env) {
   return L.join('\n');
 }
 
-export function writeResult(runDir, env) {
+/**
+ * Write the run's evidence, and — when the caller named one — the canonical
+ * result at an EXACT path the caller chose.
+ *
+ * `outPath` exists to delete a whole class of CI mistake. A harness that finds
+ * the result by listing the run directories newest-first is asking the
+ * filesystem which file is newest, and the answer is influenced by every process
+ * that ran during the verification — including the product's. The trusted side
+ * should not be discovering its own evidence; it should be naming it.
+ *
+ * Failure to write it is fatal on purpose. A run whose result did not reach the
+ * agreed path has produced no observation, and a harness that then finds a
+ * STALE file at that path would report the previous run's verdict as this one's.
+ */
+export function writeResult(runDir, env, outPath = null) {
   const jsonPath = path.join(runDir, 'result.json');
   const mdPath = path.join(runDir, 'summary.md');
-  fs.writeFileSync(jsonPath, JSON.stringify(env, null, 2));
+  const json = JSON.stringify(env, null, 2);
+  fs.writeFileSync(jsonPath, json);
   fs.writeFileSync(mdPath, summary(env));
-  return { jsonPath, mdPath };
+  if (outPath) {
+    fs.mkdirSync(path.dirname(path.resolve(outPath)), { recursive: true });
+    fs.writeFileSync(outPath, json);
+  }
+  return { jsonPath, mdPath, outPath };
 }

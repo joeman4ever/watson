@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Watson CLI — Phase 0.
 //
-//   watson verify --repo <path> [--sha <ref>] [--profile poc] [--base <ref>]
+//   watson verify --repo <path> [--sha <ref>] [--profile poc] [--base <ref>] [--out <file>]
 //   watson doctor --repo <path>            (bring up, probe, tear down)
 //   watson reap                            (drop orphaned watson_* databases)
 //
@@ -20,6 +20,7 @@ import { productFingerprint, contractFingerprint, resolveSha, contractChange, wo
 import { selectByImpact } from './selection.mjs';
 import * as env from './environment.mjs';
 import * as drive from './driver.mjs';
+import * as plane from './plane.mjs';
 import { evaluate, featureVerdict } from './checks.mjs';
 import { buildEnvelope, rollUp, writeResult, summary, downgradeForInexactHead } from './result.mjs';
 
@@ -43,14 +44,80 @@ function parseArgs(argv) {
 const log = (...a) => console.log(...a);
 const step = (m) => console.log(`  · ${m}`);
 
+/**
+ * The environment the product is launched with.
+ *
+ * `inherit` decides whether the verifier's own environment is passed through.
+ * In a single-process run it is, because the product legitimately needs the
+ * developer's PATH and toolchain. Across a plane boundary it is NOT: sending the
+ * verifier's environment over the network to the untrusted side would hand the
+ * product every variable the verifier happens to hold, which is the opposite of
+ * what the boundary is for. The product plane merges what it receives into its
+ * OWN environment, where the product's toolchain already lives.
+ */
+function buildAppEnv({ cfg, runId, databaseUrl, appPort, baseUrl, identity, inherit }) {
+  const appEnv = {
+    ...(inherit ? process.env : {}),
+    DATABASE_URL: databaseUrl,
+    PORT: String(appPort),
+    WORKOS_ISSUER: identity.issuer,
+    WORKOS_CLIENT_ID: identity.clientId,
+    WORKOS_JWKS_URI: identity.jwksUri,
+    WORKOS_REDIRECT_URI: `${baseUrl}/auth/callback`,
+    SESSION_SEALING_KEY_CURRENT: 'w'.repeat(48),
+    WORKOS_API_KEY: 'sk_watson_local_placeholder_not_a_real_key',
+  };
+
+  // The contract's `env` may reference run-scoped values the engine owns, as
+  // ${WATSON_*} placeholders. Substitute them and FAIL CLOSED on any that is
+  // left unresolved: launching a half-configured application would let the
+  // identity seam fall back to an ambient key source or stay unmounted, and the
+  // run would then "verify" an app whose guarded routes never mounted.
+  const injected = {
+    WATSON_JWKS_URI: identity.jwksUri,
+    WATSON_BASE_URL: baseUrl,
+    WATSON_DATABASE_URL: databaseUrl,
+    WATSON_PORT: String(appPort),
+    WATSON_RUN_ID: runId,
+  };
+  for (const [key, raw] of Object.entries(cfg.env ?? {})) {
+    // Deliberately NOT the general interpolate(): that substitutes an unknown
+    // name with an empty string, which here would hand the application an empty
+    // WORKOS_JWKS_URI. The identity seam would then read as "not configured",
+    // the guarded routes would never mount, and the run would fail much later
+    // with an unrelated-looking error. Resolve explicitly and throw on a miss.
+    appEnv[key] = String(raw).replace(/\$\{(WATSON_\w+)\}/g, (_, name) => {
+      if (!(name in injected)) {
+        throw new Error(
+          `.watson/config.yaml env.${key} references \${${name}}, which the engine does not supply. ` +
+            `Known injected values: ${Object.keys(injected).join(', ')}.`,
+        );
+      }
+      return injected[name];
+    });
+  }
+  return appEnv;
+}
+
+/**
+ * Reconcile what the fixture emitted with what the verifier supplied.
+ *
+ * The verifier's values WIN, always — that is the point of supplying them. The
+ * emitted value is compared only to notice a fixture that ignored what it was
+ * given, which is a broken world rather than a product defect: the entity
+ * Watson's journeys are about to assert on does not carry the name Watson
+ * chose, so the assertions would fail for a reason that has nothing to do with
+ * the product's behaviour.
+ */
 /** Bring the product up exactly as Watson will drive it. Returns a handle whose
  *  `teardown()` kills only what we started, by process group. */
-async function bringUp({ repoRoot, contract, runDir, runId, adminUrl }) {
+async function bringUp({ repoRoot, contract, runDir, runId, adminUrl, policy }) {
   const cfg = contract.config;
   const dbName = `watson_${runId.replace(/[^a-z0-9]/gi, '').slice(-16).toLowerCase()}`;
   const appPort = await env.freePort();
   const started = {};
   const timings = {};
+  let dbServerVersion = null;
 
   const teardown = async () => {
     if (started.app) env.killGroup(started.app.pid);
@@ -80,21 +147,22 @@ async function bringUp({ repoRoot, contract, runDir, runId, adminUrl }) {
     // orphan a `watson_<runId>` database that `reap` has to clean up later.
     let t = Date.now();
     for (const cmd of cfg.install ?? []) {
-      await env.runStep(cmd, { cwd: repoRoot, env: { ...process.env }, label: 'install' });
+      await env.runStep(cmd, { cwd: repoRoot, env: { ...process.env }, label: 'install', policy });
     }
     if ((cfg.install ?? []).length) step(`install commands: ${cfg.install.length}`);
     timings.install_ms = Date.now() - t;
 
     // 1. PROVISION -------------------------------------------------------------
     t = Date.now();
-    await env.provisionDatabase({ adminUrl, dbName, runId });
+    const provisioned = await env.provisionDatabase({ adminUrl, dbName, runId });
     started.dbCreated = true;
+    dbServerVersion = provisioned?.serverVersion ?? null;
     const databaseUrl = adminUrl.replace(/\/[^/]*$/, `/${dbName}`);
     step(`database ${dbName}`);
 
     for (const cmd of cfg.provision ?? []) {
       await env.runStep(env.interpolate(cmd, { DATABASE_URL: databaseUrl }), {
-        cwd: repoRoot, env: { ...process.env, DATABASE_URL: databaseUrl }, label: 'provision',
+        cwd: repoRoot, env: { ...process.env, DATABASE_URL: databaseUrl }, label: 'provision', policy,
       });
     }
     step(`provision commands: ${(cfg.provision ?? []).length}`);
@@ -108,52 +176,18 @@ async function bringUp({ repoRoot, contract, runDir, runId, adminUrl }) {
     step(`local JWKS on ${started.identity.jwksUri}`);
 
     // 3. LAUNCH ----------------------------------------------------------------
-    const appEnv = {
-      ...process.env,
-      DATABASE_URL: databaseUrl,
-      PORT: String(appPort),
-      WORKOS_ISSUER: issuer,
-      WORKOS_CLIENT_ID: clientId,
-      WORKOS_JWKS_URI: started.identity.jwksUri,
-      WORKOS_REDIRECT_URI: `http://127.0.0.1:${appPort}/auth/callback`,
-      SESSION_SEALING_KEY_CURRENT: 'w'.repeat(48),
-      WORKOS_API_KEY: 'sk_watson_local_placeholder_not_a_real_key',
-    };
-
-    // The contract's `env` may reference run-scoped values the engine owns, as
-    // ${WATSON_*} placeholders. Substitute them and FAIL CLOSED on any that is
-    // left unresolved: launching a half-configured application would let the
-    // identity seam fall back to an ambient key source or stay unmounted, and
-    // the run would then "verify" an app whose guarded routes never mounted.
-    const injected = {
-      WATSON_JWKS_URI: started.identity.jwksUri,
-      WATSON_BASE_URL: `http://127.0.0.1:${appPort}`,
-      WATSON_DATABASE_URL: databaseUrl,
-      WATSON_PORT: String(appPort),
-      WATSON_RUN_ID: runId,
-    };
-    for (const [key, raw] of Object.entries(cfg.env ?? {})) {
-      // Deliberately NOT the general interpolate(): that substitutes an unknown
-      // name with an empty string, which here would hand the application an empty
-      // WORKOS_JWKS_URI. The identity seam would then read as "not configured",
-      // the guarded routes would never mount, and the run would fail much later
-      // with an unrelated-looking error. Resolve explicitly and throw on a miss.
-      appEnv[key] = String(raw).replace(/\$\{(WATSON_\w+)\}/g, (_, name) => {
-        if (!(name in injected)) {
-          throw new Error(
-            `.watson/config.yaml env.${key} references \${${name}}, which the engine does not supply. ` +
-              `Known injected values: ${Object.keys(injected).join(', ')}.`,
-          );
-        }
-        return injected[name];
-      });
-    }
+    const appEnv = buildAppEnv({
+      cfg, runId, databaseUrl, appPort,
+      baseUrl: `http://127.0.0.1:${appPort}`,
+      identity: { issuer, clientId, jwksUri: started.identity.jwksUri },
+      inherit: true,
+    });
     for (const cmd of cfg.build ?? []) {
-      await env.runStep(cmd, { cwd: repoRoot, env: appEnv, label: 'build' });
+      await env.runStep(cmd, { cwd: repoRoot, env: appEnv, label: 'build', policy });
     }
     started.app = env.launchApp({
       cmd: cfg.launch.command, cwd: repoRoot, env: appEnv,
-      logFile: path.join(runDir, 'logs', 'app.log'),
+      logFile: path.join(runDir, 'logs', 'app.log'), policy,
     });
     const baseUrl = `http://127.0.0.1:${appPort}`;
     await env.waitForHealth(`${baseUrl}${cfg.launch.health_path}`, 90_000);
@@ -168,7 +202,12 @@ async function bringUp({ repoRoot, contract, runDir, runId, adminUrl }) {
     if (!fixture) throw new Error(`fixture profile \`${cfg.launch.fixture_profile}\` not declared`);
     const seed = await env.runStep(
       env.interpolate(fixture.command, { RUN_ID: runId, DATABASE_URL: databaseUrl }),
-      { cwd: repoRoot, env: { ...appEnv, DATABASE_URL: databaseUrl }, label: 'seed' },
+      {
+        cwd: repoRoot,
+        env: { ...appEnv, DATABASE_URL: databaseUrl },
+        label: 'seed',
+        policy,
+      },
     );
     let vars = {};
     try {
@@ -179,7 +218,202 @@ async function bringUp({ repoRoot, contract, runDir, runId, adminUrl }) {
     step(`seeded: ${Object.keys(vars).join(', ')}`);
     timings.seed_ms = Date.now() - t;
 
-    return { dbName, databaseUrl, baseUrl, appPort, vars, timings, tokens: started.identity.tokens, identity: started.identity, teardown };
+    return { dbName, databaseUrl, baseUrl, appPort, vars, timings, dbServerVersion,
+      tokens: started.identity.tokens, identity: started.identity, teardown };
+  } catch (err) {
+    await teardown();
+    throw err;
+  }
+}
+
+/**
+ * Bring the product up ACROSS A BOUNDARY: the product runs somewhere this
+ * process cannot write, and this process runs somewhere the product cannot
+ * reach.
+ *
+ * The division of labour IS the security property, so it is worth stating
+ * exactly:
+ *
+ *   THE VERIFIER (here) decides. It reads the contract, provisions and stamps
+ *   the database, mints the identity and serves the JWKS, chooses the port,
+ *   resolves every command and every environment variable, and — critically —
+ *   confirms readiness itself by polling the product's own health endpoint.
+ *
+ *   THE PRODUCT PLANE (there) executes. It runs the commands it is handed, in
+ *   the product's checkout, and answers with what came back.
+ *
+ * Nothing the plane says is trusted. Readiness is never taken on its word, and
+ * the seed's variables are product-supplied data — exactly as they always were —
+ * used only as substitution values in journeys.
+ */
+async function bringUpRemote({ contract, runId, adminUrl, planeUrl, productBaseUrl, productPort, headSha }) {
+  const cfg = contract.config;
+  const dbName = `watson_${runId.replace(/[^a-z0-9]/gi, '').slice(-16).toLowerCase()}`;
+  const started = {};
+  let timings = {};
+  let planeTree = null;
+
+  // The plane is untrusted and is on the other end of this read, so the response
+  // is treated as hostile input: status checked, size bounded, parsed by hand.
+  // `res.json()` on an unbounded body is an invitation.
+  const MAX_PLANE_RESPONSE = 8 * 1024 * 1024;
+  const plane = async (route, body) => {
+    const res = await fetch(`${planeUrl}${route}`, {
+      method: body === undefined ? 'GET' : 'POST',
+      headers: body === undefined ? {} : { 'content-type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(1_200_000),
+    });
+    const reader = res.body?.getReader();
+    if (!reader) throw new Error(`product plane ${route}: no response body`);
+    const chunks = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.length;
+      if (total > MAX_PLANE_RESPONSE) {
+        await reader.cancel();
+        throw new Error(`product plane ${route}: response exceeded ${MAX_PLANE_RESPONSE} bytes`);
+      }
+      chunks.push(value);
+    }
+    const text = Buffer.concat(chunks).toString('utf8');
+    if (!res.ok && !text) throw new Error(`product plane ${route}: HTTP ${res.status}`);
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new Error(`product plane ${route}: HTTP ${res.status}, response was not JSON: ${text.slice(0, 300)}`);
+    }
+  };
+
+  const teardown = async () => {
+    try { await plane('/teardown', {}); } catch { /* the container is going away anyway */ }
+    if (started.identity) await started.identity.close().catch(() => {});
+    if (started.dbCreated) await env.dropDatabase({ adminUrl, dbName }).catch(() => {});
+  };
+
+  try {
+    // 0. REACHABILITY — fail here, with a clear message, rather than minutes
+    //    later inside a bring-up that was never going to be delivered.
+    const alive = await plane('/alive');
+    if (!alive?.ok) throw new Error(`product plane at ${planeUrl} did not answer /alive`);
+    step(`product plane ${alive.protocol} at ${planeUrl}`);
+
+    // The verifier measures exactness against ITS OWN copy of the product tree.
+    // If the plane is about to build a different one, every claim in this run is
+    // about a commit that was never driven. The plane is untrusted, so a matching
+    // answer proves little — but a MISMATCHING one is conclusive, and this is the
+    // only thing that would notice an orchestration wired to two checkouts.
+    if (!alive.tree?.head_sha) {
+      throw new Error(
+        `the product plane did not say which checkout it is about to build. Silence and agreement `
+          + 'are not the same answer, and this check exists to tell them apart.',
+      );
+    }
+    if (headSha && alive.tree.head_sha !== headSha) {
+      throw new Error(
+        `the product plane is at ${alive.tree.head_sha}, but this run is about ${headSha}. `
+          + 'The verifier and the plane are looking at different checkouts.',
+      );
+    }
+    // A peer reporting its OWN tree dirty is the one statement an untrusted
+    // party can usefully make against itself. Recording it and carrying on
+    // would waste the only self-incrimination available.
+    if (alive.tree.clean === false) {
+      throw new Error(
+        `the product plane reports its own checkout is not clean (${alive.tree.dirty_count} path(s)). `
+          + 'It is about to build something other than the commit this run is about.',
+      );
+    }
+    planeTree = alive.tree;
+
+    // 1. PROVISION — from the verifier side. The database is reachable from both
+    //    planes over the isolated network, but only the verifier may CREATE one,
+    //    and only the verifier stamps the marker the product's fixture requires.
+    //
+    //    This runs before install, which reverses the single-process ordering:
+    //    the environment carrying DATABASE_URL must exist before any command can
+    //    be sent. A failed install therefore leaves a database behind — harmless
+    //    here, because `teardown` drops it unconditionally and the server itself
+    //    is ephemeral.
+    let t = Date.now();
+    const provisioned = await env.provisionDatabase({ adminUrl, dbName, runId });
+    started.dbCreated = true;
+    const databaseUrl = adminUrl.replace(/\/[^/]*$/, `/${dbName}`);
+    timings.provision_ms = Date.now() - t;
+    step(`database ${dbName}`);
+
+    // 2. IDENTITY — served BY THE VERIFIER, bound so the other plane can reach
+    //    it. The signing key never leaves this process.
+    t = Date.now();
+    const issuer = cfg.identity.issuer;
+    const clientId = env.interpolate(cfg.identity.client_id, { RUN_ID: runId });
+    started.identity = await env.startIdentityService({
+      issuer, clientId, identities: contract.identities,
+      bindHost: '0.0.0.0',
+      advertiseHost: process.env.WATSON_ADVERTISE_HOST ?? 'watson-verifier',
+    });
+    step(`local JWKS on ${started.identity.jwksUri}`);
+
+    const appEnv = buildAppEnv({
+      cfg, runId, databaseUrl, appPort: productPort, baseUrl: productBaseUrl,
+      identity: { issuer, clientId, jwksUri: started.identity.jwksUri },
+      inherit: false,
+    });
+
+    // 3. LAUNCH — install, provision commands, build, start. Everything the pull
+    //    request wrote runs THERE, as an unprivileged user, in a container that
+    //    holds no credential and cannot see this process's filesystem.
+    const launched = await plane('/launch', {
+      runId,
+      install: cfg.install ?? [],
+      provision: cfg.provision ?? [],
+      build: cfg.build ?? [],
+      launch: cfg.launch.command,
+      env: appEnv,
+    });
+    if (!launched?.ok) {
+      throw new Error(
+        `product plane failed during ${launched?.phase ?? 'launch'}: ${launched?.message ?? 'no message'}\n` +
+        `${(launched?.log ?? '').slice(-1500)}`,
+      );
+    }
+    // A PURE spread, reassigning. The previous attempt spread into
+    // `Object.assign`, which still writes each key with [[Set]] and so still
+    // invokes the prototype setter — the fix was on the wrong side of the call
+    // and did nothing.
+    timings = { ...timings, ...(launched.timings ?? {}) };
+    timings.launch_ms = Date.now() - t;
+
+    // 4. READINESS — proven by the verifier, across the network, against the
+    //    product's own endpoint. The plane's success response is not readiness.
+    await env.waitForHealth(`${productBaseUrl}${cfg.launch.health_path}`, 180_000);
+    step(`app answering on ${productBaseUrl}`);
+
+    // 5. SEED — after a LIVE application, because a product may create its
+    //    identity tables in its own startup bootstrap rather than in migrations.
+    t = Date.now();
+    const fixture = contract.fixtures.profiles?.[cfg.launch.fixture_profile];
+    if (!fixture) throw new Error(`fixture profile \`${cfg.launch.fixture_profile}\` not declared`);
+    const seeded = await plane('/seed', {
+      runId,
+      seed: fixture.command,
+      env: { ...appEnv, DATABASE_URL: databaseUrl },
+    });
+    if (!seeded?.ok) {
+      throw new Error(
+        `product plane failed during seed: ${seeded?.message ?? 'no message'}\n${(seeded?.log ?? '').slice(-1500)}`,
+      );
+    }
+    timings.seed_ms = Date.now() - t;
+    step(`seeded: ${Object.keys(seeded.vars).join(', ')}`);
+
+    return {
+      dbName, databaseUrl, baseUrl: productBaseUrl, appPort: productPort,
+      vars: seeded.vars, timings, dbServerVersion: provisioned?.serverVersion ?? null, planeTree,
+      tokens: started.identity.tokens, identity: started.identity, teardown,
+    };
   } catch (err) {
     await teardown();
     throw err;
@@ -190,6 +424,42 @@ async function cmdVerify(args) {
   const repoRoot = path.resolve(args.repo ?? '.');
   const adminUrl = args['db-url'] ?? process.env.WATSON_ADMIN_DB_URL ?? 'postgres://watson:watson@127.0.0.1:5432/postgres';
   const profile = args.profile ?? 'poc';
+  // Resolved ONCE, before anything runs, and before a database exists. A caller
+  // that asked for privilege separation and cannot have it must find out here —
+  // not after the product's install script has already run as the verifier.
+  // Cleared FIRST, before any refusal below can end the run. A stale file at the
+  // agreed path is read by a harness as this run's verdict, so removing it has to
+  // happen earlier than every exit — including the ones a few lines down, which
+  // is where it used to sit and therefore did not run.
+  // The trusted orchestration's account of what it materialised, written before
+  // any product code ran. Without it there is no authority for product identity
+  // and no product claim can be made.
+  const outPath = typeof args.out === 'string' ? path.resolve(args.out) : null;
+  if (outPath) {
+    try { fs.rmSync(outPath, { force: true, recursive: true }); } catch { /* nothing there */ }
+  }
+
+  const policy = env.productExecution();
+  // uid separation requires root; a sandboxed browser requires NOT root. A
+  // `verify` asked for both would run the entire bring-up and then throw at the
+  // browser, reporting BLOCKED_ENVIRONMENT after several minutes of work. Refuse
+  // here, and say what to use instead.
+  if (policy.drop) {
+    throw new Error(
+      'WATSON_PRODUCT_UID requires this process to be root, and a sandboxed browser requires that it '
+        + 'is not — `verify` cannot have both. Use --plane to run the product in its own container, '
+        + 'which is the stronger boundary anyway. uid separation remains available for `watson doctor`.',
+    );
+  }
+  // When a plane URL is given, the product runs on the far side of a boundary
+  // and this process never executes a line of it. Both values come from trusted
+  // orchestration, never from the product.
+  const planeUrl = typeof args.plane === 'string' ? args.plane.replace(/\/$/, '') : null;
+  const productBaseUrl = typeof args['product-base-url'] === 'string'
+    ? args['product-base-url'].replace(/\/$/, '') : null;
+  if (planeUrl && !productBaseUrl) {
+    throw new Error('--plane requires --product-base-url: the verifier must know where to reach the running product');
+  }
   const runId = env.newRunId();
   const runDir = env.makeRunDir(ROOT, runId);
   const startedAt = new Date().toISOString();
@@ -260,7 +530,17 @@ async function cmdVerify(args) {
     // actually verify is worse than one that reports nothing.
     workingTree: workingTreeState(repoRoot),
     repoRoot,
-    profile, selection, startedAt, shadow: true,
+    profile, selection, startedAt, shadow: true, outPath,
+    execution: {
+      ...env.executionProvenance(policy),
+      // Which boundary this run actually had between the verifier and the code
+      // it was verifying. A reader assessing a verdict needs to know whether the
+      // product ran in its own plane, was merely uid-separated in this process
+      // tree, or shared everything with the verifier — those are three different
+      // levels of confidence in the same JSON.
+      product_plane: planeUrl ? { url: planeUrl, product_base_url: productBaseUrl } : null,
+      product_isolation: planeUrl ? 'separate-plane' : (policy.drop ? 'uid-separated' : 'same-process'),
+    },
     fixtureProfile: contract.config.launch.fixture_profile,
     viewports: ['1280x800'],
     browser: 'chromium/playwright-1.49.1',
@@ -320,7 +600,12 @@ async function cmdVerify(args) {
   // --- bring the environment up ------------------------------------------------
   let up;
   try {
-    up = await bringUp({ repoRoot, contract, runDir, runId, adminUrl });
+    up = planeUrl
+      ? await bringUpRemote({
+          contract, runId, adminUrl, planeUrl, productBaseUrl, headSha,
+          productPort: Number(new URL(productBaseUrl).port || 80),
+        })
+      : await bringUp({ repoRoot, contract, runDir, runId, adminUrl, policy });
   } catch (err) {
     return finish(runDir, {
       ...base, dbName: 'n/a', baseUrl: 'n/a',
@@ -333,6 +618,16 @@ async function cmdVerify(args) {
       finishedAt: new Date().toISOString(),
     });
   }
+
+  // Filled in after provisioning rather than guessed before it: the version is a
+  // fact about the server that actually held the fixtures. `base.execution` is
+  // shared by reference with every envelope built below, which is exactly what is
+  // wanted — one record of one run's environment.
+  base.execution.database_server_version = up.dbServerVersion;
+  // What the plane said about its own checkout, recorded verbatim as the
+  // untrusted claim it is. A reader can see that the two sides agreed, and that
+  // agreement between the verifier and an untrusted peer is not the same as proof.
+  if (up.planeTree) base.execution.product_plane_tree_claimed = up.planeTree;
 
   try {
     // --- doctor ---------------------------------------------------------------
@@ -367,6 +662,30 @@ async function cmdVerify(args) {
       cdpPort,
     });
     step(`browser up, CDP on http://127.0.0.1:${cdpPort} (MCP layers attach here)`);
+
+    // Ask Chromium what its sandbox is doing rather than inferring it from the
+    // absence of a flag. The pages this browser loads are served by the product
+    // under verification, so "is the sandbox actually on" is a fact about the
+    // integrity of this run, and belongs in the evidence beside the verdict.
+    base.execution.browser_sandbox_probe = await drive.probeSandbox(browser);
+    // Recorded AND acted on. Recording that the browser said it was not
+    // sandboxed, and then producing a verdict anyway, is the shape of a control
+    // that exists only on paper.
+    if (base.execution.browser_sandbox_probe.effective === false) {
+      await browser.close();
+      return finish(runDir, {
+        ...base, dbName: up.dbName, baseUrl: up.baseUrl,
+        verdict: 'BLOCKED_ENVIRONMENT',
+        verdictReason: 'Chromium reports it is not adequately sandboxed; the browser is part of the verifier and the pages it loads come from the product',
+        doctor: dr, features: [], findings: [], qualitySignals: zeroSignals(),
+        evidence: { bundle: path.relative(ROOT, runDir), retention_days: 7 },
+        timings: { ...up.timings, total_ms: Date.now() - t0 },
+        finishedAt: new Date().toISOString(),
+      });
+    }
+    step(`browser sandbox: ${base.execution.browser_sandbox_probe.available
+      ? (base.execution.browser_sandbox_probe.effective ? 'reported effective' : 'reported NOT effective')
+      : 'not reportable by this build'} (running as uid ${typeof process.getuid === 'function' ? process.getuid() : 'n/a'})`);
 
     const tDrive = Date.now();
     const features = [];
@@ -499,7 +818,12 @@ function finish(runDir, run) {
     const at_end = workingTreeState(run.repoRoot);
     const at_start = run.workingTree ?? at_end;
     const changed_mid_run =
-      at_start.exact_head !== at_end.exact_head || at_start.dirty_count !== at_end.dirty_count;
+      at_start.exact_head !== at_end.exact_head
+      || at_start.dirty_count !== at_end.dirty_count
+      // A run that started at the reported commit and ended somewhere else moved
+      // under the verifier. `dirty_count` cannot see that: committing the change
+      // is what makes the count go back to zero.
+      || at_start.head_sha !== at_end.head_sha;
 
     run.workingTree = { ...at_end, at_start_exact_head: at_start.exact_head, changed_mid_run };
 
@@ -516,11 +840,12 @@ function finish(runDir, run) {
   }
 
   const envlp = buildEnvelope(run);
-  const { jsonPath, mdPath } = writeResult(runDir, envlp);
+  const { jsonPath, mdPath } = writeResult(runDir, envlp, run.outPath ?? null);
   log('');
   log(summary(envlp).split('\n').slice(0, 3).join('\n'));
   log('');
   log(`  result   ${path.relative(process.cwd(), jsonPath)}`);
+  if (run.outPath) log(`  canonical ${run.outPath}`);
   log(`  summary  ${path.relative(process.cwd(), mdPath)}`);
   log('');
   return envlp;
@@ -532,7 +857,7 @@ async function cmdDoctor(args) {
   const runId = env.newRunId();
   const runDir = env.makeRunDir(ROOT, runId);
   const contract = loadContract(repoRoot);
-  const up = await bringUp({ repoRoot, contract, runDir, runId, adminUrl });
+  const up = await bringUp({ repoRoot, contract, runDir, runId, adminUrl, policy: env.productExecution() });
   try {
     const adminIdentity = contract.identities.find((i) => i.role === 'admin' && i.doctor) ?? contract.identities[0];
     const dr = await env.doctor({
@@ -553,6 +878,17 @@ async function cmdDoctor(args) {
   }
 }
 
+// ONLY WHEN INVOKED AS THE COMMAND, never on import.
+//
+// Without this guard, `import('./cli.mjs')` runs the CLI: it prints usage and
+// calls `process.exit`, which kills whatever imported it. That made the entry
+// point untestable, and the cost was concrete — this slice was extracted with a
+// fully green suite and a `cli.mjs` that threw on its first import, because
+// nothing in the suite could reach it.
+const invokedDirectly = process.argv[1]
+  && path.resolve(process.argv[1]) === path.resolve(url.fileURLToPath(import.meta.url));
+
+if (invokedDirectly) {
 const args = parseArgs(process.argv.slice(2));
 const cmd = args._[0];
 try {
@@ -567,6 +903,20 @@ try {
     process.exit(envlp.check?.obligation === 'satisfied' ? 0 : 1);
   } else if (cmd === 'doctor') {
     process.exit(await cmdDoctor(args));
+  } else if (cmd === 'plane') {
+    // The product plane. Runs in the UNTRUSTED container, as an unprivileged
+    // user, and executes only what the verifier hands it. It never sees the
+    // evidence, the run bundle, or the browser.
+    const repoRoot = path.resolve(args.repo ?? '.');
+    const port = Number(args.port ?? 8079);
+    const logDir = path.resolve(args['log-dir'] ?? path.join(repoRoot, '..', 'plane-logs'));
+    const { port: bound } = await plane.serve({ repoRoot, logDir, port });
+    log(`\nwatson product plane ${plane.PLANE_PROTOCOL}`);
+    log(`  repo   ${repoRoot}`);
+    log(`  listen 0.0.0.0:${bound}`);
+    log(`  uid    ${typeof process.getuid === 'function' ? process.getuid() : 'n/a'}\n`);
+    // Deliberately never resolves: the container's lifetime is the plane's.
+    await new Promise(() => {});
   } else if (cmd === 'reap') {
     const { dropped, kept } = await env.reap({
       adminUrl: args['db-url'] ?? process.env.WATSON_ADMIN_DB_URL ?? 'postgres://watson:watson@127.0.0.1:5432/postgres',
@@ -577,10 +927,11 @@ try {
     for (const k of kept) log(`  kept ${k.datname} — ${k.why}`);
     process.exit(0);
   } else {
-    log(`watson ${VERSION}\n\n  watson verify --repo <path> [--sha <ref>] [--base <ref>] [--profile poc] [--pr N]\n  watson doctor --repo <path>\n  watson reap\n`);
+    log(`watson ${VERSION}\n\n  watson verify --repo <path> [--sha <ref>] [--base <ref>] [--profile poc] [--pr N] [--out <file>]\n               [--plane <url> --product-base-url <url>]\n  watson doctor --repo <path>\n  watson plane --repo <path> [--port 8079]\n  watson reap\n`);
     process.exit(cmd ? 1 : 0);
   }
 } catch (err) {
   console.error(`\nwatson: ${err.message}\n`);
   process.exit(2);
+}
 }
