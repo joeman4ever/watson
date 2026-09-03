@@ -21,8 +21,8 @@ import {
 } from './contract.mjs';
 import { validateProofDeclarations } from './proofs.mjs';
 import { resolveGovernance, downgradeForUngovernedContract } from './governance.mjs';
-import { productFingerprint, contractFingerprint, resolveSha, contractChange, productIdentity, changedPaths, engineProvenance, verdictBearingPaths, pathExistsAt, pathReaderAt } from './fingerprint.mjs';
-import { readManifest } from './manifest.mjs';
+import { productFingerprint, contractFingerprint, resolveSha, contractChange, productIdentity, changedPaths, engineProvenance, verdictBearingPaths, pathExistsAt, pathReaderAt, operationalConfigChange } from './fingerprint.mjs';
+import { readManifest, contractDirFingerprint } from './manifest.mjs';
 import { runManifest } from './manifest-cli.mjs';
 import { selectByImpact } from './selection.mjs';
 import * as env from './environment.mjs';
@@ -532,6 +532,11 @@ async function cmdVerify(args) {
     : null;
   const governance = resolveGovernance({
     base: baseContract, head: headContract, baseSupplied: !!baseContractDir,
+    baseSha,
+    // Computed from the materialised directory, by the same function the trusted
+    // observer uses to check it. Two notions of "the same contract" is how this
+    // field would become decorative.
+    baseFingerprint: baseContractDir ? contractDirFingerprint(baseContractDir) : null,
   });
   const contract = governance.contract;
   // Scoped from the governing contract, and from what exists at the HEAD commit —
@@ -609,6 +614,15 @@ async function cmdVerify(args) {
     // itself and report no change however much the head moved.
     contractChange: contractChange(repoRoot, baseSha, headSha,
       (sha) => (sha === headSha ? headContract : baseContract), contractScope),
+    // HOW THE PRODUCT WAS LAUNCHED, reported separately from everything else.
+    //
+    // These keys are head-authored by decision — `install`, `provision`,
+    // `build`, `launch.command`, `env` must match the pull request's own tree or
+    // nothing runs. That makes them untrusted execution inputs, not verdict
+    // authority, and it makes their movement worth seeing on its own: a reviewer
+    // must be able to tell that this pull request changed how Watson launched
+    // the product, without that fact being buried inside a whole-contract digest.
+    operationalConfig: operationalConfigChange(baseContract?.config, headContract.config),
     governance,
     // Recorded on EVERY result, pass or fail. A run that reports a SHA it did not
     // actually verify is worse than one that reports nothing.

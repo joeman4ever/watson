@@ -242,9 +242,21 @@ export function buildEnvelope(run) {
           authority: run.governance.authority,
           product_claims_permitted: run.governance.product_claims_permitted,
           head_only_features: run.governance.head_only_features ?? [],
+          // WHICH base contract, not merely that there was one. The trusted
+          // observer materialised it and knows the base SHA independently, so it
+          // can compare both and reject a mismatch — without them the field is
+          // a self-report and provenance is decorative.
+          sha: run.governance.sha ?? null,
+          fingerprint: run.governance.fingerprint ?? null,
           note: markerSafe(run.governance.note ?? ''),
         }
       : null,
+
+    // How the product was LAUNCHED, on its own rather than inside the
+    // whole-contract digest. Head-authored, untrusted, product-plane only — and
+    // conspicuous, because a reviewer must be able to see that this pull request
+    // changed the commands Watson ran to start the thing it verified.
+    operational_config: run.operationalConfig ?? null,
 
     profile: run.profile,
     verdict,

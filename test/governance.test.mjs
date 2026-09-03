@@ -13,6 +13,8 @@ import {
   resolveGovernance, governingConfig, downgradeForUngovernedContract,
   CONFIG_AUTHORITY, LAUNCH_AUTHORITY,
 } from '../src/governance.mjs';
+import { operationalConfigChange } from '../src/fingerprint.mjs';
+import { contractDirFingerprint } from '../src/manifest.mjs';
 
 const PRODUCT_CLAIMS = new Set(['PASS', 'PASS_WITH_ADVISORIES', 'FAIL_PRODUCT']);
 
@@ -310,5 +312,115 @@ describe('the gate is applied where the verdict is written', () => {
     const src = fs.readFileSync(new URL('../src/cli.mjs', import.meta.url), 'utf8');
     const body = src.slice(src.indexOf('function finish(runDir, run) {'));
     assert.ok(body.includes('downgradeForInexactHead('), 'the exact-head gate was lost');
+  });
+});
+
+describe('the governing contract names ITSELF, not merely its authority', () => {
+  // A result that says "the base contract governed" is exactly what an
+  // ungoverned run would also produce if the claim were the only evidence. The
+  // trusted observer materialised the directory and knows the base SHA
+  // independently — it can only check the claim if the claim is specific.
+  test('base governance carries the base SHA and a content fingerprint', () => {
+    const g = resolveGovernance({
+      base: contract(), head: contract(), baseSupplied: true,
+      baseSha: 'b'.repeat(40), baseFingerprint: 'sha256:abc',
+    });
+    assert.equal(g.sha, 'b'.repeat(40));
+    assert.equal(g.fingerprint, 'sha256:abc');
+  });
+
+  test('an ungoverned run carries neither', () => {
+    const g = resolveGovernance({ head: contract(), baseSupplied: false, baseSha: 'b'.repeat(40) });
+    assert.equal(g.sha, null);
+    assert.equal(g.fingerprint, null);
+  });
+
+  test('bootstrap names the base SHA but has no contract to fingerprint', () => {
+    const g = resolveGovernance({ base: null, head: contract(), baseSupplied: true, baseSha: 'b'.repeat(40) });
+    assert.equal(g.authority, 'bootstrap');
+    assert.equal(g.fingerprint, null);
+  });
+});
+
+describe('the contract fingerprint is a fact about content', () => {
+  const mk = (files) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'watson-cf-'));
+    for (const [rel, body] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+      fs.writeFileSync(path.join(dir, rel), body);
+    }
+    return dir;
+  };
+
+  test('the same content in two places digests identically', () => {
+    const a = mk({ '.watson/config.yaml': 'x: 1\n', '.watson/features/j.md': 'j' });
+    const b = mk({ '.watson/config.yaml': 'x: 1\n', '.watson/features/j.md': 'j' });
+    assert.equal(contractDirFingerprint(a), contractDirFingerprint(b));
+    assert.match(contractDirFingerprint(a), /^sha256:[0-9a-f]{64}$/);
+  });
+
+  test('one changed byte changes it', () => {
+    const a = mk({ '.watson/config.yaml': 'x: 1\n' });
+    const b = mk({ '.watson/config.yaml': 'x: 2\n' });
+    assert.notEqual(contractDirFingerprint(a), contractDirFingerprint(b));
+  });
+
+  test('an added or removed file changes it', () => {
+    const a = mk({ '.watson/config.yaml': 'x: 1\n' });
+    const b = mk({ '.watson/config.yaml': 'x: 1\n', '.watson/features/extra.md': 'e' });
+    assert.notEqual(contractDirFingerprint(a), contractDirFingerprint(b));
+  });
+
+  test('an empty or absent directory has no fingerprint, rather than a fake one', () => {
+    assert.equal(contractDirFingerprint(mk({})), null);
+    assert.equal(contractDirFingerprint('/nonexistent/watson-cf'), null);
+  });
+
+  test('a symlink is recorded as a link, never followed', () => {
+    // Following one would digest whatever it points at rather than what the
+    // directory contains — the same reason `loadContract` refuses a `.watson`
+    // symlink outright.
+    const real = mk({ 'elsewhere/config.yaml': 'secret\n' });
+    const d = fs.mkdtempSync(path.join(os.tmpdir(), 'watson-cf-'));
+    fs.mkdirSync(path.join(d, '.watson'));
+    fs.symlinkSync(path.join(real, 'elsewhere', 'config.yaml'), path.join(d, '.watson', 'config.yaml'));
+    const first = contractDirFingerprint(d);
+    fs.writeFileSync(path.join(real, 'elsewhere', 'config.yaml'), 'changed\n');
+    assert.equal(contractDirFingerprint(d), first, 'the digest followed the link');
+  });
+});
+
+describe('operational config movement is visible on its own', () => {
+  const cfg = (over = {}) => ({ ...contract().config, ...over });
+
+  test('an unchanged launch surface reports changed: false', () => {
+    const r = operationalConfigChange(cfg(), cfg());
+    assert.equal(r.changed, false);
+    assert.deepEqual(r.changed_keys, []);
+  });
+
+  test('a changed launch command is named', () => {
+    const head = cfg();
+    head.launch = { ...head.launch, command: 'npm run start:other' };
+    const r = operationalConfigChange(cfg(), head);
+    assert.equal(r.changed, true);
+    assert.deepEqual(r.changed_keys, ['launch.command']);
+  });
+
+  test('build and provision changes are named too, not folded away', () => {
+    const r = operationalConfigChange(cfg(), cfg({ build: 'x', provision: 'y' }));
+    assert.deepEqual(r.changed_keys.sort(), ['build', 'provision']);
+  });
+
+  test('the SEMANTIC half of the contract does not appear here', () => {
+    // Those are base-governed and reported as contract change; mixing them in
+    // would make this field mean two different things.
+    const r = operationalConfigChange(cfg(), cfg({ generated_roots: ['server/src'] }));
+    assert.deepEqual(r.changed_keys, []);
+    assert.ok(!r.keys.includes('generated_roots'));
+  });
+
+  test('with no base contract, `changed` is null rather than a guess', () => {
+    assert.equal(operationalConfigChange(null, cfg()).changed, null);
   });
 });

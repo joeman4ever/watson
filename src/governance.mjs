@@ -146,10 +146,12 @@ export function governingConfig(baseConfig, headConfig) {
  *                        seeing "the new journey passed" when it never ran is
  *                        worse off than one told it did not run.
  */
-export function resolveGovernance({ base = null, head, baseSupplied = false }) {
+export function resolveGovernance({
+  base = null, head, baseSupplied = false, baseSha = null, baseFingerprint = null,
+}) {
   if (!baseSupplied) {
     return {
-      authority: 'none', contract: head, problems: [],
+      authority: 'none', sha: null, fingerprint: null, contract: head, problems: [],
       head_only_features: [], product_claims_permitted: false,
       note: 'no trusted base contract was supplied, so no contract could be established as the '
         + 'governing authority for this verdict. Materialise the base contract on the trusted side '
@@ -158,7 +160,7 @@ export function resolveGovernance({ base = null, head, baseSupplied = false }) {
   }
   if (!base) {
     return {
-      authority: 'bootstrap', contract: head, problems: [],
+      authority: 'bootstrap', sha: baseSha, fingerprint: null, contract: head, problems: [],
       head_only_features: [], product_claims_permitted: false,
       note: 'the base revision carries no verification contract, so there is nothing to govern this '
         + 'run. The head contract is being introduced and becomes authoritative when it merges.',
@@ -171,6 +173,15 @@ export function resolveGovernance({ base = null, head, baseSupplied = false }) {
 
   return {
     authority: 'base',
+    // WHICH contract governed, not merely THAT one did (ADR-049 F9).
+    //
+    // A result that says "the base contract governed" is exactly what an
+    // ungoverned run would also produce if the claim were the only evidence. The
+    // trusted side materialised this directory and knows the base SHA
+    // independently, so it can compare both and reject a mismatch. Without them
+    // the field is decorative.
+    sha: baseSha,
+    fingerprint: baseFingerprint,
     contract: {
       ...base,
       config,

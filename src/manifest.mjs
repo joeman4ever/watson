@@ -217,6 +217,43 @@ export function verifyAgainstManifest(treeRoot, manifest, { generatedRoots = [] 
   };
 }
 
+/**
+ * A content fingerprint of a materialised contract directory.
+ *
+ * Lives HERE, in the dependency-free module, for one reason: the trusted side
+ * must be able to compute the same value independently of the run it is
+ * validating. `validate-result.mjs` imports this exact function from the pinned
+ * engine, so the observer and the verifier cannot drift into two different
+ * notions of "the same contract" — which is the failure that would make
+ * `governing_contract` decorative instead of load-bearing.
+ *
+ * Paths are relative and sorted, so the digest is a fact about content and not
+ * about where the directory was materialised.
+ */
+export function contractDirFingerprint(dir) {
+  const entries = [];
+  const walk = (rel) => {
+    const abs = path.join(dir, rel);
+    let st;
+    try { st = fs.lstatSync(abs); } catch { return; }
+    // A symlink is recorded as a symlink, never followed: following one would
+    // digest whatever it points at rather than what the directory contains.
+    if (st.isSymbolicLink()) { entries.push([rel, 'symlink', fs.readlinkSync(abs)]); return; }
+    if (st.isDirectory()) {
+      for (const name of fs.readdirSync(abs).sort()) walk(path.join(rel, name));
+      return;
+    }
+    if (!st.isFile()) return;
+    entries.push([rel, 'file', crypto.createHash('sha256').update(fs.readFileSync(abs)).digest('hex')]);
+  };
+  if (!fs.existsSync(dir)) return null;
+  walk('.watson');
+  if (!entries.length) return null;
+  const h = crypto.createHash('sha256');
+  for (const [rel, kind, digest] of entries) h.update(`${rel.split(path.sep).join('/')}\0${kind}\0${digest}\0`);
+  return `sha256:${h.digest('hex')}`;
+}
+
 export function readManifest(file) {
   const m = JSON.parse(fs.readFileSync(file, 'utf8'));
   if (m?.schema !== MANIFEST_SCHEMA) throw new Error(`\`${file}\` is not a ${MANIFEST_SCHEMA} manifest`);

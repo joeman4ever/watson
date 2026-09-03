@@ -12,6 +12,10 @@
 import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import { verifyAgainstManifest } from './manifest.mjs';
+// The authority maps live in `governance.mjs`, which is deliberately pure —
+// it reads nothing but its arguments, and a structural test enforces that. The
+// digest belongs here, where crypto already is.
+import { CONFIG_AUTHORITY, LAUNCH_AUTHORITY } from './governance.mjs';
 
 // ---------------------------------------------------------------- safe git --
 //
@@ -601,6 +605,43 @@ function domainSize(domain) {
  * membership is verdict-bearing in its own right: the loader globs `*.md`, so
  * adding or removing a file changes what runs.
  */
+/**
+ * What the head contract says about HOW TO LAUNCH the product, and whether it
+ * differs from the base.
+ *
+ * Reported on its own rather than folded into the whole-contract digest. These
+ * keys are head-authored by decision: they must match the pull request's own
+ * tree or nothing runs at all. That makes them untrusted execution inputs — and
+ * makes their movement exactly the thing a reviewer needs to see, because it
+ * changes how the product under verification was started.
+ *
+ * `changed` is a fact, not a judgement. Watson cannot tell a legitimate build
+ * change from one chosen to alter what gets launched, and pretending to would be
+ * worse than saying plainly that it moved.
+ */
+export function operationalConfigChange(baseConfig, headConfig) {
+  const keys = Object.entries(CONFIG_AUTHORITY).filter(([, who]) => who === 'head').map(([k]) => k)
+    .concat(Object.entries(LAUNCH_AUTHORITY).filter(([, who]) => who === 'head').map(([k]) => `launch.${k}`))
+    .sort();
+  const read = (cfg, key) => (key.startsWith('launch.') ? cfg?.launch?.[key.slice(7)] : cfg?.[key]);
+  const digest = (cfg) => (cfg
+    ? `sha256:${crypto.createHash('sha256').update(JSON.stringify(keys.map((k) => [k, read(cfg, k) ?? null]))).digest('hex')}`
+    : null);
+
+  const baseDigest = digest(baseConfig);
+  const headDigest = digest(headConfig);
+  const changedKeys = baseConfig
+    ? keys.filter((k) => JSON.stringify(read(baseConfig, k) ?? null) !== JSON.stringify(read(headConfig, k) ?? null))
+    : [];
+  return {
+    keys,
+    base_fingerprint: baseDigest,
+    head_fingerprint: headDigest,
+    changed: baseDigest === null ? null : baseDigest !== headDigest,
+    changed_keys: changedKeys,
+  };
+}
+
 export function canonicalContract(c) {
   const features = {};
   for (const f of c?.features ?? []) {
