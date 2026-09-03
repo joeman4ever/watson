@@ -242,6 +242,18 @@ export function buildEnvelope(run) {
     product_identity: run.workingTree ?? null,
     working_tree: run.workingTree ?? null,
 
+    // THE MANIFEST THAT ESTABLISHED IDENTITY, recorded in the envelope.
+    //
+    // `cli.mjs` computed this and never emitted it, so the trusted validator's
+    // `d.manifest?.sha !== expect.headSha` check could not fire: the key was
+    // always undefined and the `&&` short-circuited. A second silently-skipped
+    // trusted-side check, found by the fixture canary that was written after
+    // the first one (`schema` vs `schema_version`) was found by review.
+    //
+    // It is also provenance worth having on its own: which manifest, describing
+    // how many entries, spoke for this run's product identity.
+    manifest: run.manifest ?? null,
+
     // Recorded ALWAYS; NOT consulted for carry-forward in phase 0/1.
     product_fingerprint: run.productFingerprint,
     contract_fingerprint: run.contractFingerprint,
