@@ -17,7 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 
-import { buildManifest, verifyAgainstManifest, MANIFEST_SCHEMA } from '../src/manifest.mjs';
+import { buildManifest, verifyAgainstManifest, MANIFEST_SCHEMA, contractDirFingerprint } from '../src/manifest.mjs';
 import { productIdentity } from '../src/fingerprint.mjs';
 
 function tmpdir(label) {
@@ -386,5 +386,120 @@ describe('the gate as the engine calls it', () => {
     assert.equal(id.exact_head, false);
     assert.equal(id.dirty_paths.length, 20);
     assert.equal(id.dirty_count, 50, 'the count is the truth; the list is a courtesy');
+  });
+});
+
+// ----------------------------------------------------------------------------
+// THREE INVARIANTS THAT WERE UNPINNED (exact-HEAD confirmation review N10-N12).
+//
+// Each was found by mutating the source and watching the whole suite stay green.
+// None is a live hole: the code is correct today. What was missing is anything
+// that would notice if it stopped being.
+
+describe('a symlink in the contract directory is RECORDED, never followed', () => {
+  // N10. Deleting the symlink branch from `contractDirFingerprint`'s walk left
+  // 418/418 green. Following one would let a link inside `.watson/` pull content
+  // from outside the materialised contract into the digest that says WHICH
+  // contract governed — the one number the trusted observer compares against.
+  //
+  // Behavioural, not a source grep: a real symlink on disk, and an assertion
+  // about the digest that results.
+  const scratch = () => fs.mkdtempSync(path.join(os.tmpdir(), 'watson-symlink-'));
+
+  test('the digest records the link TARGET, not the content behind it', () => {
+    const dir = scratch();
+    const secret = path.join(dir, 'outside.txt');
+    fs.writeFileSync(secret, 'content the contract does not contain\n');
+
+    const a = path.join(dir, 'a', '.watson');
+    fs.mkdirSync(a, { recursive: true });
+    fs.writeFileSync(path.join(a, 'config.yaml'), 'x: 1\n');
+    fs.symlinkSync(secret, path.join(a, 'link'));
+
+    const b = path.join(dir, 'b', '.watson');
+    fs.mkdirSync(b, { recursive: true });
+    fs.writeFileSync(path.join(b, 'config.yaml'), 'x: 1\n');
+    // Same link NAME, different target. If the walk followed links these two
+    // would differ only by the content behind them; because it records the
+    // target, they differ by the target string — which is the honest thing to
+    // digest, and is what a reviewer can see in the diff.
+    fs.symlinkSync(path.join(dir, 'elsewhere.txt'), path.join(b, 'link'));
+
+    const da = contractDirFingerprint(path.join(dir, 'a'));
+    const db = contractDirFingerprint(path.join(dir, 'b'));
+    assert.notEqual(da, db, 'two different link targets digested the same');
+
+    // And the digest does not change when the content BEHIND the link changes,
+    // which is the property that matters: the contract is what it contains.
+    fs.writeFileSync(secret, 'completely different content\n');
+    assert.equal(contractDirFingerprint(path.join(dir, 'a')), da,
+      'the digest followed the symlink; content outside the contract reached it');
+  });
+
+  test('a dangling symlink does not throw', () => {
+    // The `b` case above is already dangling. Stated separately because "records
+    // the target" and "does not explode on a broken link" are different claims,
+    // and a walk that throws here would turn a hostile contract into a crash
+    // rather than a digest.
+    const dir = scratch();
+    const c = path.join(dir, '.watson');
+    fs.mkdirSync(c, { recursive: true });
+    fs.symlinkSync(path.join(dir, 'nothing-here'), path.join(c, 'dangling'));
+    assert.doesNotThrow(() => contractDirFingerprint(dir));
+  });
+});
+
+describe('the product fingerprint scope itself', () => {
+  // N11. Dropping `server` from PRODUCT_PATHS left the suite green. Recorded and
+  // not consulted in Phase 0/1 (a new HEAD is always re-verified), so this is a
+  // provenance defect rather than a gate defect — but a fingerprint that silently
+  // stops covering the server is worse than one that never claimed to.
+  //
+  // Independent literal, for the same reason as CONFIG_AUTHORITY and
+  // ENGINE_OWNED_ENV: an assertion derived from the list under test shrinks with
+  // it.
+  const EXPECTED_PRODUCT_PATHS = [
+    'client', 'server', 'package.json', 'package-lock.json', 'playwright.config.ts',
+  ];
+
+  test('covers exactly these paths', async () => {
+    const src = fs.readFileSync(new URL('../src/fingerprint.mjs', import.meta.url), 'utf8');
+    const m = src.match(/const PRODUCT_PATHS = \[([\s\S]*?)\];/);
+    assert.ok(m, 'PRODUCT_PATHS is no longer a literal array; this test cannot read it');
+    const actual = [...m[1].matchAll(/'([^']+)'/g)].map((x) => x[1]);
+    assert.deepEqual(actual.sort(), [...EXPECTED_PRODUCT_PATHS].sort());
+  });
+});
+
+describe('product identity is measured BEFORE any product code runs', () => {
+  // N12. The engine runs `git` against the product tree, and that tree is mounted
+  // READ-WRITE into the product container. Nothing bad happens today, for one
+  // reason only: every one of those reads is on the path before `bringUp`, and
+  // the product plane executes nothing until the verifier POSTs `/launch`.
+  //
+  // Ordering saving a design is not the same as the design being safe — it is
+  // exactly what F3 removed `loadContractAt` for. Nothing asserted the ordering,
+  // so this does.
+  test('every git read of the product tree precedes bringUp in cli.mjs', () => {
+    const src = fs.readFileSync(new URL('../src/cli.mjs', import.meta.url), 'utf8');
+    const bringUp = src.indexOf('await bringUp(');
+    assert.ok(bringUp > 0, 'bringUp is no longer called here; re-derive this ordering');
+
+    // The functions in `fingerprint.mjs` that shell out to git against the
+    // product repository. Named explicitly rather than discovered, so adding a
+    // new one is a deliberate act that has to come here too.
+    const GIT_READERS = [
+      'productFingerprint(', 'contractFingerprint(', 'contractChange(',
+      'changedPaths(', 'verdictBearingPaths(', 'resolveSha(',
+    ];
+    const late = [];
+    for (const fn of GIT_READERS) {
+      for (const m of src.matchAll(new RegExp(fn.replace('(', '\\('), 'g'))) {
+        if (m.index > bringUp) late.push(`${fn} at ${m.index}`);
+      }
+    }
+    assert.deepEqual(late, [],
+      'a git read of the product tree happens AFTER the product container can run; '
+      + 'the tree is writable by the product, so this ordering is the control');
   });
 });
