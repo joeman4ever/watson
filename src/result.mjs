@@ -188,14 +188,31 @@ export function runVerdict({ executed = [], plan = [], applicable = true } = {})
   const drift = executed.filter((f) => f.verdict === 'FAIL_CONTRACT');
 
   // A selected journey that produced no result at all cannot be spoken for, so a
-  // PASS-shaped verdict becomes INDETERMINATE.
+  // verdict that DISCHARGES THE OBLIGATION becomes INDETERMINATE.
   //
-  // Only PASS-shaped. A run that established a real FAIL_PRODUCT keeps it: the
-  // failure is evidence, the incompleteness is additional, and converting the
-  // finding into INDETERMINATE would hide it. `PRODUCT_CLAIMS` includes
-  // FAIL_PRODUCT and is the wrong set for this.
-  const PASS_SHAPED = new Set(['PASS', 'PASS_WITH_ADVISORIES']);
-  if (notAttempted.length && PASS_SHAPED.has(verdict)) {
+  // Not "PASS-shaped". That was the set, and it let the one case it was written
+  // for slip past: `rollUp([])` returns NOT_APPLICABLE, which is not PASS-shaped,
+  // so a run where NOTHING executed and journeys were selected came back as
+  //
+  //     NOT_APPLICABLE | obligation satisfied | "1 selected journey(s) never ran (j1)"
+  //
+  // — a verdict and a reason that contradict each other, discharging the
+  // verification duty over journeys that did not run. Found by the exact-HEAD
+  // confirmation review (its N5) and reproduced above before this changed.
+  //
+  // The right membership test is the one the obligation table already makes:
+  // PASS, PASS_WITH_ADVISORIES and NOT_APPLICABLE all report `satisfied`, and
+  // none of them may stand over a journey that never ran. It is the same
+  // correction as `WITHHELD_WITHOUT_GOVERNANCE` — the wider set, for the same
+  // reason: NOT_APPLICABLE says *this revision needed no runtime verification*,
+  // which is a claim, not an abstention.
+  //
+  // FAIL_PRODUCT is deliberately NOT here even though it is a product claim: a
+  // run that established a real failure keeps it. The failure is evidence, the
+  // incompleteness is additional, and converting the finding into INDETERMINATE
+  // would hide it. `PRODUCT_CLAIMS` includes FAIL_PRODUCT and is the wrong set.
+  const DISCHARGES_OBLIGATION = new Set(['PASS', 'PASS_WITH_ADVISORIES', 'NOT_APPLICABLE']);
+  if (notAttempted.length && DISCHARGES_OBLIGATION.has(verdict)) {
     return {
       verdict: 'INDETERMINATE',
       reason: `${notAttempted.length} selected journey(s) never ran (${notAttempted.join(', ')}), `

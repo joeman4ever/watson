@@ -19,7 +19,7 @@ import {
   assertionVars, validateAssertionOperands, fixtureValues, fixtureValueEnv, normaliseChosen, validateDenialProofs, reconcileFixtureValues, routeOf, withDependencies,
   validateReachedConditions,
 } from '../src/contract.mjs';
-import { rollUp, runVerdict } from '../src/result.mjs';
+import { rollUp, runVerdict, checkFor } from '../src/result.mjs';
 
 const feature = (id, steps) => ({ id, __file: `${id}.yaml`, steps });
 
@@ -688,6 +688,50 @@ describe('a prerequisite failure cannot hide behind a PASS', () => {
     });
     assert.equal(r.verdict, 'FAIL_PRODUCT');
     assert.deepEqual(r.notAttempted, ['late-1', 'late-2']);
+  });
+
+  test('NOTHING executed at all, with journeys selected, cannot discharge the obligation', () => {
+    // THE GAP THE PASS_SHAPED SET LEFT, found by the exact-HEAD confirmation
+    // review (its N5). The downgrade tested `PASS_SHAPED`, and `rollUp([])`
+    // returns NOT_APPLICABLE, which is not PASS-shaped — so the one case the
+    // guard was written for slipped past it:
+    //
+    //     NOT_APPLICABLE | obligation satisfied | "1 selected journey(s) never ran (j1)"
+    //
+    // A verdict and a reason contradicting each other, discharging the
+    // verification duty over journeys that did not run. Same correction as
+    // WITHHELD_WITHOUT_GOVERNANCE: the wider set, because NOT_APPLICABLE is a
+    // claim, not an abstention.
+    for (const n of [1, 2, 3]) {
+      const ids = Array.from({ length: n }, (_, i) => [`j${i + 1}`, 'verified']);
+      const r = runVerdict({ executed: [], plan: plan(...ids), applicable: false });
+      assert.equal(r.verdict, 'INDETERMINATE', `${n} selected, none ran -> ${r.verdict}`);
+      assert.equal(checkFor(r.verdict).obligation, 'not_satisfied');
+      assert.equal(r.notAttempted.length, n);
+    }
+  });
+
+  test('but a genuine skip — nothing selected, nothing to run — is still NOT_APPLICABLE', () => {
+    // The boundary. Widening the downgrade must not turn a legitimate
+    // "this diff touched no runtime path" into a false alarm; if it did, every
+    // non-runtime pull request would report INDETERMINATE and the signal would
+    // be worth nothing.
+    const r = runVerdict({ executed: [], plan: [], applicable: false });
+    assert.equal(r.verdict, 'NOT_APPLICABLE');
+    assert.equal(checkFor(r.verdict).obligation, 'satisfied');
+    assert.deepEqual(r.notAttempted, []);
+  });
+
+  test('and a real FAIL_PRODUCT beside an unrun journey keeps the failure', () => {
+    // The other boundary, restated here because widening the set is exactly
+    // where it could be lost. Converting an established failure into
+    // INDETERMINATE would hide the finding.
+    const r = runVerdict({
+      executed: ran(['a', 'FAIL_PRODUCT']),
+      plan: plan(['a', 'verified'], ['b', 'verified']),
+    });
+    assert.equal(r.verdict, 'FAIL_PRODUCT');
+    assert.deepEqual(r.notAttempted, ['b']);
   });
 
   test('a run where everything selected ran and passed is still PASS', () => {
