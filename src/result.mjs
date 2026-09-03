@@ -130,6 +130,12 @@ export function buildEnvelope(run) {
     head_sha: run.headSha,
     base_sha: run.baseSha ?? null,
     // Whether the checkout actually matched the SHA above.
+    // `product_identity` because that is what it is. It was `working_tree` when
+    // the answer came from `git status`; `working_tree` stays as an alias so a
+    // consumer reading it does not silently start seeing `undefined` — which, on
+    // a field that gates product claims, would read as "not exact" and turn every
+    // run INDETERMINATE.
+    product_identity: run.workingTree ?? null,
     working_tree: run.workingTree ?? null,
 
     // Recorded ALWAYS; NOT consulted for carry-forward in phase 0/1.
@@ -352,7 +358,7 @@ export function summary(env) {
     L.push('');
   }
 
-  const wt = env.working_tree;
+  const wt = env.product_identity ?? env.working_tree;
   if (wt && wt.exact_head === false) {
     L.push('### ⚠ This run is NOT bound to the SHA it reports');
     L.push(

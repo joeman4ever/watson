@@ -210,8 +210,8 @@ export function serve({ repoRoot, logDir, port, host = '0.0.0.0' }) {
           protocol: PLANE_PROTOCOL,
           phase: state.phase,
           // Self-reported, and treated as such. The verifier establishes identity
-          // itself; this exists only so a run wired to two different checkouts is
-          // noticed rather than confidently mis-reported.
+          // from the trusted manifest; this exists only so a run wired to two
+          // different checkouts is noticed rather than confidently mis-reported.
           tree: { head_sha: head, clean, dirty_count: null },
         });
       }

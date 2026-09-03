@@ -117,7 +117,7 @@ describe('one marker block, whatever the product writes into the run', () => {
     verdict: 'BLOCKED_ENVIRONMENT',
     verdictReason: 'environment could not be brought up',
     features: [], findings: [], qualitySignals: {},
-    workingTree: { exact_head: true, clean: true, dirty_paths: [], dirty_count: 0 },
+    workingTree: { exact_head: true, clean: true, method: 'manifest', dirty_paths: [], dirty_count: 0 },
     evidence: { bundle: 'runs/x' }, shadow: true,
     doctor: { ok: true, probes: [] },
     ...over,
