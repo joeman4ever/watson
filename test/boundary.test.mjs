@@ -139,6 +139,43 @@ describe('one marker block, whatever the product writes into the run', () => {
     assert.equal(blocks(md), 1, 'the product opened a second marker block through the contract diff');
   });
 
+  // THE PROPERTY, not the instances.
+  //
+  // Naming the fields has now failed twice: a review found three call sites
+  // missing `safe()`, they were fixed, and a later review found two more — the
+  // fixture profile (a free-form key in the product's own config) and an evidence
+  // filename (built from a feature id, and `-->` is legal in a POSIX filename).
+  // Both rendered a second, forged WATSON_METADATA block claiming PASS.
+  //
+  // So this walks the envelope and puts the payload in every string it finds,
+  // one at a time. A new field that reaches the summary unsanitised fails here
+  // without anyone having to remember it exists.
+  test('every string in the envelope, one at a time', () => {
+    const template = base({ verdict: 'FAIL_PRODUCT' });
+    const paths = [];
+    const walk = (node, trail) => {
+      if (typeof node === 'string') { paths.push(trail); return; }
+      if (Array.isArray(node)) return node.forEach((v, i) => walk(v, [...trail, i]));
+      if (node && typeof node === 'object') {
+        for (const [k, v] of Object.entries(node)) walk(v, [...trail, k]);
+      }
+    };
+    walk(template, []);
+    assert.ok(paths.length > 10, `expected to find many strings, found ${paths.length}`);
+
+    const failures = [];
+    for (const trail of paths) {
+      const env = JSON.parse(JSON.stringify(template));
+      let node = env;
+      for (const key of trail.slice(0, -1)) node = node[key];
+      node[trail[trail.length - 1]] = PAYLOAD;
+      let md;
+      try { md = summary(env); } catch { continue; } // a field the summariser parses, not prints
+      if (blocks(md) !== 1) failures.push(trail.join('.'));
+    }
+    assert.deepEqual(failures, [], `these fields reach the summary unsanitised: ${failures.join(', ')}`);
+  });
+
   test('the sanitiser keeps the text readable rather than dropping it', () => {
     const md = summary(base({ verdictReason: `launch failed: ${PAYLOAD}` }));
     assert.ok(md.includes('launch failed'), 'the reason still reads as itself');

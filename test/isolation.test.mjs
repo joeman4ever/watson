@@ -22,6 +22,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 import { git as safeGit } from '../src/fingerprint.mjs';
+import { validateBrowserOwnership, validateEnvOwnership, ENGINE_OWNED_ENV } from '../src/contract.mjs';
 import { buildEnvelope, writeResult } from '../src/result.mjs';
 import {
   scrubEnv, SCRUBBED_ENV_KEYS, productExecution, resetProductExecution, runStep,
@@ -344,3 +345,43 @@ describe('product-controlled text cannot forge the summary marker', () => {
 // The suite that lived here — "an assertion operand the product chose must at
 // least be specific" — is gone with the heuristic it tested. Who chooses the
 // operand is now the property, and `test/operands.test.mjs` tests that instead.
+
+// The contract must not be able to choose what the VERIFIER executes.
+//
+// Both of these were reproduced by a review as arbitrary code execution as the
+// verifier, from product-repo content, on the side of the boundary that holds the
+// evidence, the engine source and the signing key.
+describe('the product cannot choose the verifier\'s binaries', () => {
+  test('a contract naming a browser executable is REFUSED, not ignored', () => {
+    const problems = validateBrowserOwnership({ browser: { executable_path: '/tmp/evil.sh' } });
+    assert.equal(problems.length, 1);
+    assert.match(problems[0], /verifier chooses what it executes/);
+    assert.match(problems[0], /WATSON_CHROMIUM/, 'says where the path is supposed to come from');
+  });
+
+  test('the launch site reads the trusted environment and nothing else', () => {
+    // Grep rather than execute: launching a browser needs one, and the property
+    // is about which SOURCE the path comes from.
+    const cli = fs.readFileSync(new URL('../src/cli.mjs', import.meta.url), 'utf8');
+    const launch = cli.slice(cli.indexOf('drive.launchBrowser('), cli.indexOf('drive.launchBrowser(') + 400);
+    assert.match(launch, /executablePath: process\.env\.WATSON_CHROMIUM/);
+    assert.doesNotMatch(launch, /contract\.config/, 'the contract must not reach the browser launch');
+  });
+
+  test('PATH is engine-owned, so a contract cannot redirect a bare program name', () => {
+    // `spawn` resolves a bare name against the CHILD's environment. The engine
+    // spawns `setpriv` around every product command, so a contract-supplied PATH
+    // chose which one ran — while the preflight validated a different binary.
+    assert.ok(ENGINE_OWNED_ENV.includes('PATH'));
+    const problems = validateEnvOwnership({ env: { PATH: '/tmp/evil/bin:/usr/bin' } });
+    assert.equal(problems.length, 1);
+    assert.match(problems[0], /PATH/);
+  });
+
+  test('the privilege wrapper is invoked by absolute path, never by name', () => {
+    const exec = fs.readFileSync(new URL('../src/exec.mjs', import.meta.url), 'utf8');
+    assert.doesNotMatch(exec, /file: 'setpriv'/, 'a bare name is resolved by the child environment');
+    assert.match(exec, /file: policy\.setpriv/);
+    assert.match(exec, /path\.isAbsolute\(setpriv\)/, 'and it is checked to be absolute');
+  });
+});

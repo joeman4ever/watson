@@ -8,6 +8,7 @@
 
 import { spawn, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
+import path from 'node:path';
 
 /** Substitute ${NAME} from a map, with an unknown name becoming an empty string. */
 export function interpolate(str, vars) {
@@ -128,19 +129,40 @@ export function productExecution(environ = process.env) {
   if (typeof process.getuid === 'function' && process.getuid() !== 0) {
     fail('this process is not root and therefore cannot change uid');
   }
+  // RESOLVED TO AN ABSOLUTE PATH, ON THE TRUSTED SIDE, ONCE.
+  //
+  // `spawn('setpriv', …)` resolves a bare program name with execvp against the
+  // CHILD's environment — and the child's environment carries the contract's
+  // `env:` block. A contract supplying `PATH` therefore chose which `setpriv`
+  // ran, while this preflight validated a different one out of `process.env`.
+  // Reproduced: a `setpriv` shim on a contract-supplied PATH ran the product
+  // command as uid 0 while the result recorded `product_privilege_separated:
+  // true` — a security property reported as held and silently absent, which is
+  // the exact failure this module's own comment says must not happen.
+  let setpriv;
   try {
-    execFileSync('setpriv', ['--help'], { stdio: 'ignore' });
+    setpriv = execFileSync('command', ['-v', 'setpriv'], { encoding: 'utf8', shell: '/bin/sh' }).trim();
   } catch {
-    fail('`setpriv` is not available on PATH');
+    setpriv = '';
   }
-  return remember({ drop: true, uid, gid, home });
+  if (!setpriv || !path.isAbsolute(setpriv) || !fs.existsSync(setpriv)) {
+    fail('`setpriv` could not be resolved to an absolute path on the trusted side');
+  }
+  try {
+    execFileSync(setpriv, ['--help'], { stdio: 'ignore' });
+  } catch {
+    fail(`\`${setpriv}\` is not usable`);
+  }
+  return remember({ drop: true, uid, gid, home, setpriv });
 }
 
 /** Build the argv for one product command under the current execution policy. */
 function productArgv(cmdStr, policy) {
   if (!policy.drop) return { file: '/bin/sh', args: ['-c', cmdStr] };
   return {
-    file: 'setpriv',
+    // The absolute path resolved by the trusted-side preflight — never a bare
+    // name, which the child's own PATH would resolve.
+    file: policy.setpriv,
     args: [
       `--reuid=${policy.uid}`, `--regid=${policy.gid}`, '--init-groups',
       // Once dropped, nothing this command runs may regain privilege through a

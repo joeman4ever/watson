@@ -219,17 +219,37 @@ export function marker(env) {
   // the repo, schema version matches. Uses its OWN literal so Sherlock's parser
   // (which knows only `claude` and `reviewer`) ignores it rather than
   // mis-parsing it.
+  // THE MARKER'S OWN VALUES ARE SANITISED TOO.
+  //
+  // `JSON.stringify` escapes quotes and backslashes; it does NOT escape `-->`.
+  // So a value carrying that sequence closes this comment early, and everything
+  // after it becomes document body — including a second, attacker-shaped
+  // WATSON_METADATA block. Every field here is engine-derived today, which is why
+  // it went unnoticed; the escaping is wrong regardless of who fills the fields,
+  // and a field added later will not come back to re-read this comment.
+  const clean = (v) => (typeof v === 'string' ? markerSafe(v) : v);
   const payload = {
     schema: MARKER_SCHEMA,
     agent: 'watson',
-    status: env.verdict,
-    obligation: env.check.obligation,
-    verified_head: env.head_sha,
-    product_fingerprint: env.product_fingerprint,
-    profile: env.profile,
-    run_id: env.run_id,
+    status: clean(env.verdict),
+    obligation: clean(env.check.obligation),
+    verified_head: clean(env.head_sha),
+    product_fingerprint: clean(env.product_fingerprint),
+    profile: clean(env.profile),
+    run_id: clean(env.run_id),
   };
   return `<!-- WATSON_METADATA\n${JSON.stringify(payload, null, 2)}\n-->`;
+}
+
+/**
+ * Neutralise the three sequences that can open or close a WATSON_METADATA block.
+ * Shared by the marker builder and the summary so they cannot drift apart.
+ */
+export function markerSafe(v) {
+  return String(v ?? '')
+    .replaceAll('<!--', '<!-\u2011-')
+    .replaceAll('-->', '--\u2011>')
+    .replaceAll('WATSON_METADATA', 'WATSON\u2011METADATA');
 }
 
 const ICON = { PASS: '✓', PASS_WITH_ADVISORIES: '✓', FAIL_PRODUCT: '✗', FAIL_CONTRACT: '⚠', BLOCKED_ENVIRONMENT: '⚠', INDETERMINATE: '?', NOT_APPLICABLE: '–' };
@@ -242,28 +262,26 @@ export function summary(env) {
   // offer a second, forged one. Neutralise the two sequences that matter; the
   // text stays readable and stops being able to close or open a marker block.
   // THE RULE: every value that reaches this document from outside the engine
-  // goes through `safe()`. Not "every value that looks dangerous" — a review
+  // goes through `safe()`. Enforced by a test that walks the whole envelope
+  // rather than by remembering, because remembering has now failed twice. Not "every value that looks dangerous" — a review
   // found three that had been missed (`verdict_reason`, which carries a failing
   // command's message straight from the plane, and the contract-evaluation ids,
   // which are FEATURE FILENAMES and so product-authored). Each had been left out
   // because it did not look like product text at the call site. It was.
-  const safe = (v) => String(v ?? '')
-    .replaceAll('<!--', '<!-\u2011-')
-    .replaceAll('-->', '--\u2011>')
-    .replaceAll('WATSON_METADATA', 'WATSON\u2011METADATA');
+  const safe = markerSafe;
 
   const L = [];
-  L.push(`## Watson — ${env.verdict}`);
+  L.push(`## Watson — ${safe(env.verdict)}`);
   L.push('');
   L.push(`**${safe(env.verdict_reason)}**`);
   L.push('');
   L.push(`| | |`);
   L.push(`| --- | --- |`);
-  L.push(`| Verified HEAD | \`${env.head_sha}\` |`);
+  L.push(`| Verified HEAD | \`${safe(env.head_sha)}\` |`);
   L.push(`| Profile | \`${env.profile}\` |`);
-  L.push(`| Check obligation | **${env.check.obligation}**${env.check.shadow ? ' _(shadow — informational)_' : ''} |`);
-  L.push(`| Environment | ${env.environment.mode} · ${env.environment.browser} |`);
-  L.push(`| Fixture | \`${env.environment.fixture_profile}\` |`);
+  L.push(`| Check obligation | **${safe(env.check.obligation)}**${env.check.shadow ? ' _(shadow — informational)_' : ''} |`);
+  L.push(`| Environment | ${safe(env.environment.mode)} · ${safe(env.environment.browser)} |`);
+  L.push(`| Fixture | \`${safe(env.environment.fixture_profile)}\` |`);
   L.push('');
 
   if (env.doctor && !env.doctor.ok) {
@@ -299,7 +317,7 @@ export function summary(env) {
     L.push(`### Failure detail — ${safe(f.title)}`);
     L.push(`Step ${bad.n} (\`${safe(bad.action)}\`): ${safe(bad.observed)}`);
     if (bad.expected) L.push(`Expected: ${safe(bad.expected)}`);
-    if (f.evidence?.length) L.push(`Evidence: ${f.evidence.map((e) => `\`${e}\``).join(', ')}`);
+    if (f.evidence?.length) L.push(`Evidence: ${f.evidence.map((e) => `\`${safe(e)}\``).join(', ')}`);
     L.push('');
   }
   if (advisory.length) {
@@ -338,7 +356,7 @@ export function summary(env) {
   if (wt && wt.exact_head === false) {
     L.push('### ⚠ This run is NOT bound to the SHA it reports');
     L.push(
-      `The checkout differs from \`${(env.head_sha ?? '').slice(0, 7)}\` in ${wt.dirty_count} path(s). ` +
+      `The checkout differs from \`${safe((env.head_sha ?? '').slice(0, 7))}\` in ${wt.dirty_count} path(s). ` +
         'The fingerprints above come from git; the contract that ran and the product that was built ' +
         'came from the working tree. Those are different things right now.',
     );
@@ -350,7 +368,7 @@ export function summary(env) {
     L.push('');
   }
 
-  L.push(`_Not proven by this run: ${env.environment.not_proven_by_this_run.join(' · ')}._`);
+  L.push(`_Not proven by this run: ${env.environment.not_proven_by_this_run.map(safe).join(' · ')}._`);
   L.push('');
   L.push(marker(env));
   return L.join('\n');

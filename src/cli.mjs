@@ -14,7 +14,7 @@ import url from 'node:url';
 
 import {
   loadContract, loadContractAt, selectByProfile, withDependencies,
-  validateFeatureVars, validateEnvOwnership, validateContractVersion, validateStepOrder,
+  validateFeatureVars, validateEnvOwnership, validateBrowserOwnership, validateContractVersion, validateStepOrder,
 } from './contract.mjs';
 import { productFingerprint, contractFingerprint, resolveSha, contractChange, workingTreeState, changedPaths, engineProvenance } from './fingerprint.mjs';
 import { selectByImpact } from './selection.mjs';
@@ -555,6 +555,7 @@ async function cmdVerify(args) {
     ...validateContractVersion(contract.config),
     ...validateStepOrder(plan.map((p) => p.feature)),
     ...validateEnvOwnership(contract.config),
+    ...validateBrowserOwnership(contract.config),
     ...validateFeatureVars(
       plan.map((p) => p.feature),
       contract.fixtures.profiles?.[contract.config.launch.fixture_profile],
@@ -657,8 +658,26 @@ async function cmdVerify(args) {
 
     // --- drive ----------------------------------------------------------------
     const cdpPort = await env.freePort();
+    // THE VERIFIER CHOOSES ITS OWN BROWSER BINARY.
+    //
+    // This used to fall back to `contract.config.browser.executable_path` — a
+    // path out of the PRODUCT's `.watson/config.yaml`, handed to
+    // `chromium.launch()`, which runs it in the VERIFIER plane, as the verifier's
+    // uid, with the verifier's unscrubbed environment. Reproduced by a review: a
+    // shell script named there executed as the verifier and read the CI bearer
+    // tokens out of its own environment.
+    //
+    // It also defeated everything this slice claims about the browser. The root
+    // refusal, the channel pin and the sandbox probe all sit downstream of the
+    // binary, so choosing the binary skips all three. And it survived `--plane`,
+    // whose whole argument is that the verifier never executes a line of product
+    // code — this was the line.
+    //
+    // The path now comes only from the trusted side. A contract that declares one
+    // is refused (see `validateBrowserOwnership`), not silently ignored, because a
+    // contract whose key is quietly dropped reads as a contract that works.
     const browser = await drive.launchBrowser({
-      executablePath: contract.config.browser?.executable_path ?? process.env.WATSON_CHROMIUM,
+      executablePath: process.env.WATSON_CHROMIUM,
       cdpPort,
     });
     step(`browser up, CDP on http://127.0.0.1:${cdpPort} (MCP layers attach here)`);
