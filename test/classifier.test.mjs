@@ -11,7 +11,7 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { classifyFailure } from '../src/checks.mjs';
+import { classifyFailure, evaluate, SECURITY_RULES } from '../src/checks.mjs';
 
 const noFindings = [];
 const corroborating = [{ rule: 'unexpected-5xx', severity: 'blocking' }];
@@ -73,5 +73,70 @@ describe('classifyFailure', () => {
       noFindings,
     );
     assert.equal(v.verdict, 'FAIL_PRODUCT');
+  });
+});
+
+// ----------------------------------------------------------------------------
+// SECURITY RULES ARE NOT SUBJECT TO THE CONTRACT.
+//
+// Found by the exact-HEAD confirmation review (its N4) and reproduced before
+// fixing. `severityOf` already forced these to `blocking` whatever a contract
+// said, so the intent was clear — but `isEnabled` did not, and enablement is
+// what decides whether the finding exists at all. Measured on evidence carrying
+// a real 500:
+//
+//     undeclared                    -> unexpected-5xx:blocking
+//     severity: off                 -> NO FINDING
+//     except_features: [thisOne]    -> NO FINDING
+//     applies_to_features: [other]  -> NO FINDING
+//
+// Three ways to silence a rule whose severity could not be lowered. Not
+// pull-request-exploitable — invariants come from the BASE contract — but
+// `.watson/invariants.yaml` in nsc-eval states that these cannot be switched
+// off, and a claim in a shipped file is either true or it is a defect.
+//
+// Emptying `SECURITY_RULES` entirely also left the whole suite green, so the
+// membership was unpinned too.
+describe('security rules cannot be switched off by a contract', () => {
+  // Independent literal, deliberately. An assertion that iterates the set under
+  // test shrinks with it — the same trap as CONFIG_AUTHORITY and
+  // ENGINE_OWNED_ENV. Changing the engine must change only one side of this.
+  const EXPECTED_SECURITY_RULES = ['unauthorized-route-200', 'unexpected-5xx', 'wrong-season-context'];
+
+  const withFiveHundred = { requests: [{ url: 'http://x/api/a', status: 500, method: 'GET' }],
+    console: [], failed: [], texts: [], pageErrors: [] };
+  const rules = (invariants) => evaluate({ featureId: 'j', evidence: withFiveHundred, invariants, pageText: '' })
+    .map((f) => `${f.rule}:${f.severity}`);
+
+  test('the set is exactly these rules', () => {
+    assert.deepEqual([...SECURITY_RULES].sort(), [...EXPECTED_SECURITY_RULES].sort());
+  });
+
+  test('an undeclared security rule still fires, and fires blocking', () => {
+    assert.deepEqual(rules([]), ['unexpected-5xx:blocking']);
+  });
+
+  for (const [label, declaration] of [
+    ['severity: off', { rule: 'unexpected-5xx', severity: 'off' }],
+    ['except_features naming this feature', { rule: 'unexpected-5xx', severity: 'blocking', except_features: ['j'] }],
+    ['applies_to_features naming another', { rule: 'unexpected-5xx', severity: 'blocking', applies_to_features: ['other'] }],
+    ['severity downgraded to advisory', { rule: 'unexpected-5xx', severity: 'advisory' }],
+  ]) {
+    test(`${label} does not silence it`, () => {
+      assert.deepEqual(rules([declaration]), ['unexpected-5xx:blocking'],
+        'a contract switched off a rule the engine calls non-negotiable');
+    });
+  }
+
+  test('an ADVISORY rule is still tunable — this is not a blanket override', () => {
+    // The point is a bounded exception, not "the contract is ignored". A contract
+    // that legitimately silences a style rule for one journey must still work, or
+    // the mechanism becomes something people route around.
+    const noisy = { requests: [], console: [{ type: 'error', text: 'boom' }], failed: [], texts: [], pageErrors: [] };
+    const run = (invariants) => evaluate({ featureId: 'j', evidence: noisy, invariants, pageText: '' })
+      .map((f) => `${f.rule}:${f.severity}`);
+    assert.deepEqual(run([{ rule: 'console-errors', severity: 'advisory' }]), ['console-errors:advisory']);
+    assert.deepEqual(run([{ rule: 'console-errors', severity: 'off' }]), []);
+    assert.deepEqual(run([{ rule: 'console-errors', severity: 'advisory', except_features: ['j'] }]), []);
   });
 });

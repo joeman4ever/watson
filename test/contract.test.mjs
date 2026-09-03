@@ -94,10 +94,51 @@ describe('validateEnvOwnership', () => {
     // The whole point: a contract that set WORKOS_ISSUER could point the launched
     // app at an issuer Watson does not control, and the run would "verify" an app
     // trusting a stranger.
+    //
+    // THIS LOOP IS NOT THE CONTROL. It iterates the list under test, so shrinking
+    // `ENGINE_OWNED_ENV` shrinks the assertion with it — remove three keys and
+    // this still passes, having checked the three that are left. See the literal
+    // below, which is the actual control.
     for (const key of ENGINE_OWNED_ENV) {
       const [p] = validateEnvOwnership({ env: { [key]: 'x' } });
       assert.match(p, new RegExp(key), `${key} must be refused`);
       assert.match(p, /cannot redefine/);
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // THE LIST IS THE DECISION. PIN IT INDEPENDENTLY.
+  //
+  // Found by the exact-HEAD confirmation review (its N3) and reproduced before
+  // fixing: cutting `ENGINE_OWNED_ENV` from six keys to three left the whole
+  // suite at 401/401 green, and `validateEnvOwnership` then accepted a contract
+  // setting WORKOS_ISSUER, DATABASE_URL and PORT.
+  //
+  // `config.env` is HEAD-AUTHORED. This list is the only thing between a pull
+  // request's `env:` block and the identity binding the run is judged against —
+  // and, for DATABASE_URL, the isolation of the run's own database. An assertion
+  // that iterates it cannot defend it.
+  //
+  // Written out here so that changing the module changes only one side of the
+  // comparison, and so that editing the trust boundary is a visible act.
+  describe('the engine-owned environment list itself', () => {
+    const EXPECTED = [
+      'WORKOS_ISSUER', 'WORKOS_CLIENT_ID', 'WORKOS_JWKS_URI', 'DATABASE_URL', 'PORT', 'PATH',
+    ];
+
+    test('is exactly these keys', () => {
+      assert.deepEqual([...ENGINE_OWNED_ENV].sort(), [...EXPECTED].sort());
+    });
+
+    // Driven from the independent literal, so a key deleted from the module is
+    // still tested — and fails, which is the point.
+    for (const key of EXPECTED) {
+      test(`a contract setting \`${key}\` is refused`, () => {
+        const [p] = validateEnvOwnership({ env: { [key]: 'x' } });
+        assert.ok(p, `${key} was accepted; a pull request can set it`);
+        assert.match(p, new RegExp(key));
+        assert.match(p, /cannot redefine/);
+      });
     }
   });
 });

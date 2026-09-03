@@ -110,11 +110,117 @@ describe('an unattributed key fails the run rather than defaulting', () => {
   test('every classified key resolves to exactly one side', () => {
     // Property, not instance: the map itself is the thing under test, so a value
     // typo cannot leave a key silently unowned.
+    //
+    // THIS TEST IS NOT THE CONTROL, and it read as though it were. It checks the
+    // SHAPE of each value and nothing else, so `selection: 'head'` — the single
+    // token that reopens ADR-049's whole attack — satisfies it. See the exact
+    // table below, which is the actual control.
     for (const [k, v] of Object.entries(CONFIG_AUTHORITY)) {
       assert.ok(['base', 'head', 'split'].includes(v), `${k} -> ${v}`);
     }
     for (const [k, v] of Object.entries(LAUNCH_AUTHORITY)) {
       assert.ok(['base', 'head'].includes(v), `${k} -> ${v}`);
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // THE AUTHORITY TABLE IS THE DECISION. PIN IT.
+  //
+  // Found by the exact-HEAD confirmation review (its N2) and reproduced before
+  // fixing: flipping a single token in `CONFIG_AUTHORITY` and running the whole
+  // suite —
+  //
+  //     contract_version   'base' -> 'head'    383/383 GREEN
+  //     selection          'base' -> 'head'    383/383 GREEN
+  //     identity           'base' -> 'head'    383/383 GREEN
+  //     injected_by_engine 'base' -> 'head'    383/383 GREEN
+  //     generated_roots    'base' -> 'head'    caught (2 red)
+  //     verdict_bearing_paths                  caught (2 red)
+  //
+  // Four of the six base-governed keys were unprotected, `selection` among them —
+  // the key whose head authorship lets a pull request declare `ignorable: ['**']`
+  // and skip itself to NOT_APPLICABLE / obligation satisfied, which the trusted
+  // side then classified green. Every end-to-end attack test above gives base and
+  // head the SAME `selection`, so none of them tests D1 applied to the one key D1
+  // is most about.
+  //
+  // The two that were caught were caught incidentally, by tests about scope and
+  // exemptions — not by anything guarding the table.
+  //
+  // WHY THE EXPECTED TABLE IS WRITTEN OUT HERE. An assertion whose subject is
+  // derived from the thing under test cannot fail: iterating `CONFIG_AUTHORITY`
+  // to check `CONFIG_AUTHORITY` shrinks with it. The literal below is an
+  // INDEPENDENT statement of the decision, so changing the module changes only
+  // one side of the comparison. Editing this table is then a deliberate, visible
+  // act that shows up in review as a change to the trust boundary — which is
+  // exactly what it is.
+  describe('the authority table itself', () => {
+    const EXPECTED_CONFIG_AUTHORITY = {
+      contract_version: 'base',
+      selection: 'base',
+      generated_roots: 'base',
+      verdict_bearing_paths: 'base',
+      identity: 'base',
+      injected_by_engine: 'base',
+      launch: 'split',
+      install: 'head',
+      provision: 'head',
+      build: 'head',
+      env: 'head',
+      browser: 'head',
+      engine: 'head',
+    };
+    const EXPECTED_LAUNCH_AUTHORITY = {
+      fixture_profile: 'base',
+      expect_seasons: 'base',
+      command: 'head',
+      health_path: 'head',
+      readiness_path: 'head',
+    };
+
+    test('is exactly this, key for key', () => {
+      assert.deepEqual({ ...CONFIG_AUTHORITY }, EXPECTED_CONFIG_AUTHORITY);
+      assert.deepEqual({ ...LAUNCH_AUTHORITY }, EXPECTED_LAUNCH_AUTHORITY);
+    });
+
+    // And the table is not decoration: for EVERY key the decision says the base
+    // owns, the base's value must actually be the one that reaches the run when
+    // the two sides disagree. Driven from the independent literal above, so it
+    // covers a key even if someone deletes it from `CONFIG_AUTHORITY`.
+    for (const [key, who] of Object.entries(EXPECTED_CONFIG_AUTHORITY)) {
+      if (who !== 'base') continue;
+      test(`\`${key}\` is taken from the BASE when the head disagrees`, () => {
+        const base = contract();
+        const head = contract();
+        // A value that is distinguishable and could not be produced by accident.
+        head.config[key] = { HEAD_AUTHORED: key };
+        const { config } = governingConfig(base.config, head.config);
+        assert.deepEqual(config[key], base.config[key],
+          `${key} came from the head; a pull request can author it`);
+        assert.notDeepEqual(config[key], head.config[key]);
+      });
+    }
+
+    for (const [key, who] of Object.entries(EXPECTED_CONFIG_AUTHORITY)) {
+      if (who !== 'head') continue;
+      test(`\`${key}\` is taken from the HEAD, because it must match the head's own tree`, () => {
+        const base = contract();
+        const head = contract();
+        head.config[key] = { HEAD_AUTHORED: key };
+        const { config } = governingConfig(base.config, head.config);
+        assert.deepEqual(config[key], head.config[key]);
+      });
+    }
+
+    for (const [key, who] of Object.entries(EXPECTED_LAUNCH_AUTHORITY)) {
+      test(`launch.${key} is taken from the ${who.toUpperCase()}`, () => {
+        const base = contract();
+        const head = contract();
+        head.config.launch = { ...head.config.launch, [key]: 'HEAD_AUTHORED' };
+        const { config } = governingConfig(base.config, head.config);
+        const expected = who === 'base' ? base.config.launch[key] : 'HEAD_AUTHORED';
+        assert.deepEqual(config.launch[key], expected);
+      });
     }
   });
 });
