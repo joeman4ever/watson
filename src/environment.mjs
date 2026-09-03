@@ -27,6 +27,7 @@ import { isAuthorized as isAuthorizedStatus, browserSandbox, BROWSER_CHANNEL, in
 // dependency-free module so the product plane can run it from a read-only
 // engine mount without installing anything.
 import { interpolate, runStep, launchApp, killGroup, productExecution, resetProductExecution, scrubEnv, SCRUBBED_ENV_KEYS } from './exec.mjs';
+import { runTrustedProofs, proveProbeCanFail } from './proofs.mjs';
 export { interpolate, runStep, launchApp, killGroup, productExecution, resetProductExecution, scrubEnv, SCRUBBED_ENV_KEYS };
 import pg from 'pg';
 import { generateKeyPair, exportJWK, SignJWT } from 'jose';
@@ -379,7 +380,10 @@ export async function waitForHealth(url, timeoutMs = 60_000) {
  * Probe 5 is the production-safety interlock and is a HARD REFUSAL: Watson will
  * not drive a database it did not create.
  */
-export async function doctor({ baseUrl, dbName, databaseUrl, adminToken, expectSeasons, identity, preconditions, tokens, vars }) {
+export async function doctor({
+  baseUrl, dbName, databaseUrl, adminToken, expectSeasons, identity, fixtureProfile, tokens, vars,
+}) {
+  const preconditions = fixtureProfile?.preconditions;
   const probes = [];
   const add = (name, ok, detail) => probes.push({ name, ok, detail });
 
@@ -475,6 +479,63 @@ export async function doctor({ baseUrl, dbName, databaseUrl, adminToken, expectS
   const connected = (() => { try { return new URL(databaseUrl).pathname.slice(1); } catch { return null; } })();
   add('own-database', connected === dbName,
     `connected db \`${connected}\` ${connected === dbName ? 'is' : 'is NOT'} this run's \`${dbName}\``);
+
+  // TRUSTED PRECONDITION EVIDENCE (F1).
+  //
+  // The fixture reporting back a value proves it RECEIVED the value. It does not
+  // prove the entity behind it was built, and a denial asserted against an entity
+  // that does not exist is satisfied by a product that denies correctly, by one
+  // that denies everything, and by one asked about nothing at all.
+  //
+  // So the engine reads its own database directly, for the values IT chose, using
+  // a probe shape the base contract declares. An unestablished proof is a doctor
+  // failure, which is BLOCKED_ENVIRONMENT — the world the journeys assert on was
+  // not shown to exist, so there is no product verdict to give.
+  //
+  // WHO CONTROLS WHAT:
+  //   value        the trusted verifier (`verifier_chosen`)
+  //   probe shape  the BASE contract, not the pull request under test
+  //   connection   this function, from the run's own `databaseUrl`, and only
+  //                after `own-database` has established it is the run's own
+  //                database. Watson does not read a database it did not create,
+  //                and that interlock is not weakened to run a proof.
+  const trustedProofs = (fixtureProfile?.proofs ?? []).filter((p) => p?.source === 'trusted_setup');
+  if (trustedProofs.length) {
+    if (connected !== dbName) {
+      add('trusted-proof', false, 'refusing to read a database this run did not create');
+    } else {
+      // Bounded, because an unestablished proof must FAIL the run and a hung one
+      // never does. Found by the negative control for the interlock above: with
+      // that check removed the connection attempt blocked indefinitely instead
+      // of erroring, and the same would happen to a legitimate run whose own
+      // database stopped answering.
+      const client = new pg.Client({
+        connectionString: databaseUrl,
+        connectionTimeoutMillis: 10_000,
+        statement_timeout: 10_000,
+      });
+      try {
+        await client.connect();
+        const query = (sql, params) => client.query(sql, params);
+
+        // The probe must be shown capable of answering NO before any YES from it
+        // is worth anything. A probe that always says yes makes every proof below
+        // pass and the whole mechanism decoration.
+        for (const p of trustedProofs) {
+          const control = await proveProbeCanFail(query, p.probe, vars?.[p.subject]);
+          add(`proof-control ${p.subject}`, control.ok, control.detail);
+        }
+
+        for (const ev of await runTrustedProofs(query, { proofs: trustedProofs }, vars ?? {})) {
+          add(`proof ${ev.type} ${ev.subject}`, ev.established, ev.detail);
+        }
+      } catch (e) {
+        add('trusted-proof', false, `could not read the run's own database: ${e.message}`);
+      } finally {
+        await client.end().catch(() => {});
+      }
+    }
+  }
 
   if (adminToken && expectSeasons !== undefined) {
     try {

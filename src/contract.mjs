@@ -415,6 +415,34 @@ export const DENIAL_PROOF_CLASSES = Object.freeze([
  * carries. Returns human-readable problems; empty means the map's denials are
  * capable of meaning something.
  */
+/**
+ * Subjects a profile's proofs establish, split by what they actually establish.
+ *
+ * ONLY `trusted_setup` proofs count. That restriction is the whole reason this is
+ * honest evidence rather than another declaration: a `trusted_setup` proof is
+ * EXECUTED by `doctor` against the run's own database before any journey runs, and
+ * an unestablished one blocks the run. An `application_read` proof describes a
+ * read the product exposes — which is a precondition, and is credited through
+ * `resolvedByPrecondition` when one is actually declared and run.
+ *
+ * `exists` and `transitioned` are separate on purpose. An existence proof says a
+ * row is there; it says nothing about a state change, and a value that was never
+ * granted in the first place satisfies it.
+ */
+export function provenSubjects(fixtureProfile) {
+  const exists = new Set();
+  const transitioned = new Set();
+  for (const p of fixtureProfile?.proofs ?? []) {
+    if (p?.source !== 'trusted_setup' || typeof p.subject !== 'string') continue;
+    if (p.type === 'entity_exists') exists.add(p.subject);
+    if (p.type === 'state_transition' && Object.keys(p.probe?.requires ?? {}).length) {
+      transitioned.add(p.subject);
+      exists.add(p.subject);
+    }
+  }
+  return { exists, transitioned };
+}
+
 export function validateDenialProofs(features, fixtureProfile) {
   const problems = [];
 
@@ -426,6 +454,7 @@ export function validateDenialProofs(features, fixtureProfile) {
     referencedVars(pre.get, resolvedByPrecondition);
   }
   const chosen = new Set(normaliseChosen(fixtureProfile?.verifier_chosen ?? []).map(([n]) => n));
+  const proven = provenSubjects(fixtureProfile);
 
   for (const feature of features) {
     const label = feature.__file ?? feature.id;
@@ -463,13 +492,15 @@ export function validateDenialProofs(features, fixtureProfile) {
       referencedVars(step.expect_denied?.path, vars);
 
       if (cls === 'entity_existence') {
-        const unproven = [...vars].filter((v) => !positive.has(v) && !resolvedByPrecondition.has(v));
+        const unproven = [...vars].filter(
+          (v) => !positive.has(v) && !resolvedByPrecondition.has(v) && !proven.exists.has(v),
+        );
         if (unproven.length) {
           problems.push(
             `${at}: declares \`entity_existence\` but nothing proves ${unproven.map((v) => `\`\${${v}}\``).join(', ')} `
-            + 'exists. Reach it with a positive assertion in this feature, or resolve it in a precondition '
-            + 'as an identity permitted to see it. An entity that does not exist denies exactly like one '
-            + 'that does.',
+            + 'exists. Reach it with a positive assertion in this feature, resolve it in a precondition '
+            + 'as an identity permitted to see it, or declare a `trusted_setup` proof for it. An entity '
+            + 'that does not exist denies exactly like one that does.',
           );
         }
       } else if (cls === 'domain_negative') {
@@ -494,7 +525,15 @@ export function validateDenialProofs(features, fixtureProfile) {
           problems.push(`${at}: the denied value and its sibling are the same name (\`${sibling}\`).`);
         }
       } else if (cls === 'state_transition') {
-        const established = [...vars].filter((v) => !resolvedByPrecondition.has(v));
+        // A precondition run as a permitted identity establishes the prior state
+        // through the product's own read path. Where the product deliberately
+        // exposes no such path, a `state_transition` proof does it directly, and
+        // that proof is required to test the transition column itself — an
+        // `entity_exists` proof is NOT accepted here, because a never-granted
+        // value satisfies it.
+        const established = [...vars].filter(
+          (v) => !resolvedByPrecondition.has(v) && !proven.transitioned.has(v),
+        );
         if (established.length) {
           problems.push(
             `${at}: \`state_transition\` needs trusted evidence that ${established.map((v) => `\`\${${v}}\``).join(', ')} `

@@ -16,7 +16,9 @@ import {
   loadContract, loadContractAt, selectByProfile, withDependencies,
   validateFeatureVars, validateEnvOwnership, validateBrowserOwnership, validateContractVersion, validateStepOrder,
   validateAssertionOperands, validateDenialProofs, fixtureValues, fixtureValueEnv, reconcileFixtureValues,
+  normaliseChosen,
 } from './contract.mjs';
+import { validateProofDeclarations } from './proofs.mjs';
 import { productFingerprint, contractFingerprint, resolveSha, contractChange, productIdentity, changedPaths, engineProvenance } from './fingerprint.mjs';
 import { readManifest } from './manifest.mjs';
 import { runManifest } from './manifest-cli.mjs';
@@ -598,23 +600,26 @@ async function cmdVerify(args) {
   // Alongside it, refuse a contract that tries to redefine an engine-owned key.
   // Both are pure contract checks, so they run BEFORE a database is created or a
   // single provisioning command is executed.
+  // ONE profile object, read once and passed everywhere.
+  //
+  // This is not tidiness. `validateDenialProofs` credits a declared trusted proof
+  // as evidence that an entity exists, and that credit is only honest because
+  // `doctor` EXECUTES the proof and fails the run when it is not established. If
+  // the pre-flight and doctor could be handed different profiles, the credit
+  // would be extended against an obligation nobody discharges.
+  const fixtureProfile = contract.fixtures.profiles?.[contract.config.launch.fixture_profile];
   const varProblems = [
     ...validateContractVersion(contract.config),
     ...validateStepOrder(plan.map((p) => p.feature)),
     ...validateEnvOwnership(contract.config),
-    ...validateAssertionOperands(
-      plan.map((p) => p.feature),
-      contract.fixtures.profiles?.[contract.config.launch.fixture_profile],
+    ...validateProofDeclarations(
+      fixtureProfile,
+      normaliseChosen(fixtureProfile?.verifier_chosen ?? []).map(([n]) => n),
     ),
-    ...validateDenialProofs(
-      plan.map((p) => p.feature),
-      contract.fixtures.profiles?.[contract.config.launch.fixture_profile],
-    ),
+    ...validateAssertionOperands(plan.map((p) => p.feature), fixtureProfile),
+    ...validateDenialProofs(plan.map((p) => p.feature), fixtureProfile),
     ...validateBrowserOwnership(contract.config),
-    ...validateFeatureVars(
-      plan.map((p) => p.feature),
-      contract.fixtures.profiles?.[contract.config.launch.fixture_profile],
-    ),
+    ...validateFeatureVars(plan.map((p) => p.feature), fixtureProfile),
   ];
   if (varProblems.length) {
     log('');
@@ -693,8 +698,10 @@ async function cmdVerify(args) {
       adminToken: up.tokens[adminIdentity?.id], expectSeasons: contract.config.launch.expect_seasons,
       identity: up.identity,
       // W5: what the seeded rows must RESOLVE TO through the product's own read
-      // paths, declared by the profile that seeded them.
-      preconditions: contract.fixtures.profiles?.[contract.config.launch.fixture_profile]?.preconditions,
+      // paths — and F1: the trusted proofs that the entities behind the
+      // verifier's own values were actually built. Both are declared by the
+      // profile that seeded them, and the same object the pre-flight read.
+      fixtureProfile,
       tokens: up.tokens,
       vars: up.vars,
     });
@@ -941,9 +948,9 @@ async function cmdDoctor(args) {
       baseUrl: up.baseUrl, dbName: up.dbName, databaseUrl: up.databaseUrl,
       adminToken: up.tokens[adminIdentity?.id], expectSeasons: contract.config.launch.expect_seasons,
       identity: up.identity,
-      // W5: what the seeded rows must RESOLVE TO through the product's own read
-      // paths, declared by the profile that seeded them.
-      preconditions: contract.fixtures.profiles?.[contract.config.launch.fixture_profile]?.preconditions,
+      // W5 read-path preconditions and F1 trusted proofs, from the profile that
+      // seeded the world.
+      fixtureProfile: contract.fixtures.profiles?.[contract.config.launch.fixture_profile],
       tokens: up.tokens,
       vars: up.vars,
     });

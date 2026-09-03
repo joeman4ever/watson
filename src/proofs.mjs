@@ -199,6 +199,37 @@ export async function runTrustedProofs(query, fixtureProfile, vars) {
 }
 
 /**
+ * A value of the same SHAPE as `like` that the run's database does not contain.
+ *
+ * The shape matters, and finding out why cost a live run. The control below used
+ * to ask every probe about `watson-absent-<uuid>`. Against a `uuid` column
+ * Postgres does not answer that question at all — it raises `invalid input syntax
+ * for type uuid` — so the control failed, and because it fails closed, it would
+ * have blocked every run declaring a proof over a uuid column. The proofs
+ * themselves were green in both directions; only executing the whole thing
+ * against a real database showed the control was unusable.
+ *
+ * The control has to run the SAME query the proof runs, so casting the column or
+ * the parameter is not an option: a control over a different query shape does not
+ * control the proof. It has to be a type-compatible value instead.
+ *
+ * WHO CONTROLS THIS VALUE: the verifier. The shape is read from the verifier's
+ * own chosen value, and the value itself is freshly random per call — the product
+ * never sees it, cannot predict it, and cannot create a row for it.
+ */
+export function impossibleLike(like) {
+  const s = String(like ?? '');
+  // A random v4 uuid. It "cannot exist" at 2^-122, which is a smaller risk than
+  // any other part of this system.
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s)) return randomUUID();
+  // Large but inside int4, so a narrow integer column answers rather than
+  // erroring. The fixture seeds small counts; nothing in a per-run synthetic
+  // database reaches this range.
+  if (/^\d+$/.test(s)) return String(1_000_000_000 + Math.floor(Math.random() * 1_000_000_000));
+  return `watson-absent-${randomUUID()}`;
+}
+
+/**
  * A negative control the engine can run against its own probe.
  *
  * The danger with an existence probe is not that it says no when it should say
@@ -206,9 +237,11 @@ export async function runTrustedProofs(query, fixtureProfile, vars) {
  * which case every proof passes and the mechanism is decoration. So the engine
  * asks the same probe about a value that cannot exist, and requires the answer
  * to be no.
+ *
+ * `like` is the verifier's real value for this subject, used only for its shape.
  */
-export async function proveProbeCanFail(query, probe) {
-  const impossible = `watson-absent-${randomUUID()}`;
+export async function proveProbeCanFail(query, probe, like) {
+  const impossible = impossibleLike(like);
   try {
     const { rows } = await query(existenceSql(probe), [impossible]);
     return { ok: rows.length === 0, detail: rows.length === 0
