@@ -286,7 +286,25 @@ export function buildEnvelope(run) {
     contract_version: run.contractVersion ?? null,
     carried_forward_from: null,
 
-    contract_change: !!run.contractChange,
+    // THREE STATES, AND THE ENVELOPE MUST CARRY ALL THREE.
+    //
+    // This was `!!run.contractChange`, and `contractChange` now returns a
+    // TRUTHY object for an unavailable comparison — so an unobtainable base
+    // reported `contract_change: true`. That is the exact collapse the D1
+    // disposition forbids ("unavailable → changed"), reintroduced one layer
+    // above the function that was fixed to prevent it. Caught by reading the
+    // envelope rather than the function.
+    //
+    // `contract_change` now means what its documented semantics say and nothing
+    // wider: verdict-bearing contract material in the EVALUATED HEAD differs
+    // from the GOVERNING TRUSTED BASE. It is not a claim about who authored the
+    // difference — see `contract_comparison`.
+    contract_change: run.contractChange?.comparison !== 'unavailable' && !!run.contractChange,
+    // The state itself, named, so a reader never has to infer it from a boolean
+    // that cannot express three things.
+    contract_comparison: run.contractChange
+      ? (run.contractChange.comparison === 'unavailable' ? 'unavailable' : 'diverged')
+      : 'equivalent',
     contract_evaluation: run.contractChange ?? {
       model: 'head-product-x-head-contract',
       base_contract_available: false,
@@ -510,8 +528,25 @@ export function summary(env) {
   L.push(`**Signals** — console errors ${q.console_errors} · warnings ${q.console_warnings} · 5xx ${q.http_5xx} · unexpected 4xx ${q.unexpected_4xx} · failed requests ${q.failed_requests} · raw UUIDs ${q.raw_uuid_visible}`);
   L.push('');
 
-  if (env.contract_change) {
-    L.push('### ⚠ This PR changes the verification contract');
+  if (env.contract_comparison === 'unavailable') {
+    // Said out loud, and NOT as a change. The trusted material for one side was
+    // not obtainable, so no comparison happened; reporting that as a contract
+    // change would be inventing a finding, and reporting it as silence would be
+    // inventing an assurance.
+    L.push('### ⚠ The verification contract comparison could not be made');
+    L.push(safe(env.contract_evaluation?.why ?? 'trusted comparison material was unavailable'));
+    L.push('');
+    L.push('_Neither "changed" nor "unchanged" is asserted. Verification escalates rather than narrowing._');
+    L.push('');
+  } else if (env.contract_change) {
+    // DIVERGENCE FROM THE GOVERNING BASE, not authorship.
+    //
+    // This heading used to read "This PR changes the verification contract",
+    // and after D1 that statement can be false: the diff is now governing-base
+    // tip vs evaluated head, so a contract change landing on the base branch
+    // while this head stays stale diverges without this pull request having
+    // authored anything. The reader is told what was measured.
+    L.push('### ⚠ The head differs from the governing verification contract');
     const ce = env.contract_evaluation;
     if (ce.expectations_weakened?.length) {
       L.push('Expectations **weakened**:');
@@ -521,14 +556,14 @@ export function summary(env) {
     if (ce.features_added?.length) L.push(`Features added: ${ce.features_added.map((f) => `\`${safe(f)}\``).join(', ')}`);
     if (ce.invariants_added?.length) L.push(`Invariants added: ${ce.invariants_added.map((f) => `\`${safe(f)}\``).join(', ')}`);
     if (ce.base_contract_available === false) {
-      L.push('The base contract could not be read, so only the FACT of a change is reported — review the `.watson/` diff directly.');
+      L.push('The base contract itself could not be loaded, so only the FACT of divergence is reported — review the `.watson/` diff directly.');
     } else if (!ce.expectations_weakened?.length && !ce.features_removed?.length) {
       // Say this explicitly. A bare heading with nothing under it reads as
       // "something was weakened and Watson could not name it".
       L.push('No expectation was removed or weakened: every feature, step and invariant present at the base is still present and still in scope.');
     }
     L.push('');
-    L.push('_A PR must not be able to weaken its own verification expectation and thereby manufacture its own PASS. Sherlock is the independent reviewer of whether this change is legitimate. Watson REPORTS this in Phase 0/1; it does not gate on it._');
+    L.push('_Divergence is measured between the GOVERNING BASE and the EVALUATED HEAD, so it does not by itself mean this pull request authored the difference — a contract change on the base branch diverges from a stale head too. A PR must not be able to weaken its own verification expectation and thereby manufacture its own PASS; Sherlock is the independent reviewer of whether the difference is legitimate. Watson REPORTS this in Phase 0/1; it does not gate on it._');
     L.push('');
   }
 

@@ -140,7 +140,7 @@ const PATH_TOKEN = /(?:^|[\s'"=])((?:\.\/)?[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+
  * The distinction decides whether `contract_change` means anything. Resolving
  * `launch.command` reaches `server/src/index.ts` — the application under test,
  * already measured as `product_fingerprint`. Pulling it in here would make every
- * product pull request report a contract change and destroy the signal this
+ * product pull request report contract divergence and destroy the signal this
  * field exists to carry.
  *
  * `world` commands are the ones that decide WHAT THE VERIFICATION DOES: the
@@ -520,9 +520,18 @@ function asEntries(x) {
 }
 
 /**
- * Base -> head semantic diff of the CONTRACT. Phase 0/1 REPORTS this; it does
- * not gate on it. The purpose is that a PR must not be able to weaken its own
- * verification expectation and thereby silently manufacture its own PASS.
+ * GOVERNING BASE -> EVALUATED HEAD semantic diff of the CONTRACT. Phase 0/1
+ * REPORTS this; it does not gate on it. The purpose is that a PR must not be able
+ * to weaken its own verification expectation and thereby silently manufacture its
+ * own PASS.
+ *
+ * WHAT IT MEANS, PRECISELY. Whether verdict-bearing contract material in the
+ * evaluated head differs from the governing trusted base contract. NOT historical
+ * authorship: since the diff became base-tip vs head (see `changedPaths`), a
+ * contract change landing on the base branch diverges from a stale head without
+ * this pull request having authored anything. Every user-visible string says
+ * "differs from the governing contract" rather than "this PR changed it", and a
+ * test asserts the old sentence is gone.
  *
  * BOTH SIDES COME FROM TRUSTED MATERIAL. NEITHER COMES FROM PRODUCT-OWNED GIT.
  *

@@ -22,6 +22,7 @@ import {
   canonicalContract, deepDiffPaths, operationalConfigChange,
 } from '../src/fingerprint.mjs';
 import { walkTree } from '../src/manifest.mjs';
+import { buildEnvelope, summary } from '../src/result.mjs';
 import { loadContract } from '../src/contract.mjs';
 import { CONFIG_AUTHORITY } from '../src/governance.mjs';
 
@@ -520,6 +521,76 @@ describe('against a real repository', () => {
       const scope = verdictBearingPaths(c, pathExistsAt(r.dir, head));
       assert.equal(contractChange({ ...sides(r, base, head), loadAt: () => c, paths: scope }), null);
       assert.deepEqual(changedPaths(sides(r, base, head)), []);
+    });
+
+    test('THE ENVELOPE CARRIES ALL THREE STATES, not a boolean that cannot express them', () => {
+      // A defect I introduced fixing D1, and caught by reading the envelope
+      // rather than the function: `contract_change` was `!!run.contractChange`,
+      // and `contractChange` now returns a TRUTHY object for an unavailable
+      // comparison — so an unobtainable base reported `contract_change: true`.
+      // That is "unavailable -> changed", the exact collapse the disposition
+      // forbids, reintroduced one layer above the function fixed to prevent it.
+      const t = topology();
+      const { baseEntries, headEntries } = sides(t.r, t.base, t.head);
+
+      const cases = [
+        ['unavailable', contractChange({ baseEntries: null, headEntries, loadAt: () => t.c, paths: t.scope })],
+        ['equivalent', contractChange({ baseEntries, headEntries, loadAt: () => t.c, paths: t.scope })],
+      ];
+      const envelopeOf = (cc) => buildEnvelope({
+        runId: 'r', watsonVersion: '0', repository: 'x', headSha: 'a'.repeat(40),
+        contractChange: cc, features: [], findings: [], selection: {},
+        qualitySignals: {}, doctor: { ok: true, probes: [] }, verdict: 'INDETERMINATE',
+      });
+
+      const [, unavailable] = cases[0];
+      const e1 = envelopeOf(unavailable);
+      assert.equal(e1.contract_comparison, 'unavailable');
+      assert.equal(e1.contract_change, false, 'an unavailable comparison was reported as a change');
+
+      const [, equivalent] = cases[1];
+      const e2 = envelopeOf(equivalent);
+      assert.equal(e2.contract_comparison, 'equivalent');
+      assert.equal(e2.contract_change, false);
+
+      const e3 = envelopeOf({ paths_changed: ['.watson'], base_contract_available: true });
+      assert.equal(e3.contract_comparison, 'diverged');
+      assert.equal(e3.contract_change, true, 'a real divergence stopped being reported');
+    });
+
+    test('the summary says DIVERGENCE, never that the pull request authored it', () => {
+      // Required wording. After D1 the diff is governing-base tip vs evaluated
+      // head, so "this PR changes the verification contract" can be false: a
+      // contract change landing on the base branch diverges from a stale head
+      // without this pull request having authored anything.
+      const doc = summary(buildEnvelope({
+        runId: 'r', watsonVersion: '0', repository: 'x', headSha: 'a'.repeat(40),
+        contractChange: { paths_changed: ['.watson'], base_contract_available: true,
+          expectations_weakened: [], features_removed: [], features_added: [] },
+        features: [], findings: [], selection: { method: 'profile', selected: [], setup: [], deferred: [] },
+        qualitySignals: { console_errors: 0, console_warnings: 0, http_5xx: 0, unexpected_4xx: 0, failed_requests: 0, raw_uuid_visible: 0 },
+        doctor: { ok: true, probes: [] }, verdict: 'INDETERMINATE',
+        environment: { mode: 'test' },
+      }));
+      assert.doesNotMatch(doc, /This PR changes the verification contract/,
+        'the summary still claims the pull request authored the difference');
+      assert.match(doc, /differs from the governing verification contract/);
+      assert.match(doc, /does not by itself mean this pull request authored/);
+    });
+
+    test('an unavailable comparison is not printed as a contract change', () => {
+      const doc = summary(buildEnvelope({
+        runId: 'r', watsonVersion: '0', repository: 'x', headSha: 'a'.repeat(40),
+        contractChange: { model: 'comparison-unavailable', comparison: 'unavailable',
+          base_contract_available: false, why: 'no trusted base materialisation was supplied', paths_changed: [] },
+        features: [], findings: [], selection: { method: 'profile', selected: [], setup: [], deferred: [] },
+        qualitySignals: { console_errors: 0, console_warnings: 0, http_5xx: 0, unexpected_4xx: 0, failed_requests: 0, raw_uuid_visible: 0 },
+        doctor: { ok: true, probes: [] }, verdict: 'INDETERMINATE',
+        environment: { mode: 'test' },
+      }));
+      assert.match(doc, /comparison could not be made/);
+      assert.match(doc, /Neither "changed" nor "unchanged" is asserted/);
+      assert.doesNotMatch(doc, /differs from the governing verification contract/);
     });
 
     test('THE PROPERTY — destroying the product clone changes nothing', () => {

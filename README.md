@@ -89,13 +89,38 @@ that neither can be handed one.
 existing fail-conservative behaviour and escalates. Manufacturing either answer
 out of information nobody has is the specific thing this design exists to refuse.
 
-**One honest change of meaning.** The old diff was
-`merge-base(base, head)..head` — *what this pull request changed*. A merge base
-needs both histories in one repository, and neither trusted materialisation has
-the other's; that separation is the point. So the diff is now base-tip vs head:
-*how head differs from the revision whose contract governs it.* Paths that moved
-on the base branch since the fork point now appear. The effect is strictly
-conservative — a larger changed set escalates to more verification, never less.
+**One honest change of meaning, and the wording that follows from it.** The old
+diff was `merge-base(base, head)..head` — *what this pull request changed*. A
+merge base needs both histories in one repository, and neither trusted
+materialisation has the other's; that separation is the point. So the diff is now
+base-tip vs head: *how head differs from the revision whose contract governs it.*
+Paths that moved on the base branch since the fork point now appear. The effect is
+strictly conservative — a larger changed set escalates to more verification, never
+less — and it is the question ADR-049 actually asks, since the base contract is
+what governs the verdict.
+
+It also makes one old sentence false, so it is gone. Watson no longer says *"this
+PR changes the verification contract"*: a contract change landing on the base
+branch diverges from a stale head without the pull request having authored
+anything. The heading is now **"the head differs from the governing verification
+contract"**, and the note under it says so explicitly.
+
+`contract_change` keeps its name — renaming a field in the envelope the trusted
+validator reads is churn for nothing — but its documented semantics are:
+
+> whether verdict-bearing contract material in the EVALUATED HEAD differs from the
+> GOVERNING TRUSTED BASE contract
+
+not historical authorship. `changedPaths` reads the same way: paths differing
+between the governing base revision and the evaluated head.
+
+**Three states reach the envelope, because a boolean cannot carry three.**
+`contract_comparison` is `diverged`, `equivalent` or `unavailable`, and
+`contract_change` is true only for `diverged`. This is not decoration: the first
+version of the D1 fix left `contract_change` as `!!contractChange`, and since an
+unavailable comparison returns a truthy object, an unobtainable base reported
+`contract_change: true` — the collapse the fix existed to prevent, reintroduced
+one layer above the function that was fixed.
 
 Exit code is `0` for `PASS` / `PASS_WITH_ADVISORIES`, `1` otherwise. Every run
 writes `runs/<runId>/result.json` (machine) and `runs/<runId>/summary.md`
