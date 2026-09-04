@@ -305,9 +305,24 @@ export function buildEnvelope(run) {
     contract_comparison: run.contractChange
       ? (run.contractChange.comparison === 'unavailable' ? 'unavailable' : 'diverged')
       : 'equivalent',
+    // THE THIRD COLLAPSE, and the one that shipped.
+    //
+    // This default was `{ model: 'head-product-x-head-contract',
+    // base_contract_available: false }` for every run where `contractChange`
+    // returned null — and since D1, null means BOTH trusted sides were read and
+    // AGREED. So the field asserted the base was unavailable in exactly the case
+    // where it demonstrably was available, on every base-governed run with an
+    // unchanged contract. `base_contract_available` must be factual in both
+    // directions; a false negative is as much a lie as a false positive, and it
+    // is the one that was being emitted.
+    //
+    // The `model` string was wrong for the same reason — `result.mjs`'s own
+    // `governing_contract` comment already says `head-product-x-head-contract`
+    // "under D1 is simply false" for a governed run.
     contract_evaluation: run.contractChange ?? {
-      model: 'head-product-x-head-contract',
-      base_contract_available: false,
+      model: run.governance?.authority === 'base' ? 'trusted-base-x-trusted-head' : 'head-product-x-head-contract',
+      base_contract_available: run.governance?.authority === 'base',
+      comparison: 'equivalent',
     },
 
     // WHICH CONTRACT DECIDED THIS VERDICT (ADR-049 F9).

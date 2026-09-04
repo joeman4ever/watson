@@ -494,6 +494,110 @@ describe('against a real repository', () => {
       assert.equal(change, null, 'a path absent from both sides was reported as changed');
     });
 
+    // -------------------------------------------------------------------------
+    // FOUR INVARIANTS INSIDE THE D1 COMPARISON CODE THAT NOTHING PINNED.
+    //
+    // Found by the exact-HEAD confirmation: each of these mutations left the
+    // whole 438-test suite green. The shipped code is correct in all four cases;
+    // what was missing is anything that would notice it stopping being. These
+    // are the load-bearing details of a function written three commits ago, so
+    // they get pinned in the same slice that introduced them.
+    test('the prefix match requires a path separator', () => {
+      // The classic: `server/mig` must not match `server/migrations`. Without
+      // the trailing `/` a scoped path silently absorbs every sibling whose name
+      // it prefixes, and two different trees start comparing equal.
+      const tree = new Map([
+        ['server/migrations/001.sql', { type: 'file', digest: 'sha256:aa', mode: '644' }],
+        ['server/migrations-old/x.sql', { type: 'file', digest: 'sha256:bb', mode: '644' }],
+      ]);
+      const d = subtreeDigest(tree, 'server/migrations');
+      const only = new Map([['server/migrations/001.sql', tree.get('server/migrations/001.sql')]]);
+      assert.equal(d, subtreeDigest(only, 'server/migrations'),
+        'the digest absorbed a sibling directory that merely shares a prefix');
+    });
+
+    test('`type` is part of the digest, because a symlink and a file collide without it', () => {
+      // NOT decorative. `walkTree` digests a symlink as sha256(target) and a
+      // file as sha256(content), so a symlink whose TARGET STRING equals a
+      // file's CONTENT has the identical `digest`. Only `type` separates them,
+      // and a contract path swapped from file to symlink is exactly the
+      // substitution that would matter.
+      // MODE HELD EQUAL, so `type` is the only difference. The first version of
+      // this test left the file at mode 644 and the symlink at null, so removing
+      // `type` from the digest left it green — it was passing on `mode`. Caught
+      // by running the control.
+      const asFile = new Map([['.watson/x', { type: 'file', digest: 'sha256:same', mode: null }]]);
+      const asLink = new Map([['.watson/x', { type: 'symlink', digest: 'sha256:same', mode: null }]]);
+      assert.notEqual(subtreeDigest(asFile, '.watson'), subtreeDigest(asLink, '.watson'),
+        'a symlink and a file with equal digests were indistinguishable');
+    });
+
+    test('`mode` is part of the digest — the executable bit is semantic', () => {
+      // The same bytes with and without the executable bit are different
+      // materialisations, and one of them runs.
+      const a = new Map([['.watson/run.sh', { type: 'file', digest: 'sha256:same', mode: '644' }]]);
+      const b = new Map([['.watson/run.sh', { type: 'file', digest: 'sha256:same', mode: '755' }]]);
+      assert.notEqual(subtreeDigest(a, '.watson'), subtreeDigest(b, '.watson'));
+    });
+
+    test('changedPaths notices a mode-only change', () => {
+      const base = new Map([['s.sh', { type: 'file', digest: 'sha256:same', mode: '644' }]]);
+      const head = new Map([['s.sh', { type: 'file', digest: 'sha256:same', mode: '755' }]]);
+      assert.deepEqual(changedPaths({ baseEntries: base, headEntries: head }), ['s.sh'],
+        'a file that became executable was reported as unchanged');
+    });
+
+    test('a base tree that was SUPPLIED but could not be READ says so', () => {
+      // The could-not-read/was-not-supplied distinction, one layer up from where
+      // D1 fixed it. The reason used to survive only in the run log — which the
+      // observer uploads ONLY when the step fails, so on a green run it was not
+      // preserved at all — while the envelope said "no trusted base
+      // materialisation was supplied". A materialisation WAS supplied.
+      const supplied = contractChange({
+        baseEntries: null, headEntries: new Map(), loadAt: () => null, paths: ['.watson'],
+      });
+      assert.match(supplied.why, /was not supplied|no trusted base materialisation was supplied/);
+      assert.equal(supplied.base_tree_error, null);
+
+      const unreadable = contractChange({
+        baseEntries: null, headEntries: new Map(), loadAt: () => null, paths: ['.watson'],
+        baseTreeError: 'could not read .: ENOENT',
+      });
+      assert.match(unreadable.why, /could not be read/);
+      assert.match(unreadable.why, /ENOENT/);
+      assert.equal(unreadable.base_tree_error, 'could not read .: ENOENT');
+      // Both are still UNAVAILABLE — the distinction is in the reason, not the state.
+      assert.equal(unreadable.comparison, 'unavailable');
+      assert.deepEqual(unreadable.paths_changed, []);
+    });
+
+    test('base_contract_available is factual in BOTH directions', () => {
+      // `contractChange` returns null only when BOTH trusted sides were read and
+      // AGREED — so the envelope's default asserted the base was unavailable in
+      // exactly the case where it demonstrably was available, on every
+      // base-governed run with an unchanged contract. A false negative is as
+      // much a lie as a false positive, and it was the one shipping.
+      const governed = buildEnvelope({
+        runId: 'r', watsonVersion: '0', repository: 'x', headSha: 'a'.repeat(40),
+        governance: { authority: 'base' }, contractChange: null,
+        features: [], findings: [], selection: {}, qualitySignals: {},
+        doctor: { ok: true, probes: [] }, verdict: 'PASS',
+      });
+      assert.equal(governed.contract_comparison, 'equivalent');
+      assert.equal(governed.contract_evaluation.base_contract_available, true,
+        'a base-governed run with an equivalent contract claimed the base was unavailable');
+      assert.equal(governed.contract_evaluation.model, 'trusted-base-x-trusted-head');
+
+      const ungoverned = buildEnvelope({
+        runId: 'r', watsonVersion: '0', repository: 'x', headSha: 'a'.repeat(40),
+        governance: { authority: 'bootstrap' }, contractChange: null,
+        features: [], findings: [], selection: {}, qualitySignals: {},
+        doctor: { ok: true, probes: [] }, verdict: 'INDETERMINATE',
+      });
+      assert.equal(ungoverned.contract_evaluation.base_contract_available, false);
+      assert.equal(ungoverned.contract_evaluation.model, 'head-product-x-head-contract');
+    });
+
     test('an absent path digests the same whatever tree it is absent from', () => {
       // THE CONTROL the case above cannot be. If the absent return ever becomes
       // derived from the entry map — a count, a digest of the map, anything —

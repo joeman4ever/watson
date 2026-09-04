@@ -659,6 +659,10 @@ async function cmdVerify(args) {
       baseEntries,
       headEntries: manifest?.entries ?? null,
       loadAt: (side) => (side === 'head' ? headContract : baseContract),
+      // Carried into the envelope, not only logged. A supplied-but-unreadable
+      // base tree and an absent one are different facts, and the second is a
+      // harness misconfiguration worth seeing on the result itself.
+      baseTreeError,
       paths: contractScope,
     }),
     // HOW THE PRODUCT WAS LAUNCHED, reported separately from everything else.

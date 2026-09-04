@@ -229,12 +229,19 @@ describe('controlled case 4 — cross-cutting change escalates without matching 
 });
 
 describe('controlled case 5 — absent diff information never yields a skip', () => {
-  test('no base SHA falls back to profile selection', () => {
+  test('an unavailable diff falls back to profile selection, and says why accurately', () => {
+    // The reason string used to say "no base SHA", and after D1 that is the
+    // wrong fact: `changedPaths` no longer takes SHAs, so null means "no
+    // trustworthy base→head tree pair". A run can carry a perfectly good base
+    // SHA and still land here because the trusted base materialisation was
+    // absent or unreadable — and telling the reader to go looking for a missing
+    // SHA would send them to the wrong place.
     const r = selectByImpact({ features: FEATURES, profile: 'poc', rules: RULES, changedPaths: null });
     assert.equal(r.method, 'profile');
     assert.equal(r.applicable, true);
     assert.deepEqual(ids(r), ['admin-records-manage', 'restricted-report-boundary']);
-    assert.match(r.reason, /no base SHA/);
+    assert.match(r.reason, /no trustworthy base→head diff/);
+    assert.doesNotMatch(r.reason, /no base SHA/, 'the pre-D1 vocabulary came back');
   });
 
   test('an empty diff is a positive fact and may skip', () => {

@@ -556,7 +556,7 @@ function asEntries(x) {
  * @param baseEntries trusted base materialisation, `walkTree` shape, or null
  * @param headEntries trusted product manifest entries, or null
  */
-export function contractChange({ baseEntries, headEntries, loadAt, paths = CONTRACT_PATHS }) {
+export function contractChange({ baseEntries, headEntries, loadAt, baseTreeError = null, paths = CONTRACT_PATHS }) {
   const baseTree = asEntries(baseEntries);
   const headTree = asEntries(headEntries);
 
@@ -570,11 +570,21 @@ export function contractChange({ baseEntries, headEntries, loadAt, paths = CONTR
       model: 'comparison-unavailable',
       base_contract_available: false,
       comparison: 'unavailable',
-      why: !baseTree && !headTree
-        ? 'neither a trusted base materialisation nor a trusted head manifest was supplied'
-        : !baseTree
-          ? 'no trusted base materialisation was supplied, so the base side cannot be read'
-          : 'no trusted head manifest was supplied, so the head side cannot be read',
+      // COULD NOT READ IS NOT THE SAME AS WAS NOT SUPPLIED, one layer up.
+      //
+      // This is the exact distinction D1 exists to preserve, and the first
+      // version of the fix lost it here: a base tree that WAS supplied and threw
+      // on read was reported as "no trusted base materialisation was supplied".
+      // The real reason survived only in the run log, which the observer uploads
+      // only on a FAILED step — so on a green run it was not preserved at all.
+      why: baseTreeError
+        ? `the trusted base materialisation could not be read: ${baseTreeError}`
+        : !baseTree && !headTree
+          ? 'neither a trusted base materialisation nor a trusted head manifest was supplied'
+          : !baseTree
+            ? 'no trusted base materialisation was supplied, so the base side cannot be read'
+            : 'no trusted head manifest was supplied, so the head side cannot be read',
+      base_tree_error: baseTreeError,
       paths_changed: [],
     };
   }
