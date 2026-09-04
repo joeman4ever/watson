@@ -585,9 +585,27 @@ async function cmdVerify(args) {
     baseFingerprint: baseContractDir ? contractDirFingerprint(baseContractDir) : null,
   });
   const contract = governance.contract;
-  // Scoped from the governing contract, and from what exists at the HEAD commit —
-  // a path the head deleted still has to be compared, and `treeHash` reports it
-  // as `absent` on that side rather than dropping out of the digest.
+  // Scoped from the governing contract, and from what exists AT THE HEAD COMMIT.
+  //
+  // THIS COMMENT USED TO CLAIM MORE THAN THE CODE DOES. It said "a path the head
+  // deleted still has to be compared, and `treeHash` reports it as `absent` on
+  // that side rather than dropping out of the digest". Neither half survives D1:
+  // `contractChange` no longer uses `treeHash` at all, and because the existence
+  // predicate is evaluated at HEAD, a path the head DELETES drops out of the
+  // scope entirely and the comparison reports `equivalent`. Executed on a real
+  // repository whose head removes `package-lock.json`:
+  //
+  //     scope @HEAD  [.watson, package.json, server/scripts/watson-fixture.ts]
+  //     scope @BASE  [.watson, package-lock.json, package.json, …]
+  //     contractChange(scope@head)  ->  null      (reported as equivalent)
+  //     contractChange(scope@base)  ->  [package-lock.json]
+  //
+  // What bounds it: this is REPORTING, never a gate, and the unscoped
+  // `changedPaths` still carries the deleted path into selection, where the
+  // base-governed rules classify it. The remedy is the base-governed
+  // `verdict_bearing_paths`, which nsc-eval declares. Recorded as an open
+  // non-blocking finding rather than fixed here — but the comment does not get
+  // to keep asserting a guarantee the code does not make.
   const contractScope = verdictBearingPaths(
     contract, pathExistsAt(repoRoot, headSha), pathReaderAt(repoRoot, headSha),
   );

@@ -273,8 +273,9 @@ function resolveNpmScripts(command, read, exists, into) {
  * The true property is narrower, and is what this function actually guarantees:
  *
  *   CANNOT be shrunk by the head    `.watson` (unconditional)
- *                                   the install surface, where it exists
  *                                   `verdict_bearing_paths` (base-governed)
+ *   CANNOT be shrunk by REWRITING    the install surface — but see below: it
+ *   a command                        can still be removed by DELETING the file
  *   CAN be shrunk by the head       paths reachable only through head-authored
  *                                   command strings
  *
@@ -287,6 +288,18 @@ function resolveNpmScripts(command, read, exists, into) {
  * hands: any path that must stay in scope regardless of how the head writes its
  * commands belongs in base-governed `verdict_bearing_paths`, which is exactly
  * what source 3 is for.
+ *
+ * ONE MORE QUALIFICATION, because the table above overstated the install
+ * surface. Its entries are added only `if (exists(p))`, and `exists` is
+ * evaluated AT HEAD — so a head that DELETES `package-lock.json` removes it from
+ * the comparison scope entirely and the contract comparison reports
+ * `equivalent`. "Cannot be shrunk by the head" was true of rewriting a command
+ * and false of deleting the file, and the table said it without the qualifier.
+ *
+ * Bounded the same way as the rest: reporting, never a gate, and the unscoped
+ * `changedPaths` still carries the deletion into selection. An open non-blocking
+ * finding, recorded rather than fixed here — but not one this comment gets to
+ * claim away.
  *
  * `exists` is injected so this stays a pure function over the contract and one
  * predicate — the caller decides whether "exists" means the working tree or a
