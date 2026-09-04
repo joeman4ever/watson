@@ -36,33 +36,66 @@ watson verify --repo /path/to/product [--sha <ref>] [--base <ref>] [--profile po
              [--plane <url> --product-base-url <url>]   # run the product in its own plane
              [--manifest <file>]                        # trusted product identity
              [--base-contract <dir>]                    # the contract that GOVERNS the verdict
+             [--base-tree <dir>]                        # trusted base revision, for base-side content
 watson manifest --repo /path/to/product [--out <file>]  # TRUSTED side, before product code runs
 watson doctor --repo /path/to/product     # bring up, probe, tear down
 watson plane  --repo /path/to/product     # the UNTRUSTED side, inside the product container
 watson reap                               # drop orphaned watson_* databases
 ```
 
-### Two things the trusted side must supply
+### Three things the trusted side must supply
 
-Both have the same shape, and it is the shape that matters: **exactly one
+All three have the same shape, and it is the shape that matters: **exactly one
 authority, handed in by the trusted plane, with no fallback to asking the
-product.** In both cases the fallback *was* the vulnerability.
+product.** In every case the fallback *was* the vulnerability.
 
 | flag | supplies | without it |
 | --- | --- | --- |
 | `--manifest` | what the product source IS | product identity cannot be established |
 | `--base-contract` | what PASS MEANS | no contract governed the run |
+| `--base-tree` | what the base revision CONTAINED | the base→head comparison is unavailable |
 
-Either missing withholds the product claim: the run executes, reports everything
-it observed, and returns `INDETERMINATE` rather than `PASS` or `FAIL_PRODUCT`.
-A verdict about a commit needs both that the commit is what was driven and that
-the thing being judged did not choose the semantics used to judge it.
+The first two missing withholds the product claim: the run executes, reports
+everything it observed, and returns `INDETERMINATE` rather than `PASS` or
+`FAIL_PRODUCT`. A verdict about a commit needs both that the commit is what was
+driven and that the thing being judged did not choose the semantics used to judge
+it.
 
 `--base-contract` names a directory the trusted side materialised from the base
 revision — not a path inside the product tree, and never `git archive` out of the
 product's own `.git` (ADR-049 F3). The head's contract is still loaded,
 fingerprinted, diffed and reported; it is a proposal, not the authority for its
 own verdict.
+
+`--base-tree` is the same principle applied to **content**, and it closes the
+last place the engine asked the product repository a base-side question.
+`contractChange` and `changedPaths` used to run `git rev-parse <baseSha>:<path>`
+and `git diff` inside the product clone. That clone is `refs/pull/N/head`; the
+base SHA is the base branch tip, and it is in that clone only when it happens to
+be an ancestor. When it was not, every scoped path digested as the string
+`absent`, **every path read as changed**, and the result asserted a contract
+change nothing had established — while `base_contract_available` said `true`.
+
+Two defects, and the second is the worse: base-side facts asked of the untrusted
+repository, and *"could not read"* reported as *"absent"*. Both sides of both
+comparisons now come from trusted material — the base tree above, and the head
+side from the manifest, which the trusted plane builds before a line of product
+code runs. Neither function takes a repository root any more, and a test asserts
+that neither can be handed one.
+
+**Missing base material is `unavailable`, never `changed` and never `clean`.**
+`contract_change` reports `comparison: 'unavailable'` with an empty
+`paths_changed` and `base_contract_available: false`; selection keeps its
+existing fail-conservative behaviour and escalates. Manufacturing either answer
+out of information nobody has is the specific thing this design exists to refuse.
+
+**One honest change of meaning.** The old diff was
+`merge-base(base, head)..head` — *what this pull request changed*. A merge base
+needs both histories in one repository, and neither trusted materialisation has
+the other's; that separation is the point. So the diff is now base-tip vs head:
+*how head differs from the revision whose contract governs it.* Paths that moved
+on the base branch since the fork point now appear. The effect is strictly
+conservative — a larger changed set escalates to more verification, never less.
 
 Exit code is `0` for `PASS` / `PASS_WITH_ADVISORIES`, `1` otherwise. Every run
 writes `runs/<runId>/result.json` (machine) and `runs/<runId>/summary.md`

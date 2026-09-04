@@ -15,7 +15,7 @@ import {
 } from '../src/governance.mjs';
 import { operationalConfigChange } from '../src/fingerprint.mjs';
 import { PRODUCT_CLAIMS, WITHHELD_WITHOUT_GOVERNANCE, checkFor, runVerdict } from '../src/result.mjs';
-import { contractDirFingerprint } from '../src/manifest.mjs';
+import { contractDirFingerprint, buildManifest } from '../src/manifest.mjs';
 
 
 const contract = (over = {}) => ({
@@ -622,11 +622,36 @@ describe('THE ATTACK: an ungoverned run cannot skip itself green', () => {
     return { dir, base, head: g('rev-parse', 'HEAD').toString().trim() };
   }
 
+  /**
+   * THE TWO TRUSTED SIDES, supplied the way the observer supplies them.
+   *
+   * Since D1 the engine takes base-side content from a trusted materialisation
+   * and head-side content from the trusted manifest, rather than running git
+   * against the product clone for either. These end-to-end tests must therefore
+   * hand it both, or they exercise the fail-conservative path instead of the
+   * attack — which is exactly what happened when the fix first landed: three
+   * subtests here went red because the diff was no longer computable, not
+   * because the gate had moved.
+   */
+  const trustedSides = (repo) => {
+    const baseTree = tmp();
+    const tar = execFileSync('git', ['archive', '--format=tar', repo.base],
+      { cwd: repo.dir, maxBuffer: 64 * 1024 * 1024 });
+    const t = path.join(baseTree, 'x.tar');
+    fs.writeFileSync(t, tar);
+    execFileSync('tar', ['-xf', t, '-C', baseTree]);
+    fs.unlinkSync(t);
+
+    const manifestPath = path.join(tmp(), 'manifest.json');
+    fs.writeFileSync(manifestPath, JSON.stringify(buildManifest(repo.dir, { sha: repo.head })));
+    return ['--base-tree', baseTree, '--manifest', manifestPath];
+  };
+
   const run = (repo, extra) => {
     const out = path.join(repo.dir, 'result.json');
     try {
       execFileSync(process.execPath, [CLI, 'verify', '--repo', repo.dir, '--out', out,
-        '--sha', repo.head, '--base', repo.base, ...extra],
+        '--sha', repo.head, '--base', repo.base, ...trustedSides(repo), ...extra],
       { stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 });
     } catch { /* a non-product verdict exits non-zero */ }
     return JSON.parse(fs.readFileSync(out, 'utf8'));

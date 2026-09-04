@@ -478,8 +478,97 @@ export function resolveSha(repoRoot, ref = 'HEAD') {
  *
  * Returns null when the contract did not change.
  */
-export function contractChange(repoRoot, baseSha, headSha, loadAt, paths = CONTRACT_PATHS) {
-  if (!baseSha) return null;
+/**
+ * THE SUBTREE DIGEST OF ONE SCOPED PATH, from a trusted entry map.
+ *
+ * `entries` is the `walkTree` shape — `rel -> { type, digest, mode }` — which is
+ * what both the trusted base materialisation and the trusted product manifest
+ * are made of. Aggregating here rather than digesting a directory on disk means
+ * BOTH sides of every comparison are computed by the same code over the same
+ * representation, which is the only way the comparison means anything.
+ *
+ * Returns `null` when the path is absent from that side. That is a FACT about a
+ * tree we hold, never a stand-in for "we could not look" — the could-not-look
+ * case is refused by the caller before it reaches here, which is where the
+ * absent/unreadable distinction actually lives. Stated precisely because an
+ * earlier version of this comment claimed the distinction was made HERE, and a
+ * negative control against that claim stayed green: returning a constant such as
+ * `'absent'` instead of `null` changes no behaviour, since both sides are
+ * compared with the same function. What `null` buys is that it is a value no
+ * digest can collide with; what makes it correct is that it is the same value
+ * for every absent path, so a path missing from BOTH sides is not a change.
+ */
+export function subtreeDigest(entries, p) {
+  const prefix = `${p}/`;
+  const members = [];
+  for (const [rel, e] of entries) {
+    if (rel === p || rel.startsWith(prefix)) members.push([rel, e]);
+  }
+  if (!members.length) return null;
+  members.sort(([a], [b]) => (a < b ? -1 : 1));
+  const h = crypto.createHash('sha256');
+  for (const [rel, e] of members) h.update(`${rel}\0${e.type}\0${e.digest ?? ''}\0${e.mode ?? ''}\0`);
+  return `sha256:${h.digest('hex')}`;
+}
+
+/** The `walkTree` shape from either a Map or a manifest's plain object. */
+function asEntries(x) {
+  if (!x) return null;
+  if (x instanceof Map) return x;
+  if (typeof x === 'object') return new Map(Object.entries(x));
+  return null;
+}
+
+/**
+ * Base -> head semantic diff of the CONTRACT. Phase 0/1 REPORTS this; it does
+ * not gate on it. The purpose is that a PR must not be able to weaken its own
+ * verification expectation and thereby silently manufacture its own PASS.
+ *
+ * BOTH SIDES COME FROM TRUSTED MATERIAL. NEITHER COMES FROM PRODUCT-OWNED GIT.
+ *
+ * This function used to run `git rev-parse <baseSha>:<path>` inside the PRODUCT
+ * clone. That clone is `refs/pull/N/head`; the base SHA is the base branch tip,
+ * and it is in that clone only when it happens to be an ancestor. When it was
+ * not, `treeHash` returned the string `absent` for every scoped path, EVERY path
+ * read as changed, and the result asserted a contract change that nothing had
+ * established. Reproduced against the real topology before this changed.
+ *
+ * Two defects in one, and the second is the worse:
+ *
+ *   1. base-side facts were being asked of the untrusted repository
+ *   2. "could not read" was being reported as "absent"
+ *
+ * The architecture now says what it always should have: a base-side fact comes
+ * from the base materialisation the trusted side made, and an unobtainable
+ * comparison is reported as unobtainable. Note that this holds whether or not
+ * the product clone happens to contain the base object — the product clone is
+ * not consulted either way, so its contents are no longer a variable.
+ *
+ * @param baseEntries trusted base materialisation, `walkTree` shape, or null
+ * @param headEntries trusted product manifest entries, or null
+ */
+export function contractChange({ baseEntries, headEntries, loadAt, paths = CONTRACT_PATHS }) {
+  const baseTree = asEntries(baseEntries);
+  const headTree = asEntries(headEntries);
+
+  // COMPARISON NOT ESTABLISHED. Not "changed", not "unchanged".
+  //
+  // Manufacturing either from missing information is what this whole change
+  // exists to stop. The caller treats this exactly as it treats an absent diff:
+  // fail-conservative, and say so.
+  if (!baseTree || !headTree) {
+    return {
+      model: 'comparison-unavailable',
+      base_contract_available: false,
+      comparison: 'unavailable',
+      why: !baseTree && !headTree
+        ? 'neither a trusted base materialisation nor a trusted head manifest was supplied'
+        : !baseTree
+          ? 'no trusted base materialisation was supplied, so the base side cannot be read'
+          : 'no trusted head manifest was supplied, so the head side cannot be read',
+      paths_changed: [],
+    };
+  }
 
   // WHICH OF THE VERDICT-BEARING PATHS MOVED, path by path.
   //
@@ -488,13 +577,16 @@ export function contractChange(repoRoot, baseSha, headSha, loadAt, paths = CONTR
   // contain: a reviewer told "the contract changed" cannot tell a reworded
   // journey from a rewritten fixture script. So each path is compared on its own
   // and the ones that differ are named.
-  const pathsChanged = paths.filter(
-    (p) => treeHash(repoRoot, baseSha, p) !== treeHash(repoRoot, headSha, p),
-  );
+  //
+  // `subtreeDigest` returns null for a path genuinely absent from that side, and
+  // null !== a digest, so a head-ADDED path is still correctly a change — which
+  // is the distinction the old code could not make, because it spelled "absent"
+  // and "unreadable" the same way.
+  const pathsChanged = paths.filter((p) => subtreeDigest(baseTree, p) !== subtreeDigest(headTree, p));
   if (!pathsChanged.length) return null;
 
-  const base = loadAt(baseSha);
-  const head = loadAt(headSha);
+  const base = loadAt('base');
+  const head = loadAt('head');
   if (!base) {
     return {
       model: 'head-product-x-head-contract',
@@ -737,20 +829,43 @@ export function deepDiffPaths(a, b, prefix = '', into = []) {
  * must treat null as "no knowledge" and refuse to skip on it; an empty array is
  * the positive fact that the two trees are identical.
  */
-export function changedPaths(repoRoot, baseSha, headSha) {
-  if (!baseSha || !headSha) return null;
-  try {
-    const mergeBase = git(['merge-base', baseSha, headSha], {
-      cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim();
-    const out = git(['diff', '--name-only', '-z', `${mergeBase}`, headSha], {
-      cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    return out.split('\0').filter(Boolean);
-  } catch {
-    // An unreachable base, a shallow clone with no common ancestor, a bad ref.
-    return null;
+export function changedPaths({ baseEntries, headEntries }) {
+  const baseTree = asEntries(baseEntries);
+  const headTree = asEntries(headEntries);
+  // SAME ROOT CAUSE AS `contractChange`, and fixed in the same place rather than
+  // left behind. This ran `git merge-base` and `git diff` inside the PRODUCT
+  // clone, so a base SHA that clone did not contain threw, returned null, and
+  // silently dropped the run out of diff-driven selection into the broad
+  // profile. The fallback direction was safe — MORE journeys run — but the
+  // selectivity telemetry Phase 1 is about to start measuring would have been
+  // measuring the fallback.
+  //
+  // `null` still means "no trustworthy diff", and the caller still escalates on
+  // it. What changed is that it now means what it says.
+  if (!baseTree || !headTree) return null;
+
+  // WHAT THIS DIFF IS, PRECISELY — because it is not quite what git gave us.
+  //
+  // The old form was `merge-base(base, head)..head`: what this pull request
+  // changed. Computing a merge base needs both histories in one repository, and
+  // deliberately neither trusted materialisation has the other's — that is the
+  // point of the split. So this is base-tip vs head: HOW HEAD DIFFERS FROM THE
+  // REVISION WHOSE CONTRACT GOVERNS IT.
+  //
+  // That is a real change in meaning and it is stated rather than slipped in.
+  // Paths that moved on the base branch since the fork point now appear here.
+  // The effect is strictly conservative — a larger changed set escalates to more
+  // verification, never less — and it is arguably the more honest question,
+  // since the verdict being reached is about this head under that base's
+  // contract. It is not a selector redesign: the fail-conservative semantics
+  // above and below this function are untouched.
+  const changed = new Set();
+  for (const [rel, b] of baseTree) {
+    const h = headTree.get(rel);
+    if (!h || h.type !== b.type || h.digest !== b.digest || h.mode !== b.mode) changed.add(rel);
   }
+  for (const rel of headTree.keys()) if (!baseTree.has(rel)) changed.add(rel);
+  return [...changed].sort();
 }
 
 /**

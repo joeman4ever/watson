@@ -488,9 +488,12 @@ describe('product identity is measured BEFORE any product code runs', () => {
     // The functions in `fingerprint.mjs` that shell out to git against the
     // product repository. Named explicitly rather than discovered, so adding a
     // new one is a deliberate act that has to come here too.
+    // `contractChange` and `changedPaths` are no longer in this list because
+    // since D1 they run no git at all: both sides come from trusted
+    // materialisations. That is asserted structurally below rather than left to
+    // this list quietly shrinking.
     const GIT_READERS = [
-      'productFingerprint(', 'contractFingerprint(', 'contractChange(',
-      'changedPaths(', 'verdictBearingPaths(', 'resolveSha(',
+      'productFingerprint(', 'contractFingerprint(', 'verdictBearingPaths(', 'resolveSha(',
     ];
     const late = [];
     for (const fn of GIT_READERS) {
@@ -501,5 +504,45 @@ describe('product identity is measured BEFORE any product code runs', () => {
     assert.deepEqual(late, [],
       'a git read of the product tree happens AFTER the product container can run; '
       + 'the tree is writable by the product, so this ordering is the control');
+  });
+
+  test('D1: the base-side comparison functions run no git at all', () => {
+    // THE PROPERTY, encoded structurally rather than as "these SHAs happen to
+    // exist in one repository".
+    //
+    //     base-side contract/change computation comes from the trusted base
+    //     materialisation and is INDEPENDENT of whether the product checkout
+    //     contains the base git object
+    //
+    // The behavioural half is in contract-scope.test.mjs, which builds the real
+    // topology — a product clone holding only the head — and shows the answer is
+    // the same with that clone deleted. This half is the reason it can be: the
+    // two functions take entry maps and touch git nowhere.
+    const src = fs.readFileSync(new URL('../src/fingerprint.mjs', import.meta.url), 'utf8');
+    for (const fn of ['contractChange', 'changedPaths']) {
+      const start = src.indexOf(`export function ${fn}(`);
+      assert.ok(start > 0, `${fn} not found`);
+      // To the next top-level export, which is where each of these ends.
+      const rest = src.slice(start + 1);
+      const end = rest.indexOf('\nexport ');
+      const body = end < 0 ? rest : rest.slice(0, end);
+      const gitCalls = body.split('\n')
+        .filter((l) => !/^\s*(\/\/|\*)/.test(l))
+        .filter((l) => /\bgit\(|execFileSync|treeHash\(/.test(l));
+      assert.deepEqual(gitCalls, [],
+        `${fn} reaches for git or the product tree: ${gitCalls.join(' | ')}`);
+    }
+  });
+
+  test('D1: neither takes a repository root, so it cannot be handed one', () => {
+    // The signature is the boundary. While these accepted `repoRoot` a future
+    // edit could reintroduce the read without any structural check noticing.
+    const src = fs.readFileSync(new URL('../src/fingerprint.mjs', import.meta.url), 'utf8');
+    for (const fn of ['contractChange', 'changedPaths']) {
+      const m = src.match(new RegExp(`export function ${fn}\\(([^)]*)\\)`));
+      assert.ok(m, `${fn} not found`);
+      assert.doesNotMatch(m[1], /repoRoot|baseSha|headSha/,
+        `${fn} still takes a product-repository argument: ${m[1].trim()}`);
+    }
   });
 });

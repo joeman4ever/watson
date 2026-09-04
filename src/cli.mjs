@@ -22,7 +22,7 @@ import {
 import { validateProofDeclarations } from './proofs.mjs';
 import { resolveGovernance, downgradeForUngovernedContract } from './governance.mjs';
 import { productFingerprint, contractFingerprint, resolveSha, contractChange, productIdentity, changedPaths, engineProvenance, verdictBearingPaths, pathExistsAt, pathReaderAt, operationalConfigChange } from './fingerprint.mjs';
-import { readManifest, contractDirFingerprint } from './manifest.mjs';
+import { readManifest, contractDirFingerprint, walkTree } from './manifest.mjs';
 import { runManifest } from './manifest-cli.mjs';
 import { selectByImpact } from './selection.mjs';
 import * as env from './environment.mjs';
@@ -531,6 +531,35 @@ async function cmdVerify(args) {
   const baseContract = baseContractDir
     ? (() => { try { return loadContract(baseContractDir); } catch { return null; } })()
     : null;
+  // THE TRUSTED BASE TREE — the base side of every comparison.
+  //
+  // `--base-contract` carries the base revision's `.watson/` and is the semantic
+  // authority. This is the other half: the base revision's TREE, materialised by
+  // the same trusted step, so base-side CONTENT for the wider verdict-bearing
+  // scope — migrations, lockfile, fixture script — comes from trusted material
+  // too. It used to come from `git rev-parse <baseSha>:<path>` inside the product
+  // clone, which is `refs/pull/N/head` and holds the base commit only by
+  // coincidence. See `contractChange` for what that produced.
+  //
+  // Kept as a SEPARATE directory from `--base-contract` on purpose. Folding the
+  // whole tree into that one would silently redefine `governing_contract`'s
+  // fingerprint — a field the trusted validator recomputes and compares — from
+  // "the base contract" to "the base tree". Both sides would still agree, and
+  // the field would quietly mean something else.
+  const baseTreeDir = typeof args['base-tree'] === 'string' ? args['base-tree'] : null;
+  let baseEntries = null;
+  let baseTreeError = null;
+  if (baseTreeDir) {
+    try {
+      baseEntries = walkTree(baseTreeDir);
+    } catch (err) {
+      // Recorded, never swallowed into "unchanged". `contractChange` reports the
+      // comparison as unavailable and selection escalates.
+      baseTreeError = err.message;
+      log(`  ⚠ the trusted base tree at ${baseTreeDir} could not be read (${baseTreeError});`
+        + ' the base-side comparison is UNAVAILABLE and selection escalates');
+    }
+  }
   const governance = resolveGovernance({
     base: baseContract, head: headContract, baseSupplied: !!baseContractDir,
     baseSha,
@@ -556,7 +585,11 @@ async function cmdVerify(args) {
   // resolves; declared profile otherwise. The fallback direction matters: an
   // absent base or absent rules means MORE journeys run, never fewer.
   const rules = contract.config.selection ?? null;
-  const changed = rules ? changedPaths(repoRoot, baseSha, headSha) : null;
+  // Same trusted inputs as `contractChange`, and for the same reason: this used
+  // to run `git merge-base` / `git diff` inside the product clone, so a base SHA
+  // that clone did not contain dropped the run out of diff-driven selection and
+  // into the broad profile without saying so.
+  const changed = rules ? changedPaths({ baseEntries, headEntries: manifest?.entries ?? null }) : null;
 
   const impact = rules
     ? selectByImpact({
@@ -611,15 +644,23 @@ async function cmdVerify(args) {
     // on it.
     contractFingerprint: contractFingerprint(repoRoot, headSha, contractScope),
     contractScope,
-    // Resolves the contract at BOTH SHAs so the diff can name what changed, not
-    // merely that something did.
+    // Resolves the contract from BOTH SIDES so the diff can name what changed,
+    // not merely that something did.
     //
-    // The base side is the TRUSTED materialisation, never `git archive` out of
-    // the product's own `.git` (F3), and the head side is the head contract as
-    // authored — not the governing merge, which would diff the base against
-    // itself and report no change however much the head moved.
-    contractChange: contractChange(repoRoot, baseSha, headSha,
-      (sha) => (sha === headSha ? headContract : baseContract), contractScope),
+    // Every input is trusted material. The base side is the trusted
+    // materialisation — never `git archive` out of the product's own `.git` (F3)
+    // and, since D1, never `git rev-parse` against it either. The head side is
+    // the trusted MANIFEST, built by the trusted plane before a line of product
+    // code ran, rather than the product repository's view of its own commit. The
+    // head CONTRACT is the head contract as authored, not the governing merge,
+    // which would diff the base against itself and report no change however much
+    // the head moved.
+    contractChange: contractChange({
+      baseEntries,
+      headEntries: manifest?.entries ?? null,
+      loadAt: (side) => (side === 'head' ? headContract : baseContract),
+      paths: contractScope,
+    }),
     // HOW THE PRODUCT WAS LAUNCHED, reported separately from everything else.
     //
     // These keys are head-authored by decision — `install`, `provision`,
@@ -1118,7 +1159,7 @@ try {
     for (const k of kept) log(`  kept ${k.datname} — ${k.why}`);
     process.exit(0);
   } else {
-    log(`watson ${VERSION}\n\n  watson verify --repo <path> [--sha <ref>] [--base <ref>] [--profile poc] [--pr N] [--out <file>]\n               [--plane <url> --product-base-url <url>]\n               [--manifest <file>] [--base-contract <dir>]\n  watson manifest --repo <path> [--sha <ref>] [--out <file>]   (TRUSTED side, before product code runs)\n  watson doctor --repo <path>\n  watson plane --repo <path> [--port 8079]\n  watson reap\n`);
+    log(`watson ${VERSION}\n\n  watson verify --repo <path> [--sha <ref>] [--base <ref>] [--profile poc] [--pr N] [--out <file>]\n               [--plane <url> --product-base-url <url>]\n               [--manifest <file>] [--base-contract <dir>] [--base-tree <dir>]\n  watson manifest --repo <path> [--sha <ref>] [--out <file>]   (TRUSTED side, before product code runs)\n  watson doctor --repo <path>\n  watson plane --repo <path> [--port 8079]\n  watson reap\n`);
     process.exit(cmd ? 1 : 0);
   }
 } catch (err) {

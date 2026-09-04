@@ -18,9 +18,10 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 import {
-  verdictBearingPaths, contractFingerprint, contractChange, pathExistsAt,
+  verdictBearingPaths, contractFingerprint, contractChange, changedPaths, pathExistsAt, subtreeDigest,
   canonicalContract, deepDiffPaths, operationalConfigChange,
 } from '../src/fingerprint.mjs';
+import { walkTree } from '../src/manifest.mjs';
 import { loadContract } from '../src/contract.mjs';
 import { CONFIG_AUTHORITY } from '../src/governance.mjs';
 
@@ -239,6 +240,31 @@ describe('against a real repository', () => {
     return { dir, g, commit: (m) => { g('add', '-A'); g('commit', '-q', '-m', m); return g('rev-parse', 'HEAD').toString().trim(); } };
   };
 
+  // MATERIALISE THE TWO TRUSTED SIDES, the way the observer does.
+  //
+  // The engine no longer reads either side out of the product clone, so these
+  // tests must not hand it one. `base/` is a directory the trusted plane
+  // produced from the base revision; the head side is the trusted MANIFEST's
+  // entries, which the trusted plane builds before a line of product code runs.
+  //
+  // `git archive` here is the TEST constructing the topology, not the engine
+  // reading it. That distinction is the whole point of the change: what the
+  // engine is given is two trees, and where the test got them is the test's
+  // business.
+  const materialise = (r, sha) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'watson-trusted-'));
+    const tar = execFileSync('git', ['archive', '--format=tar', sha], { cwd: r.dir, maxBuffer: 64 * 1024 * 1024 });
+    const t = path.join(dir, 'x.tar');
+    fs.writeFileSync(t, tar);
+    execFileSync('tar', ['-xf', t, '-C', dir]);
+    fs.unlinkSync(t);
+    return dir;
+  };
+  const sides = (r, base, head) => ({
+    baseEntries: walkTree(materialise(r, base)),
+    headEntries: walkTree(materialise(r, head)),
+  });
+
   const writeContract = (dir, { enumValues = ['A', 'B', 'C'] } = {}) => {
     const d = path.join(dir, '.watson');
     fs.mkdirSync(path.join(d, 'features'), { recursive: true });
@@ -280,7 +306,7 @@ describe('against a real repository', () => {
     assert.notEqual(contractFingerprint(r.dir, base, scope),
       contractFingerprint(r.dir, head, scope));
 
-    const change = contractChange(r.dir, base, head, () => c, scope);
+    const change = contractChange({ ...sides(r, base, head), loadAt: () => c, paths: scope });
     assert.ok(change, 'no contract change reported');
     assert.deepEqual(change.paths_changed, ['server/scripts/watson-fixture.ts']);
   });
@@ -294,7 +320,7 @@ describe('against a real repository', () => {
     const head = r.commit('head');
     const c = loadContract(r.dir);
     const scope = verdictBearingPaths(c, pathExistsAt(r.dir, head));
-    const change = contractChange(r.dir, base, head, () => c, scope);
+    const change = contractChange({ ...sides(r, base, head), loadAt: () => c, paths: scope });
     assert.deepEqual(change.paths_changed, ['package-lock.json']);
   });
 
@@ -306,7 +332,212 @@ describe('against a real repository', () => {
     const head = r.commit('head');
     const c = loadContract(r.dir);
     const scope = verdictBearingPaths(c, pathExistsAt(r.dir, head));
-    assert.equal(contractChange(r.dir, base, head, () => c, scope), null);
+    assert.equal(contractChange({ ...sides(r, base, head), loadAt: () => c, paths: scope }), null);
+  });
+
+  // ===========================================================================
+  // D1 / N9 — THE BASE SIDE COMES FROM THE TRUSTED MATERIALISATION.
+  //
+  // `contractChange` and `changedPaths` used to run git inside the PRODUCT clone
+  // for base-side facts. That clone is `refs/pull/N/head`; the base SHA is the
+  // base branch tip and is in it only by coincidence. When it was not,
+  // `treeHash` returned the string `absent` for every scoped path, EVERY path
+  // read as changed, and the result asserted a contract change nothing had
+  // established — while `base_contract_available` said `true`.
+  //
+  // Two defects, and the second is the worse: base-side facts asked of the
+  // untrusted repository, and "could not read" reported as "absent".
+  //
+  // The property these cases pin is NOT "the base object happens to be there".
+  // It is:
+  //
+  //     base-side computation comes from the trusted base materialisation and is
+  //     INDEPENDENT of whether the product checkout contains the base git object
+  //
+  // so the tests are written against that, not against a lucky repository.
+  describe('D1: base-side comparison is independent of the product clone', () => {
+    // The real topology, built rather than described: a product clone holding
+    // ONLY the head commit — no base object, exactly as `refs/pull/N/head` gives
+    // it — beside a trusted materialisation of each side.
+    const topology = ({ headDiffers = false } = {}) => {
+      const r = repo();
+      writeContract(r.dir);
+      fs.mkdirSync(path.join(r.dir, 'server/scripts'), { recursive: true });
+      fs.writeFileSync(path.join(r.dir, 'server/scripts/watson-fixture.ts'), 'original\n');
+      const base = r.commit('base');
+      if (headDiffers) fs.writeFileSync(path.join(r.dir, 'server/scripts/watson-fixture.ts'), 'rewritten\n');
+      else fs.writeFileSync(path.join(r.dir, 'unrelated.txt'), 'x\n');
+      const head = r.commit('head');
+
+      // The product clone as the observer actually produces it.
+      const product = fs.mkdtempSync(path.join(os.tmpdir(), 'watson-product-'));
+      const pg = (...a) => execFileSync('git', a, { cwd: product, stdio: ['ignore', 'pipe', 'pipe'] });
+      pg('init', '-q', '-b', 'main');
+      pg('remote', 'add', 'origin', r.dir);
+      pg('fetch', '-q', '--depth', '1', 'origin', head);
+      pg('checkout', '-q', '--detach', 'FETCH_HEAD');
+
+      const c = loadContract(r.dir);
+      return { r, base, head, product, c, scope: verdictBearingPaths(c, pathExistsAt(r.dir, head)) };
+    };
+
+    test('the product clone really does lack the base object — the premise, executed', () => {
+      // Without this the rest proves nothing: a test that never built the
+      // failing condition cannot show the condition no longer matters.
+      const t = topology();
+      const has = (sha) => {
+        try {
+          execFileSync('git', ['cat-file', '-e', sha], { cwd: t.product, stdio: 'ignore' });
+          return true;
+        } catch { return false; }
+      };
+      assert.equal(has(t.head), true, 'the product clone should hold the head');
+      assert.equal(has(t.base), false, 'the product clone should NOT hold the base — the premise of N9');
+    });
+
+    test('CASE 1 — identical contract content reports NO change, base object absent', () => {
+      // THE KEY NEGATIVE CONTROL. Before this change the same topology reported
+      // every scoped path as changed. The product clone's missing base object is
+      // now irrelevant, because the product clone is not consulted.
+      const t = topology();
+      const change = contractChange({ ...sides(t.r, t.base, t.head), loadAt: () => t.c, paths: t.scope });
+      assert.equal(change, null, `spurious contract change: ${JSON.stringify(change)}`);
+    });
+
+    test('CASE 1b — changedPaths is computed, not abandoned', () => {
+      const t = topology();
+      const changed = changedPaths(sides(t.r, t.base, t.head));
+      assert.ok(Array.isArray(changed), 'changedPaths gave up and returned null');
+      assert.deepEqual(changed, ['unrelated.txt']);
+    });
+
+    test('CASE 2 — a real contract modification is still reported, with no loss of sensitivity', () => {
+      const t = topology({ headDiffers: true });
+      const change = contractChange({ ...sides(t.r, t.base, t.head), loadAt: () => t.c, paths: t.scope });
+      assert.ok(change, 'a real change went unreported');
+      assert.deepEqual(change.paths_changed, ['server/scripts/watson-fixture.ts']);
+      assert.equal(change.base_contract_available, true);
+    });
+
+    test('CASE 3 — a genuinely unavailable base is UNAVAILABLE, not changed and not clean', () => {
+      const t = topology({ headDiffers: true });
+      const { headEntries } = sides(t.r, t.base, t.head);
+      const change = contractChange({ baseEntries: null, headEntries, loadAt: () => t.c, paths: t.scope });
+
+      assert.ok(change, 'an unavailable comparison must be reported, not silently null');
+      assert.equal(change.comparison, 'unavailable');
+      assert.equal(change.base_contract_available, false);
+      // NEITHER fabrication. This is the whole point of the case.
+      assert.deepEqual(change.paths_changed, [], 'fabricated a change from missing information');
+      assert.notEqual(change, null, 'fabricated "unchanged" from missing information');
+      assert.match(change.why, /base/);
+
+      // And selection stays fail-conservative rather than diff-driven.
+      assert.equal(changedPaths({ baseEntries: null, headEntries }), null);
+    });
+
+    test('CASE 3b — an unreadable head manifest is equally unavailable', () => {
+      const t = topology();
+      const { baseEntries } = sides(t.r, t.base, t.head);
+      const change = contractChange({ baseEntries, headEntries: null, loadAt: () => t.c, paths: t.scope });
+      assert.equal(change.comparison, 'unavailable');
+      assert.equal(change.base_contract_available, false);
+      assert.deepEqual(change.paths_changed, []);
+      assert.equal(changedPaths({ baseEntries, headEntries: null }), null);
+    });
+
+    test('CASE 4 — a path the base PROVABLY lacks is a real addition, not an unreadable one', () => {
+      // The distinction the old code could not express: it spelled "absent" and
+      // "unreadable" with the same string. Here the trusted base materialisation
+      // proves the path is not there.
+      const r = repo();
+      writeContract(r.dir);
+      const base = r.commit('base');
+      fs.mkdirSync(path.join(r.dir, 'server/scripts'), { recursive: true });
+      fs.writeFileSync(path.join(r.dir, 'server/scripts/watson-fixture.ts'), 'new file\n');
+      const head = r.commit('head');
+      const c = loadContract(r.dir);
+      const scope = verdictBearingPaths(c, pathExistsAt(r.dir, head));
+
+      const change = contractChange({ ...sides(r, base, head), loadAt: () => c, paths: scope });
+      assert.ok(change, 'a head-added contract path was not reported');
+      assert.ok(change.paths_changed.includes('server/scripts/watson-fixture.ts'));
+      assert.equal(change.base_contract_available, true);
+    });
+
+    test('a scoped path absent from BOTH sides is not a change', () => {
+      // Scope can name a path that exists at neither revision — a base-declared
+      // `verdict_bearing_paths` entry for a directory not created yet — and that
+      // must be silence, not a change.
+      //
+      // HONEST NOTE ON WHAT THIS TEST IS. It is a characterisation test, not a
+      // control. I could not construct a mutation of `subtreeDigest`'s absent
+      // return that breaks it, because the function is a pure function of
+      // `(entries, p)` and both sides are called with the same `p` — so any
+      // constant, and any value derived from `p`, compares equal on both sides.
+      // Two attempted controls stayed green and are recorded rather than counted.
+      //
+      // What CAN regress is the absent return becoming ENTRIES-dependent, and
+      // the assertion below pins that directly. Reported as a characterisation
+      // test so nobody reads a green here as evidence of a control.
+      const r = repo();
+      writeContract(r.dir);
+      const base = r.commit('base');
+      fs.writeFileSync(path.join(r.dir, 'unrelated.txt'), 'x\n');
+      const head = r.commit('head');
+      const c = loadContract(r.dir);
+      const change = contractChange({
+        ...sides(r, base, head), loadAt: () => c,
+        paths: ['.watson', 'does/not/exist/at/either/revision'],
+      });
+      assert.equal(change, null, 'a path absent from both sides was reported as changed');
+    });
+
+    test('an absent path digests the same whatever tree it is absent from', () => {
+      // THE CONTROL the case above cannot be. If the absent return ever becomes
+      // derived from the entry map — a count, a digest of the map, anything —
+      // then two different trees that both lack a path stop agreeing, and every
+      // such path reports as changed. That is the original N9 failure mode
+      // arriving by a new route.
+      const a = new Map([['x', { type: 'file', digest: 'sha256:aa', mode: '644' }]]);
+      const b = new Map([
+        ['y', { type: 'file', digest: 'sha256:bb', mode: '644' }],
+        ['z', { type: 'file', digest: 'sha256:cc', mode: '755' }],
+      ]);
+      assert.equal(subtreeDigest(a, 'nowhere'), subtreeDigest(b, 'nowhere'));
+      assert.equal(subtreeDigest(a, 'nowhere'), null);
+      // And a path present on one side only is still a difference.
+      assert.notEqual(subtreeDigest(a, 'x'), subtreeDigest(b, 'x'));
+    });
+
+    test('CASE 5 — an unchanged real topology produces no warning at all', () => {
+      // The signal-to-noise property this change exists to restore.
+      const r = repo();
+      writeContract(r.dir);
+      const base = r.commit('base');
+      const head = base;
+      const c = loadContract(r.dir);
+      const scope = verdictBearingPaths(c, pathExistsAt(r.dir, head));
+      assert.equal(contractChange({ ...sides(r, base, head), loadAt: () => c, paths: scope }), null);
+      assert.deepEqual(changedPaths(sides(r, base, head)), []);
+    });
+
+    test('THE PROPERTY — destroying the product clone changes nothing', () => {
+      // Encoded as the property rather than as "these SHAs happen to exist in
+      // one git repo". If the base-side computation were still reaching into the
+      // product clone, removing it would change the answer. It does not, because
+      // it is not an input.
+      const t = topology({ headDiffers: true });
+      const before = contractChange({ ...sides(t.r, t.base, t.head), loadAt: () => t.c, paths: t.scope });
+      const beforePaths = changedPaths(sides(t.r, t.base, t.head));
+
+      fs.rmSync(t.product, { recursive: true, force: true });
+
+      const after = contractChange({ ...sides(t.r, t.base, t.head), loadAt: () => t.c, paths: t.scope });
+      const afterPaths = changedPaths(sides(t.r, t.base, t.head));
+      assert.deepEqual(after, before);
+      assert.deepEqual(afterPaths, beforePaths);
+    });
   });
 
   test('a `.watson` symlink is refused, not followed', () => {
