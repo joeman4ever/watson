@@ -587,6 +587,59 @@ describe('applicable with an empty plan is a contract fault, not a skip', () => 
   });
 });
 
+describe('an unreadable base contract is not a bootstrap', () => {
+  // COULD NOT READ IS NOT THE SAME AS DOES NOT EXIST, one layer below the base
+  // tree's version of the same distinction and load-bearing for the same field.
+  //
+  // `cli.mjs` reduced "loadContract threw" and "there is no .watson/" to the
+  // same null, and this function then told the reader the base revision carries
+  // no verification contract. Reproduced against a real unparseable base
+  // contract before this changed: `authority: bootstrap` with that note, which
+  // is false.
+  //
+  // Bootstrap is a legitimate, expected state — the pull request that first
+  // introduces the contract. An unparseable base contract is a harness or
+  // authoring fault, and reporting the second as the first hides it.
+  const head = { config: {}, features: [] };
+
+  test('a genuine bootstrap still reads as a bootstrap', () => {
+    const g = resolveGovernance({ base: null, head, baseSupplied: true, baseSha: 'b'.repeat(40) });
+    assert.equal(g.authority, 'bootstrap');
+    assert.match(g.note, /carries no verification contract/);
+    assert.equal(g.base_contract_error, null);
+  });
+
+  test('an unreadable one says so, and does not claim the base has no contract', () => {
+    const g = resolveGovernance({
+      base: null, head, baseSupplied: true, baseSha: 'b'.repeat(40),
+      baseError: 'Nested mappings are not allowed at line 1',
+    });
+    assert.match(g.note, /could not be READ/);
+    assert.match(g.note, /Nested mappings/);
+    assert.doesNotMatch(g.note, /carries no verification contract/,
+      'an unreadable base contract was reported as an absent one');
+    assert.equal(g.base_contract_error, 'Nested mappings are not allowed at line 1');
+  });
+
+  test('both withhold the product claim — the verdict is unchanged, only the reason is true', () => {
+    for (const baseError of [null, 'boom']) {
+      const g = resolveGovernance({ base: null, head, baseSupplied: true, baseSha: 'b'.repeat(40), baseError });
+      assert.equal(g.authority, 'bootstrap');
+      assert.equal(g.product_claims_permitted, false);
+    }
+  });
+
+  test('the CLI distinguishes them — an absent .watson is not an error', async () => {
+    // The join. `cli.mjs` must classify `loadContract`'s failure, and the one
+    // failure that is NOT an error is the missing directory.
+    const src = fs.readFileSync(new URL('../src/cli.mjs', import.meta.url), 'utf8');
+    const m = src.match(/catch \(err\) \{[\s\S]{0,400}?baseContractError = err\.message;/);
+    assert.ok(m, 'cli.mjs no longer classifies the base-contract load failure');
+    assert.match(m[0], /has no \\\.watson/,
+      'the missing-directory case is not excluded, so a genuine bootstrap would report an error');
+  });
+});
+
 describe('THE ATTACK: an ungoverned run cannot skip itself green', () => {
   // Demonstrated end to end by independent adversarial review. With no governing
   // contract the PULL REQUEST authors `selection`, so a head declaring

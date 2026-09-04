@@ -568,7 +568,13 @@ export function contractChange({ baseEntries, headEntries, loadAt, baseTreeError
   if (!baseTree || !headTree) {
     return {
       model: 'comparison-unavailable',
-      base_contract_available: false,
+      // ONE NAME, ONE SUBJECT. This used to hardcode `false` and mean "the base
+      // TREE was unobtainable", while every other branch of this function uses
+      // the same key to mean "the base CONTRACT was loadable". A run can have a
+      // perfectly good governing contract and an unreadable base tree, and it
+      // was reporting the contract as unavailable — the same false negative
+      // fixed in the envelope's default, surviving in the sibling branch.
+      base_contract_available: !!loadAt('base'),
       comparison: 'unavailable',
       // COULD NOT READ IS NOT THE SAME AS WAS NOT SUPPLIED, one layer up.
       //
@@ -584,7 +590,7 @@ export function contractChange({ baseEntries, headEntries, loadAt, baseTreeError
           : !baseTree
             ? 'no trusted base materialisation was supplied, so the base side cannot be read'
             : 'no trusted head manifest was supplied, so the head side cannot be read',
-      base_tree_error: baseTreeError,
+
       paths_changed: [],
     };
   }
@@ -604,12 +610,23 @@ export function contractChange({ baseEntries, headEntries, loadAt, baseTreeError
   const pathsChanged = paths.filter((p) => subtreeDigest(baseTree, p) !== subtreeDigest(headTree, p));
   if (!pathsChanged.length) return null;
 
+  // EVERY RETURN CARRIES THE STATE.
+  //
+  // The `comparison` key was added on the unavailable branch only, so a diverged
+  // result left it undefined — and a consumer writing `ce.comparison ??
+  // 'equivalent'` (exactly the pattern removed from the top-level field one
+  // commit earlier) was told a diverged contract was equivalent. A three-state
+  // carrier that can only express two states is the collapse this work exists to
+  // remove, reintroduced by the field added to prevent it.
+  const diverged = 'diverged';
+
   const base = loadAt('base');
   const head = loadAt('head');
   if (!base) {
     return {
       model: 'head-product-x-head-contract',
       base_contract_available: false,
+      comparison: diverged,
       paths_changed: pathsChanged,
     };
   }
@@ -696,8 +713,12 @@ export function contractChange({ baseEntries, headEntries, loadAt, baseTreeError
   }
 
   return {
-    model: 'head-product-x-head-contract',
+    // Both sides came from trusted materialisations, so say which model produced
+    // this. `head-product-x-head-contract` describes the pre-D1 arrangement and
+    // is simply false for a comparison that read a trusted base tree.
+    model: 'trusted-base-x-trusted-head',
     base_contract_available: true,
+    comparison: diverged,
     features_added: added,
     features_removed: removed,
     invariants_added: invariantsAdded,

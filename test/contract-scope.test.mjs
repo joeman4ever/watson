@@ -427,7 +427,12 @@ describe('against a real repository', () => {
 
       assert.ok(change, 'an unavailable comparison must be reported, not silently null');
       assert.equal(change.comparison, 'unavailable');
-      assert.equal(change.base_contract_available, false);
+      // NOT asserted false here any more, and the change is deliberate. This key
+      // means "was the base CONTRACT loadable", and in this case it was — what
+      // was unobtainable is the base TREE. Asserting false conflated two
+      // subjects under one name; the tree's absence is carried by `comparison`
+      // and `why`.
+      assert.equal(change.base_contract_available, true);
       // NEITHER fabrication. This is the whole point of the case.
       assert.deepEqual(change.paths_changed, [], 'fabricated a change from missing information');
       assert.notEqual(change, null, 'fabricated "unchanged" from missing information');
@@ -442,7 +447,6 @@ describe('against a real repository', () => {
       const { baseEntries } = sides(t.r, t.base, t.head);
       const change = contractChange({ baseEntries, headEntries: null, loadAt: () => t.c, paths: t.scope });
       assert.equal(change.comparison, 'unavailable');
-      assert.equal(change.base_contract_available, false);
       assert.deepEqual(change.paths_changed, []);
       assert.equal(changedPaths({ baseEntries, headEntries: null }), null);
     });
@@ -557,7 +561,6 @@ describe('against a real repository', () => {
         baseEntries: null, headEntries: new Map(), loadAt: () => null, paths: ['.watson'],
       });
       assert.match(supplied.why, /was not supplied|no trusted base materialisation was supplied/);
-      assert.equal(supplied.base_tree_error, null);
 
       const unreadable = contractChange({
         baseEntries: null, headEntries: new Map(), loadAt: () => null, paths: ['.watson'],
@@ -565,10 +568,53 @@ describe('against a real repository', () => {
       });
       assert.match(unreadable.why, /could not be read/);
       assert.match(unreadable.why, /ENOENT/);
-      assert.equal(unreadable.base_tree_error, 'could not read .: ENOENT');
       // Both are still UNAVAILABLE — the distinction is in the reason, not the state.
       assert.equal(unreadable.comparison, 'unavailable');
       assert.deepEqual(unreadable.paths_changed, []);
+    });
+
+    test('EVERY branch reports its comparison state — a three-state field expressing two is the bug', () => {
+      // The `comparison` key was added on the unavailable branch only, so a
+      // DIVERGED result left it undefined and a consumer writing
+      // `ce.comparison ?? 'equivalent'` — the exact pattern removed from the
+      // top-level field one commit earlier — was told a diverged contract was
+      // equivalent. A three-state carrier that can only express two states is
+      // the collapse this work exists to remove, reintroduced by the field
+      // added to prevent it.
+      const base = new Map([['.watson/c.yaml', { type: 'file', digest: 'sha256:aa', mode: '644' }]]);
+      const head = new Map([['.watson/c.yaml', { type: 'file', digest: 'sha256:bb', mode: '644' }]]);
+      const c = { config: {}, features: [], invariants: [], identities: [], fixtures: { profiles: {} } };
+
+      const diverged = contractChange({ baseEntries: base, headEntries: head, loadAt: () => c, paths: ['.watson'] });
+      assert.equal(diverged.comparison, 'diverged',
+        'a diverged comparison did not say so; `?? "equivalent"` would read it as equivalent');
+
+      const noBaseContract = contractChange({ baseEntries: base, headEntries: head, loadAt: () => null, paths: ['.watson'] });
+      assert.equal(noBaseContract.comparison, 'diverged');
+
+      const unavailable = contractChange({ baseEntries: null, headEntries: head, loadAt: () => c, paths: ['.watson'] });
+      assert.equal(unavailable.comparison, 'unavailable');
+
+      // And the model string tells the truth about which arrangement produced it.
+      assert.equal(diverged.model, 'trusted-base-x-trusted-head');
+    });
+
+    test('base_contract_available means the base CONTRACT on every branch', () => {
+      // One name, one subject. The unavailable branch hardcoded `false` and
+      // meant "the base TREE was unobtainable", while every other branch used
+      // the same key for "the base CONTRACT was loadable". A run can have a
+      // perfectly good governing contract and an unreadable base tree.
+      const base = new Map([['.watson/c.yaml', { type: 'file', digest: 'sha256:aa', mode: '644' }]]);
+      const head = new Map([['.watson/c.yaml', { type: 'file', digest: 'sha256:bb', mode: '644' }]]);
+      const c = { config: {}, features: [], invariants: [], identities: [], fixtures: { profiles: {} } };
+      const withContract = (b) => contractChange({ baseEntries: b, headEntries: head, loadAt: () => c, paths: ['.watson'] });
+      const without = (b) => contractChange({ baseEntries: b, headEntries: head, loadAt: () => null, paths: ['.watson'] });
+
+      assert.equal(withContract(base).base_contract_available, true);
+      assert.equal(without(base).base_contract_available, false);
+      assert.equal(withContract(null).base_contract_available, true,
+        'an unreadable base TREE was reported as an unavailable base CONTRACT');
+      assert.equal(without(null).base_contract_available, false);
     });
 
     test('base_contract_available is factual in BOTH directions', () => {

@@ -528,8 +528,23 @@ async function cmdVerify(args) {
   // reports, and withholds the product claim. Same shape as the manifest: one
   // authority, supplied by the trusted plane, no fallback to asking the product.
   const baseContractDir = typeof args['base-contract'] === 'string' ? args['base-contract'] : null;
+  // The bare `catch { return null }` here discarded WHY the contract did not
+  // load, and `resolveGovernance` then reported every case as bootstrap — "the
+  // base revision carries no verification contract" — including a base contract
+  // that was materialised and would not parse. Same collapse as the base tree's,
+  // one layer down, and load-bearing for `base_contract_available`.
+  let baseContractError = null;
   const baseContract = baseContractDir
-    ? (() => { try { return loadContract(baseContractDir); } catch { return null; } })()
+    ? (() => {
+      try {
+        return loadContract(baseContractDir);
+      } catch (err) {
+        // An absent `.watson/` is the legitimate bootstrap and is NOT an error;
+        // anything else is a fault worth naming.
+        if (!/has no \.watson\/ directory/.test(err.message)) baseContractError = err.message;
+        return null;
+      }
+    })()
     : null;
   // THE TRUSTED BASE TREE — the base side of every comparison.
   //
@@ -562,6 +577,7 @@ async function cmdVerify(args) {
   }
   const governance = resolveGovernance({
     base: baseContract, head: headContract, baseSupplied: !!baseContractDir,
+    baseError: baseContractError,
     baseSha,
     // Computed from the materialised directory, by the same function the trusted
     // observer uses to check it. Two notions of "the same contract" is how this

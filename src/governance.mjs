@@ -148,6 +148,11 @@ export function governingConfig(baseConfig, headConfig) {
  */
 export function resolveGovernance({
   base = null, head, baseSupplied = false, baseSha = null, baseFingerprint = null,
+  // Why `base` is null, when the caller knows. `null` alone cannot distinguish
+  // "the base revision has no contract" (a legitimate bootstrap) from "it has one
+  // and the engine could not read it" (a fault). Optional, so a caller that does
+  // not know keeps today's behaviour.
+  baseError = null,
 }) {
   if (!baseSupplied) {
     return {
@@ -159,11 +164,30 @@ export function resolveGovernance({
     };
   }
   if (!base) {
+    // COULD NOT READ IS NOT THE SAME AS DOES NOT EXIST — the same distinction as
+    // the base tree's, one layer down and load-bearing for the same field.
+    //
+    // The caller reduces "loadContract threw" and "there is no `.watson/`" to the
+    // same `null`, and this note then told the reader the base revision carries
+    // no contract. Reproduced: a base contract that WAS materialised and would
+    // not parse produced `authority: bootstrap` with that note, which is false —
+    // it carries one the engine could not read. Bootstrap is a legitimate,
+    // expected state (the pull request that first introduces the contract); an
+    // unparseable base contract is a harness or authoring fault, and reporting
+    // the second as the first hides it.
+    //
+    // Both still withhold the product claim, so the verdict is unchanged. What
+    // changes is that the reason is true.
     return {
       authority: 'bootstrap', sha: baseSha, fingerprint: null, contract: head, problems: [],
       head_only_features: [], product_claims_permitted: false,
-      note: 'the base revision carries no verification contract, so there is nothing to govern this '
-        + 'run. The head contract is being introduced and becomes authoritative when it merges.',
+      base_contract_error: baseError ?? null,
+      note: baseError
+        ? `the base revision's verification contract could not be READ (${baseError}) — this is not `
+          + 'a bootstrap: a contract is present at the base and could not be loaded, so nothing '
+          + 'governs this run and no product claim is made.'
+        : 'the base revision carries no verification contract, so there is nothing to govern this '
+          + 'run. The head contract is being introduced and becomes authoritative when it merges.',
     };
   }
 
