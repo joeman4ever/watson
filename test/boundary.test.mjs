@@ -4,6 +4,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import url from 'node:url';
 import { spawnSync } from 'node:child_process';
+import http from 'node:http';
+
+import * as drive from '../src/driver.mjs';
 
 import { summary, buildEnvelope } from '../src/result.mjs';
 
@@ -117,7 +120,7 @@ describe('one marker block, whatever the product writes into the run', () => {
     verdict: 'BLOCKED_ENVIRONMENT',
     verdictReason: 'environment could not be brought up',
     features: [], findings: [], qualitySignals: {},
-    workingTree: { exact_head: true, clean: true, dirty_paths: [], dirty_count: 0 },
+    workingTree: { exact_head: true, clean: true, method: 'manifest', dirty_paths: [], dirty_count: 0 },
     evidence: { bundle: 'runs/x' }, shadow: true,
     doctor: { ok: true, probes: [] },
     ...over,
@@ -219,5 +222,267 @@ describe('the entry point actually starts', () => {
     for (const cmd of advertised) {
       assert.match(src, new RegExp(`cmd === '${cmd}'`), `usage advertises \`${cmd}\`, which the CLI does not handle`);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `expect_reached` — the status boundary IS the assertion.
+//
+// Driven against a real HTTP server rather than a stubbed `page.request`,
+// because what this step means is entirely a claim about status codes, and a
+// stub would only re-state the table I wrote.
+
+describe('expect_reached asserts a DECLARED downstream condition', () => {
+  // The rule this replaced was "anything that is not 401/403/404/405/5xx", and
+  // that is another vacuous proof — it accepts a status the contract author
+  // never reasoned about. Not all 400s prove authorization succeeded: a request
+  // can be rejected before any guard runs, by a body parser or a router.
+  const serve = async (status, body) => {
+    const srv = http.createServer((_req, res) => {
+      res.writeHead(status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(body ?? {}));
+    });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    return { url: `http://127.0.0.1:${srv.address().port}`, close: () => srv.close() };
+  };
+  const ctxFor = (base) => ({
+    page: { request: { get: async (p) => {
+      const r = await fetch(new URL(p, base));
+      return { status: () => r.status, json: async () => r.json() };
+    } } },
+    evidence: { requests: [] },
+    vars: {},
+  });
+
+  test('the declared status AND error code both match', async () => {
+    const s = await serve(400, { error: 'grade_required' });
+    try {
+      const out = await drive.runStep(
+        { expect_reached: { path: '/api/x', status: 400, body: { error: 'grade_required' } } }, ctxFor(s.url));
+      assert.match(out, /reached — 400 error=grade_required/);
+    } finally { s.close(); }
+  });
+
+  test('THE CASE THIS EXISTS FOR: the right status, the WRONG reason', async () => {
+    // A 400 from a body parser, a router, or any pre-guard rejection is not
+    // evidence the guard admitted the caller. The old rule accepted every one.
+    const s = await serve(400, { error: 'malformed_json' });
+    try {
+      await assert.rejects(
+        () => drive.runStep(
+          { expect_reached: { path: '/api/x', status: 400, body: { error: 'grade_required' } } }, ctxFor(s.url)),
+        /not the declared downstream condition/);
+    } finally { s.close(); }
+  });
+
+  test('a different status fails even when the body would have matched', async () => {
+    const s = await serve(422, { error: 'grade_required' });
+    try {
+      await assert.rejects(
+        () => drive.runStep(
+          { expect_reached: { path: '/api/x', status: 400, body: { error: 'grade_required' } } }, ctxFor(s.url)),
+        /to answer 400 downstream of authorization, got 422/);
+    } finally { s.close(); }
+  });
+
+  for (const status of [401, 403, 404, 405, 500]) {
+    test(`${status} fails a declaration expecting a downstream condition`, async () => {
+      const s = await serve(status, { error: 'grade_required' });
+      try {
+        await assert.rejects(() => drive.runStep(
+          { expect_reached: { path: '/api/x', status: 400, body: { error: 'grade_required' } } }, ctxFor(s.url)));
+      } finally { s.close(); }
+    });
+  }
+
+  test('a status-only declaration still checks the exact status', async () => {
+    const s = await serve(409);
+    try {
+      const out = await drive.runStep({ expect_reached: { path: '/api/x', status: 409 } }, ctxFor(s.url));
+      assert.match(out, /409 \(status-only/);
+      await assert.rejects(() => drive.runStep({ expect_reached: { path: '/api/x', status: 400 } }, ctxFor(s.url)));
+    } finally { s.close(); }
+  });
+
+  test('a non-JSON body fails a declaration that names body fields', async () => {
+    const srv = http.createServer((_req, res) => { res.writeHead(400); res.end('<html>nope'); });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    try {
+      await assert.rejects(() => drive.runStep(
+        { expect_reached: { path: '/api/x', status: 400, body: { error: 'grade_required' } } },
+        ctxFor(`http://127.0.0.1:${srv.address().port}`)),
+      /not the declared downstream condition/);
+    } finally { srv.close(); }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// EVERY step's operands are interpolated, whatever shape the step takes.
+//
+// The defect this exists for: `runStep` interpolated only string-shaped
+// arguments, so `expect_text_in: { selector, text: "${grantedCohortSize}" }`
+// compared against the LITERAL `${grantedCohortSize}` and could never pass.
+// Watson accused a correct product on every run for as long as that step
+// existed. A per-handler rule is one a handler can forget; this is the property.
+
+describe('step operands are interpolated at any depth', () => {
+  test('a nested string is resolved', () => {
+    assert.deepEqual(
+      drive.interpDeep({ selector: 'testid=x', text: '${size}' }, { size: 14 }),
+      { selector: 'testid=x', text: '14' });
+  });
+
+  test('non-strings pass through untouched — `max: 0` stays a number', () => {
+    const out = drive.interpDeep({ selector: 's', max: 0, on: false, list: ['${a}', 2] }, { a: 'A' });
+    assert.deepEqual(out, { selector: 's', max: 0, on: false, list: ['A', 2] });
+    assert.equal(typeof out.max, 'number');
+  });
+
+  test('an unresolved name still throws rather than asserting against a literal', () => {
+    assert.throws(() => drive.interpDeep({ text: '${nope}' }, {}), /could not be resolved/);
+  });
+
+  test('THE JOIN, on the step that actually broke: `expect_text_in`', async () => {
+    // `expect_reached` interpolates its own path, so driving THAT proves nothing
+    // about the boundary — the first version of this test used it and the
+    // negative control stayed green. `expect_text_in` is the handler that does
+    // NOT self-interpolate, and is the one that was comparing against a literal
+    // `${grantedCohortSize}` on every run.
+    const page = { getByTestId: () => ({ first: () => ({ innerText: async () => 'Cohort 14 players' }) }) };
+    const ctx = { page, evidence: { requests: [] }, vars: { grantedCohortSize: 14 }, timeout: 2000 };
+    const out = await drive.runStep(
+      { expect_text_in: { selector: 'testid=prospective-cohort', text: '${grantedCohortSize}' } }, ctx);
+    assert.match(out, /14/);
+  });
+
+  test('and it FAILS when the element does not contain the resolved value', async () => {
+    const page = { getByTestId: () => ({ first: () => ({ innerText: async () => 'Cohort 9 players' }) }) };
+    const ctx = { page, evidence: { requests: [] }, vars: { grantedCohortSize: 14 }, timeout: 1000 };
+    await assert.rejects(() => drive.runStep(
+      { expect_text_in: { selector: 'testid=prospective-cohort', text: '${grantedCohortSize}' } }, ctx));
+  });
+
+  test('THE JOIN: `runStep` actually uses it on an object-shaped step', async () => {
+    // The first version of this suite tested `interpDeep` alone, and the
+    // negative control stayed green when `runStep` was reverted to the broken
+    // string-only rule — a module that is correct and nothing calls it, which is
+    // the failure mode this project has now produced three times. Drive the real
+    // entry point and read back what was actually requested.
+    const srv = http.createServer((_req, res) => { res.writeHead(200); res.end('{}'); });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    const base = `http://127.0.0.1:${srv.address().port}`;
+    const ctx = {
+      page: { request: { get: async (p) => {
+        const r = await fetch(new URL(p, base));
+        return { status: () => r.status, json: async () => r.json() };
+      } } },
+      evidence: { requests: [] },
+      vars: { seasonId: 'SEASON-7' },
+    };
+    try {
+      await drive.runStep({ expect_reached: { path: '/api/seasons/${seasonId}/x', status: 200 } }, ctx);
+      assert.equal(ctx.evidence.requests[0].path, '/api/seasons/SEASON-7/x');
+    } finally { srv.close(); }
+  });
+
+  test('PROPERTY: no `${...}` survives interpolation, in any shape a step can take', () => {
+    // Enumerated programmatically rather than by listing the handlers I happen
+    // to remember — which is exactly how the original defect survived review.
+    const shapes = [
+      '${a}',
+      { text: '${a}' },
+      { path: '/x/${a}?q=${b}' },
+      { selector: 's', text: '${a}', nested: { deep: ['${b}', { deeper: '${a}' }] } },
+      ['${a}', '${b}'],
+    ];
+    for (const shape of shapes) {
+      const out = JSON.stringify(drive.interpDeep(shape, { a: '1', b: '2' }));
+      assert.ok(!out.includes('${'), `unresolved operand survived: ${out}`);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The sandbox probe's own verdict — the string that made three gates vacuous.
+//
+// `/adequately sandboxed/i` matched BOTH of Chromium's verdicts, because the
+// negative one contains the positive as a substring. `effective` could never be
+// false, so the BLOCKED_ENVIRONMENT gate, the trusted validator's check, and the
+// per-commit layer-1 proof were all unreachable in the failing direction — while
+// every run bundle recorded `effective: true` beside a report saying the browser
+// was NOT sandboxed.
+//
+// Both literals are Chromium's own, verbatim.
+
+describe('probeSandbox reads Chromium\'s verdict, not a substring of it', () => {
+  // The predicate under test, applied to the page text `probeSandbox` reads.
+  const effective = (text) => JSON.parse(JSON.stringify({
+    v: !/not\s+adequately\s+sandboxed/i.test(text) && /adequately sandboxed/i.test(text),
+  })).v;
+
+  const NOT_SANDBOXED = [
+    'Sandbox Status', 'Layer 1 Sandbox\tNone', 'PID namespaces\tNo',
+    'Network namespaces\tNo', 'Seccomp-BPF sandbox\tNo', '', 'You are NOT adequately sandboxed.',
+  ].join('\n');
+  const SANDBOXED = [
+    'Sandbox Status', 'Layer 1 Sandbox\tNamespace', 'PID namespaces\tYes',
+    'Network namespaces\tYes', 'Seccomp-BPF sandbox\tYes', '', 'You are adequately sandboxed.',
+  ].join('\n');
+
+  test('Chromium saying NOT adequately sandboxed is NOT effective', () => {
+    assert.equal(effective(NOT_SANDBOXED), false);
+  });
+
+  test('Chromium saying adequately sandboxed IS effective', () => {
+    assert.equal(effective(SANDBOXED), true);
+  });
+
+  test('a report with no verdict line at all is not effective', () => {
+    // Absence of the sentence is not evidence of the sandbox.
+    assert.equal(effective('Sandbox Status\nLayer 1 Sandbox\tNone'), false);
+  });
+
+  test('the source uses a predicate that separates the two', () => {
+    // The join: it is the module that must read Chromium's verdict correctly,
+    // not this test's local copy of the regex. Asserted against the file so a
+    // future edit that reintroduces the bare substring is caught here.
+    const src = fs.readFileSync(new URL('../src/driver.mjs', import.meta.url), 'utf8');
+    const line = src.split('\n')
+      .filter((l) => !/^\s*(\/\/|\*)/.test(l))
+      .find((l) => l.includes('effective:') && l.includes('adequately'));
+    assert.ok(line, 'no `effective:` predicate found in driver.mjs');
+    assert.ok(/not\S*\s*adequately/.test(line),
+      `the predicate does not exclude Chromium's negative verdict: ${line.trim()}`);
+  });
+
+  test('the gate demands a POSITIVE probe, not merely the absence of a negative', () => {
+    // `effective === false` let a build that will not render `chrome://sandbox`
+    // — `available: false`, `effective` undefined — through to a product
+    // verdict with no layer-1 evidence at all. "An unprovable sandbox is not one
+    // this design gets to claim" was written in the README and not implemented.
+    //
+    // Asserted against `cli.mjs` rather than re-stated here, because the gate is
+    // the thing that has to be right; a local copy of the condition would pass
+    // while the engine shipped the softer one.
+    const src = fs.readFileSync(new URL('../src/cli.mjs', import.meta.url), 'utf8');
+    const line = src.split('\n')
+      .filter((l) => !/^\s*(\/\/|\*)/.test(l))
+      .find((l) => l.includes('browser_sandbox_probe') && l.includes('effective'));
+    assert.ok(line, 'no sandbox gate found in cli.mjs');
+    assert.match(line, /effective !== true/,
+      `the sandbox gate does not demand a positive probe: ${line.trim()}`);
+  });
+
+  test('the engine asks for a sandboxed browser, and says why in the same place', () => {
+    // Playwright adds `--no-sandbox` unless `chromiumSandbox: true` is passed,
+    // so the option is the whole claim. Kept here beside the probe tests because
+    // a probe that reads Chromium's verdict correctly is worthless if the
+    // browser was asked to run without a sandbox in the first place.
+    const src = fs.readFileSync(new URL('../src/driver.mjs', import.meta.url), 'utf8');
+    const line = src.split('\n')
+      .filter((l) => !/^\s*(\/\/|\*)/.test(l))
+      .find((l) => l.includes('chromiumSandbox'));
+    assert.ok(line, 'launchBrowser does not pass chromiumSandbox at all');
+    assert.match(line, /chromiumSandbox:\s*true/);
   });
 });

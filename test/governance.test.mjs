@@ -1,0 +1,742 @@
+// The base contract governs.
+//
+// The property under test: a pull request may propose a contract change, and
+// cannot use it to decide its own verdict. Everything here is about WHO the
+// value came from, never about whether the value looks reasonable — no predicate
+// over a declaration distinguishes a legitimate one from one chosen to weaken
+// the test.
+
+import { test, describe } from 'node:test';
+import assert from 'node:assert/strict';
+
+import {
+  resolveGovernance, governingConfig, downgradeForUngovernedContract,
+  CONFIG_AUTHORITY, LAUNCH_AUTHORITY,
+} from '../src/governance.mjs';
+import { operationalConfigChange } from '../src/fingerprint.mjs';
+import { PRODUCT_CLAIMS, WITHHELD_WITHOUT_GOVERNANCE, checkFor, runVerdict } from '../src/result.mjs';
+import { contractDirFingerprint, buildManifest } from '../src/manifest.mjs';
+
+
+const contract = (over = {}) => ({
+  dir: '/x/.watson',
+  config: {
+    contract_version: 3,
+    selection: { escalation_profile: 'smoke' },
+    generated_roots: [],
+    identity: { issuer: 'https://watson.local/base' },
+    injected_by_engine: [],
+    launch: { fixture_profile: 'watson-poc', expect_seasons: 2, command: 'npm start', health_path: '/h', readiness_path: '/r' },
+    install: 'npm ci', provision: 'npm run migrate', build: 'npm run build',
+    env: {}, browser: {}, engine: {},
+  },
+  features: [{ id: 'a' }],
+  invariants: [], identities: [], fixtures: { profiles: {} },
+  ...over,
+});
+
+describe('the reproduced attack', () => {
+  test('a generated_roots exemption added by the head does not reach the run', () => {
+    // This is the exact escalation from ADR-049's Context: the head declares
+    // `server/src` generated, and the identity check stops noticing source the
+    // build wrote. Under base governance the head's list is never consulted.
+    const head = contract();
+    head.config.generated_roots = ['server/src'];
+    const g = resolveGovernance({ base: contract(), head, baseSupplied: true });
+    assert.deepEqual(g.contract.config.generated_roots, []);
+    assert.equal(g.authority, 'base');
+  });
+
+  test('a head that narrows a fixture domain to one member does not reach the run', () => {
+    const base = contract({ fixtures: { profiles: { p: { verifier_chosen: [{ grade: { enum: ['A', 'B', 'C'] } }] } } } });
+    const head = contract({ fixtures: { profiles: { p: { verifier_chosen: [{ grade: { enum: ['A'] } }] } } } });
+    const g = resolveGovernance({ base, head, baseSupplied: true });
+    assert.deepEqual(g.contract.fixtures.profiles.p.verifier_chosen[0].grade.enum, ['A', 'B', 'C']);
+  });
+
+  test('a head that drops a journey does not reduce what runs', () => {
+    const base = contract({ features: [{ id: 'a' }, { id: 'b' }] });
+    const head = contract({ features: [{ id: 'a' }] });
+    const g = resolveGovernance({ base, head, baseSupplied: true });
+    assert.deepEqual(g.contract.features.map((f) => f.id), ['a', 'b']);
+  });
+});
+
+describe('the head still supplies what only the head can', () => {
+  test('build and launch commands come from the head — they must match its own tree', () => {
+    const head = contract();
+    head.config.build = 'npm run build:new';
+    head.config.launch.command = 'npm run start:new';
+    const g = resolveGovernance({ base: contract(), head, baseSupplied: true });
+    assert.equal(g.contract.config.build, 'npm run build:new');
+    assert.equal(g.contract.config.launch.command, 'npm run start:new');
+  });
+
+  test('but the semantic half of `launch` still comes from the base', () => {
+    const head = contract();
+    head.config.launch.fixture_profile = 'weaker';
+    head.config.launch.expect_seasons = 0;
+    const g = resolveGovernance({ base: contract(), head, baseSupplied: true });
+    assert.equal(g.contract.config.launch.fixture_profile, 'watson-poc');
+    assert.equal(g.contract.config.launch.expect_seasons, 2);
+  });
+});
+
+describe('an unattributed key fails the run rather than defaulting', () => {
+  test('a new top-level key is a contract problem, named', () => {
+    const head = contract();
+    head.config.exempt_everything = true;
+    const { problems } = governingConfig(contract().config, head.config);
+    assert.equal(problems.length, 1);
+    assert.match(problems[0], /`exempt_everything`/);
+    assert.match(problems[0], /not defaulted/);
+  });
+
+  test('a new `launch` field is too', () => {
+    const head = contract();
+    head.config.launch.skip_doctor = true;
+    const { problems } = governingConfig(contract().config, head.config);
+    assert.equal(problems.length, 1);
+    assert.match(problems[0], /`launch\.skip_doctor`/);
+  });
+
+  test('an unattributed key is not silently carried through either', () => {
+    const head = contract();
+    head.config.exempt_everything = true;
+    const { config } = governingConfig(contract().config, head.config);
+    assert.ok(!('exempt_everything' in config));
+  });
+
+  test('every classified key resolves to exactly one side', () => {
+    // Property, not instance: the map itself is the thing under test, so a value
+    // typo cannot leave a key silently unowned.
+    //
+    // THIS TEST IS NOT THE CONTROL, and it read as though it were. It checks the
+    // SHAPE of each value and nothing else, so `selection: 'head'` — the single
+    // token that reopens ADR-049's whole attack — satisfies it. See the exact
+    // table below, which is the actual control.
+    for (const [k, v] of Object.entries(CONFIG_AUTHORITY)) {
+      assert.ok(['base', 'head', 'split'].includes(v), `${k} -> ${v}`);
+    }
+    for (const [k, v] of Object.entries(LAUNCH_AUTHORITY)) {
+      assert.ok(['base', 'head'].includes(v), `${k} -> ${v}`);
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // THE AUTHORITY TABLE IS THE DECISION. PIN IT.
+  //
+  // Found by the exact-HEAD confirmation review (its N2) and reproduced before
+  // fixing: flipping a single token in `CONFIG_AUTHORITY` and running the whole
+  // suite —
+  //
+  //     contract_version   'base' -> 'head'    383/383 GREEN
+  //     selection          'base' -> 'head'    383/383 GREEN
+  //     identity           'base' -> 'head'    383/383 GREEN
+  //     injected_by_engine 'base' -> 'head'    383/383 GREEN
+  //     generated_roots    'base' -> 'head'    caught (2 red)
+  //     verdict_bearing_paths                  caught (2 red)
+  //
+  // Four of the six base-governed keys were unprotected, `selection` among them —
+  // the key whose head authorship lets a pull request declare `ignorable: ['**']`
+  // and skip itself to NOT_APPLICABLE / obligation satisfied, which the trusted
+  // side then classified green. Every end-to-end attack test above gives base and
+  // head the SAME `selection`, so none of them tests D1 applied to the one key D1
+  // is most about.
+  //
+  // The two that were caught were caught incidentally, by tests about scope and
+  // exemptions — not by anything guarding the table.
+  //
+  // WHY THE EXPECTED TABLE IS WRITTEN OUT HERE. An assertion whose subject is
+  // derived from the thing under test cannot fail: iterating `CONFIG_AUTHORITY`
+  // to check `CONFIG_AUTHORITY` shrinks with it. The literal below is an
+  // INDEPENDENT statement of the decision, so changing the module changes only
+  // one side of the comparison. Editing this table is then a deliberate, visible
+  // act that shows up in review as a change to the trust boundary — which is
+  // exactly what it is.
+  describe('the authority table itself', () => {
+    const EXPECTED_CONFIG_AUTHORITY = {
+      contract_version: 'base',
+      selection: 'base',
+      generated_roots: 'base',
+      verdict_bearing_paths: 'base',
+      identity: 'base',
+      injected_by_engine: 'base',
+      launch: 'split',
+      install: 'head',
+      provision: 'head',
+      build: 'head',
+      env: 'head',
+      browser: 'head',
+      engine: 'head',
+    };
+    const EXPECTED_LAUNCH_AUTHORITY = {
+      fixture_profile: 'base',
+      expect_seasons: 'base',
+      command: 'head',
+      health_path: 'head',
+      readiness_path: 'head',
+    };
+
+    test('is exactly this, key for key', () => {
+      assert.deepEqual({ ...CONFIG_AUTHORITY }, EXPECTED_CONFIG_AUTHORITY);
+      assert.deepEqual({ ...LAUNCH_AUTHORITY }, EXPECTED_LAUNCH_AUTHORITY);
+    });
+
+    // And the table is not decoration: for EVERY key the decision says the base
+    // owns, the base's value must actually be the one that reaches the run when
+    // the two sides disagree. Driven from the independent literal above, so it
+    // covers a key even if someone deletes it from `CONFIG_AUTHORITY`.
+    for (const [key, who] of Object.entries(EXPECTED_CONFIG_AUTHORITY)) {
+      if (who !== 'base') continue;
+      test(`\`${key}\` is taken from the BASE when the head disagrees`, () => {
+        const base = contract();
+        const head = contract();
+        // A value that is distinguishable and could not be produced by accident.
+        head.config[key] = { HEAD_AUTHORED: key };
+        const { config } = governingConfig(base.config, head.config);
+        assert.deepEqual(config[key], base.config[key],
+          `${key} came from the head; a pull request can author it`);
+        assert.notDeepEqual(config[key], head.config[key]);
+      });
+    }
+
+    for (const [key, who] of Object.entries(EXPECTED_CONFIG_AUTHORITY)) {
+      if (who !== 'head') continue;
+      test(`\`${key}\` is taken from the HEAD, because it must match the head's own tree`, () => {
+        const base = contract();
+        const head = contract();
+        head.config[key] = { HEAD_AUTHORED: key };
+        const { config } = governingConfig(base.config, head.config);
+        assert.deepEqual(config[key], head.config[key]);
+      });
+    }
+
+    for (const [key, who] of Object.entries(EXPECTED_LAUNCH_AUTHORITY)) {
+      test(`launch.${key} is taken from the ${who.toUpperCase()}`, () => {
+        const base = contract();
+        const head = contract();
+        head.config.launch = { ...head.config.launch, [key]: 'HEAD_AUTHORED' };
+        const { config } = governingConfig(base.config, head.config);
+        const expected = who === 'base' ? base.config.launch[key] : 'HEAD_AUTHORED';
+        assert.deepEqual(config.launch[key], expected);
+      });
+    }
+  });
+});
+
+describe('F7: the three cases that used to fail open', () => {
+  test('no base supplied withholds the product claim — it never falls back to head', () => {
+    const g = resolveGovernance({ head: contract(), baseSupplied: false });
+    assert.equal(g.authority, 'none');
+    assert.equal(g.product_claims_permitted, false);
+  });
+
+  test('a base revision with no contract is bootstrap, not head governance', () => {
+    const g = resolveGovernance({ base: null, head: contract(), baseSupplied: true });
+    assert.equal(g.authority, 'bootstrap');
+    assert.equal(g.product_claims_permitted, false);
+    assert.match(g.note, /becomes authoritative when it merges/);
+  });
+
+  test('a head-only journey does not run, and is reported rather than dropped', () => {
+    const head = contract({ features: [{ id: 'a' }, { id: 'brand-new' }] });
+    const g = resolveGovernance({ base: contract(), head, baseSupplied: true });
+    assert.deepEqual(g.head_only_features, ['brand-new']);
+    assert.deepEqual(g.contract.features.map((f) => f.id), ['a']);
+    assert.match(g.note, /did not run: brand-new/);
+  });
+});
+
+describe('the downgrade', () => {
+  for (const v of ['PASS', 'PASS_WITH_ADVISORIES', 'FAIL_PRODUCT']) {
+    test(`${v} is withheld when nothing governed the run`, () => {
+      const r = downgradeForUngovernedContract(v, { product_claims_permitted: false, note: 'x' }, PRODUCT_CLAIMS);
+      assert.equal(r.verdict, 'INDETERMINATE');
+      assert.match(r.reason, new RegExp(`^${v} withheld`));
+    });
+  }
+
+  test('FAIL_PRODUCT is withheld too — a governed accusation is the point, not just a governed pass', () => {
+    // Deliberate. An ungoverned run that reports FAIL_PRODUCT is making a claim
+    // about the product on semantics nobody trusted either.
+    const r = downgradeForUngovernedContract('FAIL_PRODUCT', { product_claims_permitted: false, note: 'x' }, PRODUCT_CLAIMS);
+    assert.equal(r.verdict, 'INDETERMINATE');
+  });
+
+  test('non-product verdicts pass through untouched', () => {
+    for (const v of ['BLOCKED_ENVIRONMENT', 'FAIL_CONTRACT', 'NOT_APPLICABLE', 'INDETERMINATE']) {
+      assert.equal(downgradeForUngovernedContract(v, { product_claims_permitted: false }, PRODUCT_CLAIMS).verdict, v);
+    }
+  });
+
+  test('a governed run keeps its verdict', () => {
+    assert.equal(downgradeForUngovernedContract('PASS', { product_claims_permitted: true }, PRODUCT_CLAIMS).verdict, 'PASS');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The wiring, exercised through the real entry point.
+//
+// Everything above tests `resolveGovernance` in isolation, which is exactly the
+// kind of test that has passed over a defect twice in this project: the module
+// was right and nothing called it. So these drive `watson verify` as a process,
+// against a synthetic product, and read the governing contract back out of the
+// canonical result the run wrote. No database is involved — the pre-flight
+// contract check terminates the run before bring-up, which is enough to prove
+// which contract the engine loaded and what it recorded.
+
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+const CLI = fileURLToPath(new URL('../src/cli.mjs', import.meta.url));
+
+function writeContract(root, { generatedRoots = [], featureIds = ['j1'], expectSeasons = 2, selection = null } = {}) {
+  const dir = path.join(root, '.watson');
+  fs.mkdirSync(path.join(dir, 'features'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'fixtures'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'config.yaml'), [
+    'contract_version: 4',
+    `generated_roots: ${JSON.stringify(generatedRoots)}`,
+    ...(selection ? [`selection: ${JSON.stringify(selection)}`] : []),
+    'identity: { issuer: "https://watson.local/x", client_id: "c" }',
+    'injected_by_engine: []',
+    // The run is stopped here, deliberately and before any database is created.
+    // What these tests are about is which contract the engine loaded and what it
+    // recorded about that — which is decided, and written to the envelope, well
+    // before bring-up.
+    'install: ["/bin/false"]', 'provision: []', 'build: []',
+    'env: {}', 'browser: {}', 'engine: {}',
+    'launch:',
+    '  command: "true"',
+    '  health_path: /api/health',
+    '  readiness_path: /api/health/db',
+    '  fixture_profile: p',
+    `  expect_seasons: ${expectSeasons}`,
+  ].join('\n'));
+  fs.writeFileSync(path.join(dir, 'identities.yaml'), 'identities: [{ id: A, role: admin, doctor: true }]\n');
+  fs.writeFileSync(path.join(dir, 'invariants.yaml'), 'invariants: []\n');
+  fs.writeFileSync(path.join(dir, 'fixtures', 'profiles.yaml'), 'profiles:\n  p:\n    command: "true"\n    emits: []\n');
+  for (const id of featureIds) {
+    fs.writeFileSync(path.join(dir, 'features', `${id}.md`), [
+      '---', `id: ${id}`, `title: ${id}`, 'status: mapped',
+      'personas: [A]', 'profiles: [poc]',
+      'steps:', '  - goto: /', '---', '', 'body',
+    ].join('\n'));
+  }
+  return dir;
+}
+
+function verify(repo, extra = []) {
+  const out = path.join(repo, 'result.json');
+  try {
+    // An explicit 40-hex SHA: `resolveSha` returns one as given without
+    // consulting git, so the synthetic product needs no repository.
+    execFileSync(process.execPath, [CLI, 'verify', '--repo', repo, '--out', out,
+      '--sha', '1'.repeat(40), ...extra],
+      { stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 });
+  } catch { /* a non-product verdict exits non-zero; the envelope is what matters */ }
+  return fs.existsSync(out) ? JSON.parse(fs.readFileSync(out, 'utf8')) : null;
+}
+
+describe('driving the real CLI', () => {
+  const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'watson-gov-'));
+
+  test('THE REPRODUCED ATTACK: the head\'s generated_roots never reaches the run', () => {
+    // The head declares `server/src` generated. The base does not. Under D1 the
+    // run must be conducted with the base's empty list.
+    const repo = tmp();
+    writeContract(repo, { generatedRoots: ['server/src'] });
+    const baseDir = tmp();
+    writeContract(baseDir, { generatedRoots: [] });
+
+    const env = verify(repo, ['--base-contract', baseDir]);
+    assert.ok(env, 'the run wrote no result');
+    assert.equal(env.governing_contract.authority, 'base');
+    assert.equal(env.governing_contract.product_claims_permitted, true);
+  });
+
+  test('with no base contract the run records that nothing governed it', () => {
+    const repo = tmp();
+    writeContract(repo);
+    const env = verify(repo);
+    assert.ok(env, 'the run wrote no result');
+    assert.equal(env.governing_contract.authority, 'none');
+    assert.equal(env.governing_contract.product_claims_permitted, false);
+    assert.ok(!['PASS', 'PASS_WITH_ADVISORIES', 'FAIL_PRODUCT'].includes(env.verdict), env.verdict);
+  });
+
+  test('a base revision without a contract is bootstrap, and makes no product claim', () => {
+    const repo = tmp();
+    writeContract(repo);
+    const env = verify(repo, ['--base-contract', tmp()]);
+    assert.equal(env.governing_contract.authority, 'bootstrap');
+    assert.ok(!['PASS', 'PASS_WITH_ADVISORIES', 'FAIL_PRODUCT'].includes(env.verdict), env.verdict);
+  });
+
+  test('a head-only journey is named in the result rather than silently absent', () => {
+    const repo = tmp();
+    writeContract(repo, { featureIds: ['j1', 'j2'] });
+    const baseDir = tmp();
+    writeContract(baseDir, { featureIds: ['j1'] });
+    const env = verify(repo, ['--base-contract', baseDir]);
+    assert.deepEqual(env.governing_contract.head_only_features, ['j2']);
+  });
+
+  test('an unattributed contract key stops the run before anything is provisioned', () => {
+    const repo = tmp();
+    const dir = writeContract(repo);
+    fs.appendFileSync(path.join(dir, 'config.yaml'), '\nexempt_everything: true\n');
+    const baseDir = tmp();
+    writeContract(baseDir);
+    const env = verify(repo, ['--base-contract', baseDir]);
+    assert.equal(env.verdict, 'FAIL_CONTRACT');
+    assert.ok(env.doctor.probes.some((p) => /exempt_everything/.test(p.detail)), JSON.stringify(env.doctor.probes));
+  });
+});
+
+describe('the gate is applied where the verdict is written', () => {
+  // Honest about what this is: a STRUCTURAL check, not an executed one. Driving
+  // a run all the way to PASS needs a database and a real application, which
+  // this suite does not have. The unit tests above establish that the gate
+  // withholds the right verdicts; this establishes that `finish` reaches it, and
+  // that it reaches it before the envelope is built. Between them the join is
+  // covered — a module that is correct and never called is the failure mode this
+  // project has already produced twice.
+  test('finish() runs the governing-contract gate before building the envelope', () => {
+    const src = fs.readFileSync(new URL('../src/cli.mjs', import.meta.url), 'utf8');
+    const body = src.slice(src.indexOf('function finish(runDir, run) {'));
+    const gate = body.indexOf('downgradeForUngovernedContract(');
+    const build = body.indexOf('buildEnvelope(run)');
+    assert.ok(gate > 0, 'finish() does not apply the governing-contract gate');
+    assert.ok(build > 0 && gate < build, 'the gate runs after the envelope is built');
+  });
+
+  test('the exact-head gate is still there — both hold, neither replaces the other', () => {
+    const src = fs.readFileSync(new URL('../src/cli.mjs', import.meta.url), 'utf8');
+    const body = src.slice(src.indexOf('function finish(runDir, run) {'));
+    assert.ok(body.includes('downgradeForInexactHead('), 'the exact-head gate was lost');
+  });
+});
+
+describe('the governing contract names ITSELF, not merely its authority', () => {
+  // A result that says "the base contract governed" is exactly what an
+  // ungoverned run would also produce if the claim were the only evidence. The
+  // trusted observer materialised the directory and knows the base SHA
+  // independently — it can only check the claim if the claim is specific.
+  test('base governance carries the base SHA and a content fingerprint', () => {
+    const g = resolveGovernance({
+      base: contract(), head: contract(), baseSupplied: true,
+      baseSha: 'b'.repeat(40), baseFingerprint: 'sha256:abc',
+    });
+    assert.equal(g.sha, 'b'.repeat(40));
+    assert.equal(g.fingerprint, 'sha256:abc');
+  });
+
+  test('an ungoverned run carries neither', () => {
+    const g = resolveGovernance({ head: contract(), baseSupplied: false, baseSha: 'b'.repeat(40) });
+    assert.equal(g.sha, null);
+    assert.equal(g.fingerprint, null);
+  });
+
+  test('bootstrap names the base SHA but has no contract to fingerprint', () => {
+    const g = resolveGovernance({ base: null, head: contract(), baseSupplied: true, baseSha: 'b'.repeat(40) });
+    assert.equal(g.authority, 'bootstrap');
+    assert.equal(g.fingerprint, null);
+  });
+});
+
+describe('the contract fingerprint is a fact about content', () => {
+  const mk = (files) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'watson-cf-'));
+    for (const [rel, body] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+      fs.writeFileSync(path.join(dir, rel), body);
+    }
+    return dir;
+  };
+
+  test('the same content in two places digests identically', () => {
+    const a = mk({ '.watson/config.yaml': 'x: 1\n', '.watson/features/j.md': 'j' });
+    const b = mk({ '.watson/config.yaml': 'x: 1\n', '.watson/features/j.md': 'j' });
+    assert.equal(contractDirFingerprint(a), contractDirFingerprint(b));
+    assert.match(contractDirFingerprint(a), /^sha256:[0-9a-f]{64}$/);
+  });
+
+  test('one changed byte changes it', () => {
+    const a = mk({ '.watson/config.yaml': 'x: 1\n' });
+    const b = mk({ '.watson/config.yaml': 'x: 2\n' });
+    assert.notEqual(contractDirFingerprint(a), contractDirFingerprint(b));
+  });
+
+  test('an added or removed file changes it', () => {
+    const a = mk({ '.watson/config.yaml': 'x: 1\n' });
+    const b = mk({ '.watson/config.yaml': 'x: 1\n', '.watson/features/extra.md': 'e' });
+    assert.notEqual(contractDirFingerprint(a), contractDirFingerprint(b));
+  });
+
+  test('an empty or absent directory has no fingerprint, rather than a fake one', () => {
+    assert.equal(contractDirFingerprint(mk({})), null);
+    assert.equal(contractDirFingerprint('/nonexistent/watson-cf'), null);
+  });
+
+  test('a symlink is recorded as a link, never followed', () => {
+    // Following one would digest whatever it points at rather than what the
+    // directory contains — the same reason `loadContract` refuses a `.watson`
+    // symlink outright.
+    const real = mk({ 'elsewhere/config.yaml': 'secret\n' });
+    const d = fs.mkdtempSync(path.join(os.tmpdir(), 'watson-cf-'));
+    fs.mkdirSync(path.join(d, '.watson'));
+    fs.symlinkSync(path.join(real, 'elsewhere', 'config.yaml'), path.join(d, '.watson', 'config.yaml'));
+    const first = contractDirFingerprint(d);
+    fs.writeFileSync(path.join(real, 'elsewhere', 'config.yaml'), 'changed\n');
+    assert.equal(contractDirFingerprint(d), first, 'the digest followed the link');
+  });
+});
+
+describe('operational config movement is visible on its own', () => {
+  const cfg = (over = {}) => ({ ...contract().config, ...over });
+
+  test('an unchanged launch surface reports changed: false', () => {
+    const r = operationalConfigChange(cfg(), cfg());
+    assert.equal(r.changed, false);
+    assert.deepEqual(r.changed_keys, []);
+  });
+
+  test('a changed launch command is named', () => {
+    const head = cfg();
+    head.launch = { ...head.launch, command: 'npm run start:other' };
+    const r = operationalConfigChange(cfg(), head);
+    assert.equal(r.changed, true);
+    assert.deepEqual(r.changed_keys, ['launch.command']);
+  });
+
+  test('build and provision changes are named too, not folded away', () => {
+    const r = operationalConfigChange(cfg(), cfg({ build: 'x', provision: 'y' }));
+    assert.deepEqual(r.changed_keys.sort(), ['build', 'provision']);
+  });
+
+  test('the SEMANTIC half of the contract does not appear here', () => {
+    // Those are base-governed and reported as contract change; mixing them in
+    // would make this field mean two different things.
+    const r = operationalConfigChange(cfg(), cfg({ generated_roots: ['server/src'] }));
+    assert.deepEqual(r.changed_keys, []);
+    assert.ok(!r.keys.includes('generated_roots'));
+  });
+
+  test('with no base contract, `changed` is null rather than a guess', () => {
+    assert.equal(operationalConfigChange(null, cfg()).changed, null);
+  });
+});
+
+describe('an ungoverned run cannot report NOT_APPLICABLE either', () => {
+  // THE ATTACK THIS CLOSES, demonstrated by independent review with a full
+  // engine run: the head contract declares `ignorable: ["**"]` with empty
+  // `runtime_roots`, so a diff touching identity enforcement, an auth guard and
+  // a repository is "positively established as non-runtime". Zero journeys, exit
+  // 0, `obligation: satisfied` — and the trusted validator accepted it.
+  //
+  // `NOT_APPLICABLE` is not a statement about Watson. It says THIS REVISION
+  // needed no verification, which is a claim about the revision, decided by
+  // `selection` rules that in the ungoverned state come from the pull request.
+  test('NOT_APPLICABLE is withheld when nothing governed the run', () => {
+    const r = downgradeForUngovernedContract(
+      'NOT_APPLICABLE', { product_claims_permitted: false, note: 'nothing governed. ' },
+      WITHHELD_WITHOUT_GOVERNANCE);
+    assert.equal(r.verdict, 'INDETERMINATE');
+  });
+
+  test('and it is kept when a trusted contract DID govern', () => {
+    const r = downgradeForUngovernedContract(
+      'NOT_APPLICABLE', { product_claims_permitted: true }, WITHHELD_WITHOUT_GOVERNANCE);
+    assert.equal(r.verdict, 'NOT_APPLICABLE');
+  });
+
+  test('the withheld set is strictly wider than the product-claim set', () => {
+    // Stated as a property so the two cannot be silently unified again: the
+    // difference between them IS this finding.
+    for (const v of PRODUCT_CLAIMS) assert.ok(WITHHELD_WITHOUT_GOVERNANCE.has(v), v);
+    assert.ok(WITHHELD_WITHOUT_GOVERNANCE.has('NOT_APPLICABLE'));
+    assert.ok(!PRODUCT_CLAIMS.has('NOT_APPLICABLE'));
+  });
+
+  test('an obligation is never satisfied by an ungoverned run', () => {
+    // The end-to-end property, over every verdict the engine can reach.
+    for (const v of ['PASS', 'PASS_WITH_ADVISORIES', 'FAIL_PRODUCT', 'NOT_APPLICABLE',
+      'FAIL_CONTRACT', 'BLOCKED_ENVIRONMENT', 'INDETERMINATE']) {
+      const out = downgradeForUngovernedContract(
+        v, { product_claims_permitted: false, note: 'x. ' }, WITHHELD_WITHOUT_GOVERNANCE);
+      assert.notEqual(checkFor(out.verdict).obligation, 'satisfied',
+        `${v} -> ${out.verdict} still satisfied the obligation without a governing contract`);
+    }
+  });
+});
+
+describe('applicable with an empty plan is a contract fault, not a skip', () => {
+  test('the run cannot report a satisfied obligation over zero journeys', () => {
+    const r = runVerdict({ executed: [], plan: [], applicable: true });
+    assert.equal(r.verdict, 'FAIL_CONTRACT');
+    assert.match(r.reason, /selected no journeys at all/);
+  });
+
+  test('a genuine up-front skip is untouched', () => {
+    assert.equal(runVerdict({ executed: [], plan: [], applicable: false }).verdict, 'NOT_APPLICABLE');
+  });
+});
+
+describe('an unreadable base contract is not a bootstrap', () => {
+  // COULD NOT READ IS NOT THE SAME AS DOES NOT EXIST, one layer below the base
+  // tree's version of the same distinction and load-bearing for the same field.
+  //
+  // `cli.mjs` reduced "loadContract threw" and "there is no .watson/" to the
+  // same null, and this function then told the reader the base revision carries
+  // no verification contract. Reproduced against a real unparseable base
+  // contract before this changed: `authority: bootstrap` with that note, which
+  // is false.
+  //
+  // Bootstrap is a legitimate, expected state — the pull request that first
+  // introduces the contract. An unparseable base contract is a harness or
+  // authoring fault, and reporting the second as the first hides it.
+  const head = { config: {}, features: [] };
+
+  test('a genuine bootstrap still reads as a bootstrap', () => {
+    const g = resolveGovernance({ base: null, head, baseSupplied: true, baseSha: 'b'.repeat(40) });
+    assert.equal(g.authority, 'bootstrap');
+    assert.match(g.note, /carries no verification contract/);
+    assert.equal(g.base_contract_error, null);
+  });
+
+  test('an unreadable one says so, and does not claim the base has no contract', () => {
+    const g = resolveGovernance({
+      base: null, head, baseSupplied: true, baseSha: 'b'.repeat(40),
+      baseError: 'Nested mappings are not allowed at line 1',
+    });
+    assert.match(g.note, /could not be READ/);
+    assert.match(g.note, /Nested mappings/);
+    assert.doesNotMatch(g.note, /carries no verification contract/,
+      'an unreadable base contract was reported as an absent one');
+    assert.equal(g.base_contract_error, 'Nested mappings are not allowed at line 1');
+  });
+
+  test('both withhold the product claim — the verdict is unchanged, only the reason is true', () => {
+    for (const baseError of [null, 'boom']) {
+      const g = resolveGovernance({ base: null, head, baseSupplied: true, baseSha: 'b'.repeat(40), baseError });
+      assert.equal(g.authority, 'bootstrap');
+      assert.equal(g.product_claims_permitted, false);
+    }
+  });
+
+  test('the CLI distinguishes them — an absent .watson is not an error', async () => {
+    // The join. `cli.mjs` must classify `loadContract`'s failure, and the one
+    // failure that is NOT an error is the missing directory.
+    const src = fs.readFileSync(new URL('../src/cli.mjs', import.meta.url), 'utf8');
+    const m = src.match(/catch \(err\) \{[\s\S]{0,400}?baseContractError = err\.message;/);
+    assert.ok(m, 'cli.mjs no longer classifies the base-contract load failure');
+    assert.match(m[0], /has no \\\.watson/,
+      'the missing-directory case is not excluded, so a genuine bootstrap would report an error');
+  });
+});
+
+describe('THE ATTACK: an ungoverned run cannot skip itself green', () => {
+  // Demonstrated end to end by independent adversarial review. With no governing
+  // contract the PULL REQUEST authors `selection`, so a head declaring
+  // `ignorable: ["**"]` with empty `runtime_roots` makes every change
+  // non-runtime. The run drove ZERO journeys and reported NOT_APPLICABLE with
+  // `obligation: satisfied` — indistinguishable from a correct skip, over a diff
+  // that in the reviewer's run touched identity enforcement, an auth guard and a
+  // repository.
+  //
+  // Driven through the real CLI, because the unit test above proves the gate and
+  // this proves the gate is reached.
+  const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'watson-skip-'));
+
+  const ATTACK_SELECTION = {
+    runtime_roots: [], governing_roots: [], cross_cutting: [],
+    ignorable: ['**'], escalation_profile: 'poc',
+  };
+
+  /** A product git repo with two commits, so impact selection has a real diff. */
+  function repoWithDiff(selection) {
+    const dir = tmp();
+    const g = (...a) => execFileSync('git', a, { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'] });
+    g('init', '-q', '-b', 'main');
+    g('config', 'user.email', 'w@example.invalid');
+    g('config', 'user.name', 'w');
+    fs.mkdirSync(path.join(dir, 'server', 'src'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'server', 'src', 'enforcement.ts'), 'export const v = 1;\n');
+    writeContract(dir, { selection });
+    g('add', '-A'); g('commit', '-q', '-m', 'base');
+    const base = g('rev-parse', 'HEAD').toString().trim();
+    fs.writeFileSync(path.join(dir, 'server', 'src', 'enforcement.ts'), 'export const v = 2;\n');
+    g('add', '-A'); g('commit', '-q', '-m', 'head');
+    return { dir, base, head: g('rev-parse', 'HEAD').toString().trim() };
+  }
+
+  /**
+   * THE TWO TRUSTED SIDES, supplied the way the observer supplies them.
+   *
+   * Since D1 the engine takes base-side content from a trusted materialisation
+   * and head-side content from the trusted manifest, rather than running git
+   * against the product clone for either. These end-to-end tests must therefore
+   * hand it both, or they exercise the fail-conservative path instead of the
+   * attack — which is exactly what happened when the fix first landed: three
+   * subtests here went red because the diff was no longer computable, not
+   * because the gate had moved.
+   */
+  const trustedSides = (repo) => {
+    const baseTree = tmp();
+    const tar = execFileSync('git', ['archive', '--format=tar', repo.base],
+      { cwd: repo.dir, maxBuffer: 64 * 1024 * 1024 });
+    const t = path.join(baseTree, 'x.tar');
+    fs.writeFileSync(t, tar);
+    execFileSync('tar', ['-xf', t, '-C', baseTree]);
+    fs.unlinkSync(t);
+
+    const manifestPath = path.join(tmp(), 'manifest.json');
+    fs.writeFileSync(manifestPath, JSON.stringify(buildManifest(repo.dir, { sha: repo.head })));
+    return ['--base-tree', baseTree, '--manifest', manifestPath];
+  };
+
+  const run = (repo, extra) => {
+    const out = path.join(repo.dir, 'result.json');
+    try {
+      execFileSync(process.execPath, [CLI, 'verify', '--repo', repo.dir, '--out', out,
+        '--sha', repo.head, '--base', repo.base, ...trustedSides(repo), ...extra],
+      { stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 });
+    } catch { /* a non-product verdict exits non-zero */ }
+    return JSON.parse(fs.readFileSync(out, 'utf8'));
+  };
+
+  test('the head declares every change ignorable, and nothing governs: NOT NOT_APPLICABLE', () => {
+    const repo = repoWithDiff(ATTACK_SELECTION);
+    const env = run(repo, ['--base-contract', tmp()]);       // supplied but empty -> bootstrap
+    assert.equal(env.governing_contract.authority, 'bootstrap');
+    assert.notEqual(env.verdict, 'NOT_APPLICABLE');
+    assert.equal(env.verdict, 'INDETERMINATE');
+    assert.notEqual(env.check.obligation, 'satisfied');
+  });
+
+  test('...and with no base contract supplied at all, the same', () => {
+    const repo = repoWithDiff(ATTACK_SELECTION);
+    const env = run(repo, []);
+    assert.equal(env.governing_contract.authority, 'none');
+    assert.equal(env.verdict, 'INDETERMINATE');
+    assert.notEqual(env.check.obligation, 'satisfied');
+  });
+
+  test('a GOVERNED skip is still a legitimate NOT_APPLICABLE', () => {
+    // The fix must not turn every genuine skip into an INDETERMINATE — that
+    // would be the opposite failure, and it is what makes this a boundary rather
+    // than a blanket refusal.
+    const repo = repoWithDiff(ATTACK_SELECTION);
+    const baseContract = tmp();
+    writeContract(baseContract, { selection: ATTACK_SELECTION });
+    const env = run(repo, ['--base-contract', baseContract]);
+    assert.equal(env.governing_contract.authority, 'base');
+    assert.equal(env.verdict, 'NOT_APPLICABLE');
+    assert.equal(env.check.obligation, 'satisfied');
+  });
+});

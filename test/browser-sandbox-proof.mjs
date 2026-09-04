@@ -71,7 +71,14 @@ function renderers() {
     for (const kind of ['user', 'pid', 'net']) {
       try { ns[kind] = fs.readlinkSync(`/proc/${pid}/ns/${kind}`); } catch { ns[kind] = null; }
     }
-    out.push({ pid, seccomp: field('Seccomp'), noNewPrivs: field('NoNewPrivs'), ns });
+    // TOKENISED ON NUL *AND* WHITESPACE, and that is not defensive padding.
+    // `/proc/<pid>/cmdline` is normally NUL-separated, but Chromium rewrites its
+    // own process title, so a renderer's whole command line arrives as ONE
+    // element. Splitting on NUL alone produced a single token that matched
+    // nothing, and the flag check below reported "clean" on a browser that was
+    // demonstrably started with --no-sandbox.
+    const argv = cmdline.split(/[\0\s]+/).filter(Boolean);
+    out.push({ pid, argv, seccomp: field('Seccomp'), noNewPrivs: field('NoNewPrivs'), ns });
   }
   return out;
 }
@@ -123,7 +130,28 @@ for (const [label, options] of [
 }
 
 if (!measured.length) fail('no browser started at all');
-ok(`Chromium started with no --no-sandbox flag (${measured.length} build(s) measured)`);
+
+// THIS ASSERTION USED TO BE VACUOUS, and it is the one that would have found the
+// root cause. It printed "Chromium started with no --no-sandbox flag" on the
+// strength of `measured.length` being non-zero — it never looked at a command
+// line. Meanwhile playwright-core was adding the flag itself:
+//
+//     if (options.chromiumSandbox !== true) chromeArguments.push('--no-sandbox');
+//
+// so the browser carried `--no-sandbox` on every run while `src/` contained no
+// such string and a grep of `src/` said so. The flag now has to be absent from
+// the argv of the PROCESSES WE ACTUALLY STARTED, which is the only place the
+// question can be answered.
+for (const m of measured) {
+  const flagged = m.renderers.filter((r) => r.argv.some((a) => a === '--no-sandbox'));
+  if (flagged.length) {
+    fail(`${flagged.length}/${m.renderers.length} renderer(s) of ${m.label} were started with `
+      + `--no-sandbox (pids ${flagged.map((r) => r.pid).join(', ')}). Watson does not put it there; `
+      + `Playwright adds it unless \`chromiumSandbox: true\` is passed to launch().`);
+  }
+}
+ok(`no renderer of any measured build carries --no-sandbox `
+  + `(${measured.reduce((n, m) => n + m.renderers.length, 0)} renderer(s) inspected)`);
 
 const best = measured.find((m) => m.label === WATSON_BUILD);
 if (!best) fail(`the build Watson drives (${WATSON_BUILD}) did not start`);

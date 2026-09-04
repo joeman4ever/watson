@@ -44,6 +44,27 @@ const OBLIGATION = {
 export const PRODUCT_CLAIMS = new Set(['PASS', 'PASS_WITH_ADVISORIES', 'FAIL_PRODUCT']);
 
 /**
+ * Verdicts an UNGOVERNED run may not reach.
+ *
+ * Wider than `PRODUCT_CLAIMS`, and the difference is the whole point.
+ * `NOT_APPLICABLE` is not a statement about Watson — it says *this revision
+ * needed no verification*, which is a claim about the revision, decided by the
+ * contract's `selection` rules.
+ *
+ * When nothing governs the run those rules come from the PULL REQUEST. A head
+ * contract declaring `ignorable: ["**"]` with empty `runtime_roots` then makes
+ * every change non-runtime, the run drives zero journeys, and it reports
+ * `NOT_APPLICABLE` with `obligation: satisfied` — indistinguishable from a
+ * correct skip, while the product chose the semantics that produced it.
+ *
+ * Demonstrated by independent adversarial review with a full engine run: a diff
+ * touching `identity/enforcement.ts`, an auth guard and a repository was
+ * "positively established as non-runtime", 0 journeys, exit 0, and the trusted
+ * validator accepted it.
+ */
+export const WITHHELD_WITHOUT_GOVERNANCE = new Set([...PRODUCT_CLAIMS, 'NOT_APPLICABLE']);
+
+/**
  * A product claim requires that the source driven actually IS the revision
  * reported (Phase-1 defect W2, now a standing invariant).
  *
@@ -107,9 +128,109 @@ export function rollUp(features) {
   if (!features.length) return 'NOT_APPLICABLE';
   if (has('FAIL_PRODUCT')) return 'FAIL_PRODUCT';
   if (has('FAIL_CONTRACT')) return 'FAIL_CONTRACT';
+  // A feature that ended BLOCKED_ENVIRONMENT did not verify anything, and used
+  // to fall through to PASS because nothing named it here. Found by the
+  // run-level property test, not by any test of this function.
+  if (has('BLOCKED_ENVIRONMENT')) return 'BLOCKED_ENVIRONMENT';
   if (has('INDETERMINATE')) return 'INDETERMINATE';
   if (has('PASS_WITH_ADVISORIES')) return 'PASS_WITH_ADVISORIES';
   return 'PASS';
+}
+
+/**
+ * The RUN-LEVEL verdict: what the whole run may claim, given what executed and
+ * what was planned.
+ *
+ * Extracted from `cli.mjs` so the property below is testable where it actually
+ * holds. Two defects lived in that inline code, both of them silent
+ * under-verification on the verdict path:
+ *
+ *   - a failing SETUP journey was excluded from the roll-up, so a prerequisite
+ *     failure aborted its dependants and the run reported PASS over whatever had
+ *     already executed;
+ *   - the aborted dependants vanished entirely, so the run reported on a subset
+ *     without saying it was a subset.
+ *
+ * THE PROPERTY, stated once and enforced here:
+ *
+ *     a prerequisite failure cannot make verification coverage disappear
+ *     while the run reports PASS or PASS_WITH_ADVISORIES.
+ *
+ * It holds for every failure kind, not only FAIL_PRODUCT — a dependency that
+ * fails its contract or its environment leaves its dependants just as unable to
+ * execute meaningfully.
+ */
+export function runVerdict({ executed = [], plan = [], applicable = true } = {}) {
+  // SELECTED, APPLICABLE, AND NOTHING TO RUN IS A CONTRACT FAULT.
+  //
+  // `rollUp([])` answers `NOT_APPLICABLE`, which is right for a run that
+  // decided up front there was nothing to verify — and wrong for one that
+  // decided there WAS and then found no journeys: an escalation profile with no
+  // members, a profile fallback matching nothing. That run drove nothing and
+  // would report a satisfied obligation. Same defect class as an ungoverned
+  // `NOT_APPLICABLE`; named here rather than left to the caller.
+  if (applicable && !plan.length) {
+    return {
+      verdict: 'FAIL_CONTRACT',
+      reason: 'the run was applicable but the contract selected no journeys at all — '
+        + 'nothing was verified, and that is a contract fault rather than a skip',
+      notAttempted: [],
+    };
+  }
+  const verdict = rollUp(executed);
+
+  const attempted = new Set(executed.map((f) => f.id));
+  const notAttempted = plan
+    .filter((p) => p.role === 'verified' && !attempted.has(p.feature?.id ?? p.id))
+    .map((p) => p.feature?.id ?? p.id);
+
+  const failed = executed.filter((f) => f.verdict === 'FAIL_PRODUCT');
+  const drift = executed.filter((f) => f.verdict === 'FAIL_CONTRACT');
+
+  // A selected journey that produced no result at all cannot be spoken for, so a
+  // verdict that DISCHARGES THE OBLIGATION becomes INDETERMINATE.
+  //
+  // Not "PASS-shaped". That was the set, and it let the one case it was written
+  // for slip past: `rollUp([])` returns NOT_APPLICABLE, which is not PASS-shaped,
+  // so a run where NOTHING executed and journeys were selected came back as
+  //
+  //     NOT_APPLICABLE | obligation satisfied | "1 selected journey(s) never ran (j1)"
+  //
+  // — a verdict and a reason that contradict each other, discharging the
+  // verification duty over journeys that did not run. Found by the exact-HEAD
+  // confirmation review (its N5) and reproduced above before this changed.
+  //
+  // The right membership test is the one the obligation table already makes:
+  // PASS, PASS_WITH_ADVISORIES and NOT_APPLICABLE all report `satisfied`, and
+  // none of them may stand over a journey that never ran. It is the same
+  // correction as `WITHHELD_WITHOUT_GOVERNANCE` — the wider set, for the same
+  // reason: NOT_APPLICABLE says *this revision needed no runtime verification*,
+  // which is a claim, not an abstention.
+  //
+  // FAIL_PRODUCT is deliberately NOT here even though it is a product claim: a
+  // run that established a real failure keeps it. The failure is evidence, the
+  // incompleteness is additional, and converting the finding into INDETERMINATE
+  // would hide it. `PRODUCT_CLAIMS` includes FAIL_PRODUCT and is the wrong set.
+  const DISCHARGES_OBLIGATION = new Set(['PASS', 'PASS_WITH_ADVISORIES', 'NOT_APPLICABLE']);
+  if (notAttempted.length && DISCHARGES_OBLIGATION.has(verdict)) {
+    return {
+      verdict: 'INDETERMINATE',
+      reason: `${notAttempted.length} selected journey(s) never ran (${notAttempted.join(', ')}), `
+        + 'so this run cannot speak for them',
+      notAttempted,
+    };
+  }
+  return {
+    verdict,
+    reason: failed.length
+      ? `${failed.length} of ${executed.length} feature(s) failed their proof`
+      : drift.length
+        ? `${drift.length} feature(s) could not be verified — the map names something that no longer exists`
+        : notAttempted.length
+          ? `${notAttempted.length} selected journey(s) never ran (${notAttempted.join(', ')})`
+          : `${executed.length} feature(s) met their proof`,
+    notAttempted,
+  };
 }
 
 export function buildEnvelope(run) {
@@ -130,11 +251,34 @@ export function buildEnvelope(run) {
     head_sha: run.headSha,
     base_sha: run.baseSha ?? null,
     // Whether the checkout actually matched the SHA above.
+    // `product_identity` because that is what it is. It was `working_tree` when
+    // the answer came from `git status`; `working_tree` stays as an alias so a
+    // consumer reading it does not silently start seeing `undefined` — which, on
+    // a field that gates product claims, would read as "not exact" and turn every
+    // run INDETERMINATE.
+    product_identity: run.workingTree ?? null,
     working_tree: run.workingTree ?? null,
+
+    // THE MANIFEST THAT ESTABLISHED IDENTITY, recorded in the envelope.
+    //
+    // `cli.mjs` computed this and never emitted it, so the trusted validator's
+    // `d.manifest?.sha !== expect.headSha` check could not fire: the key was
+    // always undefined and the `&&` short-circuited. A second silently-skipped
+    // trusted-side check, found by the fixture canary that was written after
+    // the first one (`schema` vs `schema_version`) was found by review.
+    //
+    // It is also provenance worth having on its own: which manifest, describing
+    // how many entries, spoke for this run's product identity.
+    manifest: run.manifest ?? null,
 
     // Recorded ALWAYS; NOT consulted for carry-forward in phase 0/1.
     product_fingerprint: run.productFingerprint,
     contract_fingerprint: run.contractFingerprint,
+    // What that fingerprint covered. `.watson/` plus everything the contract
+    // NAMES but does not contain — the fixture script, the package scripts, the
+    // lockfile, the migrations (ADR-049 D2). Recorded because a digest whose
+    // scope is invisible cannot be checked by the person reading it.
+    contract_scope: run.contractScope ?? null,
     // The fingerprint pins the exact contract BYTES, which is the stronger fact.
     // The declared version is recorded beside it because it is what the engine
     // negotiated against — a reader comparing two observations wants to know the
@@ -142,11 +286,76 @@ export function buildEnvelope(run) {
     contract_version: run.contractVersion ?? null,
     carried_forward_from: null,
 
-    contract_change: !!run.contractChange,
+    // THREE STATES, AND THE ENVELOPE MUST CARRY ALL THREE.
+    //
+    // This was `!!run.contractChange`, and `contractChange` now returns a
+    // TRUTHY object for an unavailable comparison — so an unobtainable base
+    // reported `contract_change: true`. That is the exact collapse the D1
+    // disposition forbids ("unavailable → changed"), reintroduced one layer
+    // above the function that was fixed to prevent it. Caught by reading the
+    // envelope rather than the function.
+    //
+    // `contract_change` now means what its documented semantics say and nothing
+    // wider: verdict-bearing contract material in the EVALUATED HEAD differs
+    // from the GOVERNING TRUSTED BASE. It is not a claim about who authored the
+    // difference — see `contract_comparison`.
+    contract_change: run.contractChange?.comparison !== 'unavailable' && !!run.contractChange,
+    // The state itself, named, so a reader never has to infer it from a boolean
+    // that cannot express three things.
+    contract_comparison: run.contractChange
+      ? (run.contractChange.comparison === 'unavailable' ? 'unavailable' : 'diverged')
+      : 'equivalent',
+    // THE THIRD COLLAPSE, and the one that shipped.
+    //
+    // This default was `{ model: 'head-product-x-head-contract',
+    // base_contract_available: false }` for every run where `contractChange`
+    // returned null — and since D1, null means BOTH trusted sides were read and
+    // AGREED. So the field asserted the base was unavailable in exactly the case
+    // where it demonstrably was available, on every base-governed run with an
+    // unchanged contract. `base_contract_available` must be factual in both
+    // directions; a false negative is as much a lie as a false positive, and it
+    // is the one that was being emitted.
+    //
+    // The `model` string was wrong for the same reason — `result.mjs`'s own
+    // `governing_contract` comment already says `head-product-x-head-contract`
+    // "under D1 is simply false" for a governed run.
     contract_evaluation: run.contractChange ?? {
-      model: 'head-product-x-head-contract',
-      base_contract_available: false,
+      model: run.governance?.authority === 'base' ? 'trusted-base-x-trusted-head' : 'head-product-x-head-contract',
+      base_contract_available: run.governance?.authority === 'base',
+      comparison: 'equivalent',
     },
+
+    // WHICH CONTRACT DECIDED THIS VERDICT (ADR-049 F9).
+    //
+    // Before this key existed, a base-governed run was still labelled with the
+    // head's `contract_version` and `contract_fingerprint`, and the model string
+    // above said `head-product-x-head-contract` — which under D1 is simply
+    // false. A reader could not tell a governed run from an ungoverned one, and
+    // neither could `validate-result.mjs`.
+    //
+    // `authority` is the whole answer: `base` means a trusted contract governed;
+    // `none` and `bootstrap` mean nothing did, and the product claim was
+    // withheld for that reason.
+    governing_contract: run.governance
+      ? {
+          authority: run.governance.authority,
+          product_claims_permitted: run.governance.product_claims_permitted,
+          head_only_features: run.governance.head_only_features ?? [],
+          // WHICH base contract, not merely that there was one. The trusted
+          // observer materialised it and knows the base SHA independently, so it
+          // can compare both and reject a mismatch — without them the field is
+          // a self-report and provenance is decorative.
+          sha: run.governance.sha ?? null,
+          fingerprint: run.governance.fingerprint ?? null,
+          note: markerSafe(run.governance.note ?? ''),
+        }
+      : null,
+
+    // How the product was LAUNCHED, on its own rather than inside the
+    // whole-contract digest. Head-authored, untrusted, product-plane only — and
+    // conspicuous, because a reviewer must be able to see that this pull request
+    // changed the commands Watson ran to start the thing it verified.
+    operational_config: run.operationalConfig ?? null,
 
     profile: run.profile,
     verdict,
@@ -202,6 +411,10 @@ export function buildEnvelope(run) {
     },
 
     selection: run.selection,
+    // Selected journeys that produced no result at all — a prerequisite failed
+    // and the loop stopped. Named, because a run that quietly reports on the
+    // subset which happened to execute is under-verifying without saying so.
+    not_attempted: run.notAttempted ?? [],
     doctor: run.doctor,
     features: run.features,
     runtime_findings: run.findings,
@@ -330,8 +543,25 @@ export function summary(env) {
   L.push(`**Signals** — console errors ${q.console_errors} · warnings ${q.console_warnings} · 5xx ${q.http_5xx} · unexpected 4xx ${q.unexpected_4xx} · failed requests ${q.failed_requests} · raw UUIDs ${q.raw_uuid_visible}`);
   L.push('');
 
-  if (env.contract_change) {
-    L.push('### ⚠ This PR changes the verification contract');
+  if (env.contract_comparison === 'unavailable') {
+    // Said out loud, and NOT as a change. The trusted material for one side was
+    // not obtainable, so no comparison happened; reporting that as a contract
+    // change would be inventing a finding, and reporting it as silence would be
+    // inventing an assurance.
+    L.push('### ⚠ The verification contract comparison could not be made');
+    L.push(safe(env.contract_evaluation?.why ?? 'trusted comparison material was unavailable'));
+    L.push('');
+    L.push('_Neither "changed" nor "unchanged" is asserted. Verification escalates rather than narrowing._');
+    L.push('');
+  } else if (env.contract_change) {
+    // DIVERGENCE FROM THE GOVERNING BASE, not authorship.
+    //
+    // This heading used to read "This PR changes the verification contract",
+    // and after D1 that statement can be false: the diff is now governing-base
+    // tip vs evaluated head, so a contract change landing on the base branch
+    // while this head stays stale diverges without this pull request having
+    // authored anything. The reader is told what was measured.
+    L.push('### ⚠ The head differs from the governing verification contract');
     const ce = env.contract_evaluation;
     if (ce.expectations_weakened?.length) {
       L.push('Expectations **weakened**:');
@@ -341,18 +571,18 @@ export function summary(env) {
     if (ce.features_added?.length) L.push(`Features added: ${ce.features_added.map((f) => `\`${safe(f)}\``).join(', ')}`);
     if (ce.invariants_added?.length) L.push(`Invariants added: ${ce.invariants_added.map((f) => `\`${safe(f)}\``).join(', ')}`);
     if (ce.base_contract_available === false) {
-      L.push('The base contract could not be read, so only the FACT of a change is reported — review the `.watson/` diff directly.');
+      L.push('The base contract itself could not be loaded, so only the FACT of divergence is reported — review the `.watson/` diff directly.');
     } else if (!ce.expectations_weakened?.length && !ce.features_removed?.length) {
       // Say this explicitly. A bare heading with nothing under it reads as
       // "something was weakened and Watson could not name it".
       L.push('No expectation was removed or weakened: every feature, step and invariant present at the base is still present and still in scope.');
     }
     L.push('');
-    L.push('_A PR must not be able to weaken its own verification expectation and thereby manufacture its own PASS. Sherlock is the independent reviewer of whether this change is legitimate. Watson REPORTS this in Phase 0/1; it does not gate on it._');
+    L.push('_Divergence is measured between the GOVERNING BASE and the EVALUATED HEAD, so it does not by itself mean this pull request authored the difference — a contract change on the base branch diverges from a stale head too. A PR must not be able to weaken its own verification expectation and thereby manufacture its own PASS; Sherlock is the independent reviewer of whether the difference is legitimate. Watson REPORTS this in Phase 0/1; it does not gate on it._');
     L.push('');
   }
 
-  const wt = env.working_tree;
+  const wt = env.product_identity ?? env.working_tree;
   if (wt && wt.exact_head === false) {
     L.push('### ⚠ This run is NOT bound to the SHA it reports');
     L.push(

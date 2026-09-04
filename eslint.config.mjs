@@ -10,6 +10,9 @@ export default [
       sourceType: 'module',
       globals: {
         process: 'readonly', console: 'readonly', URL: 'readonly', fetch: 'readonly',
+        // `Response` is a global of the same fetch API as `fetch` above; tests use
+        // it to stand a product response up without a server.
+        Response: 'readonly', globalThis: 'readonly',
         AbortSignal: 'readonly', setTimeout: 'readonly', clearTimeout: 'readonly', Buffer: 'readonly',
         structuredClone: 'readonly',
         // Browser globals. These are NOT available to the engine — they appear only

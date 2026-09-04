@@ -264,7 +264,11 @@ export function selectByImpact({
     return {
       method: 'profile',
       applicable: true,
-      reason: 'no base SHA — diff unavailable, falling back to profile selection',
+      // Pre-D1 vocabulary, corrected. `changedPaths` no longer takes SHAs, so
+      // null now means "no trusted base/head tree pair to compare", not "no base
+      // SHA" — a run can carry a perfectly good base SHA and still land here
+      // because the trusted base materialisation was absent or unreadable.
+      reason: 'no trustworthy base→head diff — falling back to profile selection',
       features: inProfile(profile),
       classifications: [],
       escalated: false,

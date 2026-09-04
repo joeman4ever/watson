@@ -13,16 +13,24 @@ import path from 'node:path';
 import url from 'node:url';
 
 import {
-  loadContract, loadContractAt, selectByProfile, withDependencies,
+  loadContract, selectByProfile, withDependencies,
   validateFeatureVars, validateEnvOwnership, validateBrowserOwnership, validateContractVersion, validateStepOrder,
+  validateAssertionOperands, validateDenialProofs, validateReachedConditions,
+  fixtureValues, fixtureValueEnv, reconcileFixtureValues,
+  normaliseChosen,
 } from './contract.mjs';
-import { productFingerprint, contractFingerprint, resolveSha, contractChange, workingTreeState, changedPaths, engineProvenance } from './fingerprint.mjs';
+import { validateProofDeclarations } from './proofs.mjs';
+import { resolveGovernance, downgradeForUngovernedContract } from './governance.mjs';
+import { productFingerprint, contractFingerprint, resolveSha, contractChange, productIdentity, changedPaths, engineProvenance, verdictBearingPaths, pathExistsAt, pathReaderAt, operationalConfigChange } from './fingerprint.mjs';
+import { readManifest, contractDirFingerprint, walkTree } from './manifest.mjs';
+import { runManifest } from './manifest-cli.mjs';
 import { selectByImpact } from './selection.mjs';
 import * as env from './environment.mjs';
 import * as drive from './driver.mjs';
 import * as plane from './plane.mjs';
 import { evaluate, featureVerdict } from './checks.mjs';
-import { buildEnvelope, rollUp, writeResult, summary, downgradeForInexactHead } from './result.mjs';
+import { buildEnvelope, runVerdict, writeResult, summary, downgradeForInexactHead,
+  WITHHELD_WITHOUT_GOVERNANCE } from './result.mjs';
 
 const HERE = path.dirname(url.fileURLToPath(import.meta.url));
 const ROOT = path.join(HERE, '..');
@@ -200,11 +208,16 @@ async function bringUp({ repoRoot, contract, runDir, runId, adminUrl, policy }) 
     t = Date.now();
     const fixture = contract.fixtures.profiles?.[cfg.launch.fixture_profile];
     if (!fixture) throw new Error(`fixture profile \`${cfg.launch.fixture_profile}\` not declared`);
+    // THE VERIFIER PICKS THE VALUES ITS ASSERTIONS REST ON, and hands them to the
+    // fixture as input. The fixture may SEE them — a running application observes
+    // its own data, and Phase 1 does not claim otherwise — but it may not CHOOSE
+    // them (ADR-049 D4).
+    const chosen = fixtureValues(runId, fixture.verifier_chosen ?? []);
     const seed = await env.runStep(
       env.interpolate(fixture.command, { RUN_ID: runId, DATABASE_URL: databaseUrl }),
       {
         cwd: repoRoot,
-        env: { ...appEnv, DATABASE_URL: databaseUrl },
+        env: { ...appEnv, DATABASE_URL: databaseUrl, ...fixtureValueEnv(chosen) },
         label: 'seed',
         policy,
       },
@@ -215,6 +228,21 @@ async function bringUp({ repoRoot, contract, runDir, runId, adminUrl, policy }) 
     } catch (e) {
       throw new Error(`seed did not emit parseable JSON vars: ${e.message}\n${seed.stdout.slice(-400)}`);
     }
+    // The fixture is held to what it was given. Contradicting a chosen value, or
+    // never reporting one back at all, means the world the journeys are about to
+    // assert on is not the world the verifier asked for — a broken environment,
+    // not a product defect.
+    //
+    // This is NOT by itself proof that the required world EXISTS: an untrusted
+    // fixture echoing an id back proves it received the id. That gap is F1, and
+    // trusted precondition evidence is what closes it.
+    const reconciled = reconcileFixtureValues(vars, chosen);
+    if (reconciled.ignored.length) {
+      throw new Error(
+        `the fixture did not build its world from the values the verifier supplied:\n  - ${reconciled.ignored.join('\n  - ')}`,
+      );
+    }
+    vars = reconciled.vars;
     step(`seeded: ${Object.keys(vars).join(', ')}`);
     timings.seed_ms = Date.now() - t;
 
@@ -396,14 +424,29 @@ async function bringUpRemote({ contract, runId, adminUrl, planeUrl, productBaseU
     t = Date.now();
     const fixture = contract.fixtures.profiles?.[cfg.launch.fixture_profile];
     if (!fixture) throw new Error(`fixture profile \`${cfg.launch.fixture_profile}\` not declared`);
+    const chosen = fixtureValues(runId, fixture.verifier_chosen ?? []);
     const seeded = await plane('/seed', {
       runId,
       seed: fixture.command,
-      env: { ...appEnv, DATABASE_URL: databaseUrl },
+      env: { ...appEnv, DATABASE_URL: databaseUrl, ...fixtureValueEnv(chosen) },
     });
     if (!seeded?.ok) {
       throw new Error(
         `product plane failed during seed: ${seeded?.message ?? 'no message'}\n${(seeded?.log ?? '').slice(-1500)}`,
+      );
+    }
+    // The fixture is held to what it was given. Contradicting a chosen value, or
+    // never reporting one back at all, means the world the journeys are about to
+    // assert on is not the world the verifier asked for — a broken environment,
+    // not a product defect.
+    //
+    // This is NOT by itself proof that the required world EXISTS: an untrusted
+    // fixture echoing an id back proves it received the id. That gap is F1, and
+    // trusted precondition evidence is what closes it.
+    const reconciledPlane = reconcileFixtureValues(seeded.vars, chosen);
+    if (reconciledPlane.ignored.length) {
+      throw new Error(
+        `the fixture did not build its world from the values the verifier supplied:\n  - ${reconciledPlane.ignored.join('\n  - ')}`,
       );
     }
     timings.seed_ms = Date.now() - t;
@@ -411,7 +454,7 @@ async function bringUpRemote({ contract, runId, adminUrl, planeUrl, productBaseU
 
     return {
       dbName, databaseUrl, baseUrl: productBaseUrl, appPort: productPort,
-      vars: seeded.vars, timings, dbServerVersion: provisioned?.serverVersion ?? null, planeTree,
+      vars: reconciledPlane.vars, timings, dbServerVersion: provisioned?.serverVersion ?? null, planeTree,
       tokens: started.identity.tokens, identity: started.identity, teardown,
     };
   } catch (err) {
@@ -433,7 +476,10 @@ async function cmdVerify(args) {
   // is where it used to sit and therefore did not run.
   // The trusted orchestration's account of what it materialised, written before
   // any product code ran. Without it there is no authority for product identity
-  // and no product claim can be made.
+  // NO MANIFEST, NO PRODUCT CLAIM. A run that was not given one cannot establish
+  // identity, and says so rather than falling back to asking git — the fallback
+  // WAS the vulnerability (ADR-049 D3).
+  const manifest = typeof args.manifest === 'string' ? readManifest(path.resolve(args.manifest)) : null;
   const outPath = typeof args.out === 'string' ? path.resolve(args.out) : null;
   if (outPath) {
     try { fs.rmSync(outPath, { force: true, recursive: true }); } catch { /* nothing there */ }
@@ -468,16 +514,116 @@ async function cmdVerify(args) {
   log(`\nWatson ${VERSION} — run ${runId}`);
   const headSha = resolveSha(repoRoot, args.sha ?? 'HEAD');
   const baseSha = args.base ? resolveSha(repoRoot, args.base) : null;
-  const contract = loadContract(repoRoot);
+  const headContract = loadContract(repoRoot);
+
+  // WHICH CONTRACT GOVERNS (ADR-049 D1/F3/F7).
+  //
+  // `--base-contract` names a TRUSTED materialisation of the base revision's
+  // `.watson/`, produced on the trusted side before either container starts. It
+  // is not read out of the product's own `.git`, which is mounted read-write into
+  // the product container — ordering used to save that, which is not the same as
+  // being safe.
+  //
+  // Absent, the run does not silently fall back to head governance. It runs and
+  // reports, and withholds the product claim. Same shape as the manifest: one
+  // authority, supplied by the trusted plane, no fallback to asking the product.
+  const baseContractDir = typeof args['base-contract'] === 'string' ? args['base-contract'] : null;
+  // The bare `catch { return null }` here discarded WHY the contract did not
+  // load, and `resolveGovernance` then reported every case as bootstrap — "the
+  // base revision carries no verification contract" — including a base contract
+  // that was materialised and would not parse. Same collapse as the base tree's,
+  // one layer down, and load-bearing for `base_contract_available`.
+  let baseContractError = null;
+  const baseContract = baseContractDir
+    ? (() => {
+      try {
+        return loadContract(baseContractDir);
+      } catch (err) {
+        // An absent `.watson/` is the legitimate bootstrap and is NOT an error;
+        // anything else is a fault worth naming.
+        if (!/has no \.watson\/ directory/.test(err.message)) baseContractError = err.message;
+        return null;
+      }
+    })()
+    : null;
+  // THE TRUSTED BASE TREE — the base side of every comparison.
+  //
+  // `--base-contract` carries the base revision's `.watson/` and is the semantic
+  // authority. This is the other half: the base revision's TREE, materialised by
+  // the same trusted step, so base-side CONTENT for the wider verdict-bearing
+  // scope — migrations, lockfile, fixture script — comes from trusted material
+  // too. It used to come from `git rev-parse <baseSha>:<path>` inside the product
+  // clone, which is `refs/pull/N/head` and holds the base commit only by
+  // coincidence. See `contractChange` for what that produced.
+  //
+  // Kept as a SEPARATE directory from `--base-contract` on purpose. Folding the
+  // whole tree into that one would silently redefine `governing_contract`'s
+  // fingerprint — a field the trusted validator recomputes and compares — from
+  // "the base contract" to "the base tree". Both sides would still agree, and
+  // the field would quietly mean something else.
+  const baseTreeDir = typeof args['base-tree'] === 'string' ? args['base-tree'] : null;
+  let baseEntries = null;
+  let baseTreeError = null;
+  if (baseTreeDir) {
+    try {
+      baseEntries = walkTree(baseTreeDir);
+    } catch (err) {
+      // Recorded, never swallowed into "unchanged". `contractChange` reports the
+      // comparison as unavailable and selection escalates.
+      baseTreeError = err.message;
+      log(`  ⚠ the trusted base tree at ${baseTreeDir} could not be read (${baseTreeError});`
+        + ' the base-side comparison is UNAVAILABLE and selection escalates');
+    }
+  }
+  const governance = resolveGovernance({
+    base: baseContract, head: headContract, baseSupplied: !!baseContractDir,
+    baseError: baseContractError,
+    baseSha,
+    // Computed from the materialised directory, by the same function the trusted
+    // observer uses to check it. Two notions of "the same contract" is how this
+    // field would become decorative.
+    baseFingerprint: baseContractDir ? contractDirFingerprint(baseContractDir) : null,
+  });
+  const contract = governance.contract;
+  // Scoped from the governing contract, and from what exists AT THE HEAD COMMIT.
+  //
+  // THIS COMMENT USED TO CLAIM MORE THAN THE CODE DOES. It said "a path the head
+  // deleted still has to be compared, and `treeHash` reports it as `absent` on
+  // that side rather than dropping out of the digest". Neither half survives D1:
+  // `contractChange` no longer uses `treeHash` at all, and because the existence
+  // predicate is evaluated at HEAD, a path the head DELETES drops out of the
+  // scope entirely and the comparison reports `equivalent`. Executed on a real
+  // repository whose head removes `package-lock.json`:
+  //
+  //     scope @HEAD  [.watson, package.json, server/scripts/watson-fixture.ts]
+  //     scope @BASE  [.watson, package-lock.json, package.json, …]
+  //     contractChange(scope@head)  ->  null      (reported as equivalent)
+  //     contractChange(scope@base)  ->  [package-lock.json]
+  //
+  // What bounds it: this is REPORTING, never a gate, and the unscoped
+  // `changedPaths` still carries the deleted path into selection, where the
+  // base-governed rules classify it. The remedy is the base-governed
+  // `verdict_bearing_paths`, which nsc-eval declares. Recorded as an open
+  // non-blocking finding rather than fixed here — but the comment does not get
+  // to keep asserting a guarantee the code does not make.
+  const contractScope = verdictBearingPaths(
+    contract, pathExistsAt(repoRoot, headSha), pathReaderAt(repoRoot, headSha),
+  );
+
   log(`  repo   ${repoRoot}`);
   log(`  head   ${headSha}`);
+  log(`  govern ${governance.authority} — ${governance.note}`);
   log(`  map    ${contract.features.length} feature(s), profile \`${profile}\`\n`);
 
   // Diff-driven impact selection when the contract declares rules AND a base
   // resolves; declared profile otherwise. The fallback direction matters: an
   // absent base or absent rules means MORE journeys run, never fewer.
   const rules = contract.config.selection ?? null;
-  const changed = rules ? changedPaths(repoRoot, baseSha, headSha) : null;
+  // Same trusted inputs as `contractChange`, and for the same reason: this used
+  // to run `git merge-base` / `git diff` inside the product clone, so a base SHA
+  // that clone did not contain dropped the run out of diff-driven selection and
+  // into the broad profile without saying so.
+  const changed = rules ? changedPaths({ baseEntries, headEntries: manifest?.entries ?? null }) : null;
 
   const impact = rules
     ? selectByImpact({
@@ -520,16 +666,59 @@ async function cmdVerify(args) {
     headSha, baseSha,
     contractVersion: contract.config?.contract_version ?? null,
     productFingerprint: productFingerprint(repoRoot, headSha),
-    contractFingerprint: contractFingerprint(repoRoot, headSha),
-    // Resolves the contract at BOTH SHAs so the diff can name what changed, not
-    // merely that something did. `loadContractAt` returns null for an unreadable
-    // or invalid base, which the diff reports as `base_contract_available: false`.
-    contractChange: contractChange(repoRoot, baseSha, headSha, (sha) =>
-      sha === headSha ? contract : loadContractAt(repoRoot, sha)),
+    // D2: the fingerprint covers everything verdict-bearing, which is more than
+    // `.watson/`. The scope is derived from the GOVERNING contract and recorded
+    // beside the digest, because a fingerprint whose scope is invisible is one
+    // nobody can check — and here that visibility is load-bearing rather than
+    // decorative. `.watson`, the install surface and base-governed
+    // `verdict_bearing_paths` cannot be shrunk by the head; paths reachable only
+    // through head-authored command strings CAN be, because those commands must
+    // match the pull request's own tree. See `verdictBearingPaths` for what that
+    // does and does not buy. Watson reports contract movement; it does not gate
+    // on it.
+    contractFingerprint: contractFingerprint(repoRoot, headSha, contractScope),
+    contractScope,
+    // Resolves the contract from BOTH SIDES so the diff can name what changed,
+    // not merely that something did.
+    //
+    // Every input is trusted material. The base side is the trusted
+    // materialisation — never `git archive` out of the product's own `.git` (F3)
+    // and, since D1, never `git rev-parse` against it either. The head side is
+    // the trusted MANIFEST, built by the trusted plane before a line of product
+    // code ran, rather than the product repository's view of its own commit. The
+    // head CONTRACT is the head contract as authored, not the governing merge,
+    // which would diff the base against itself and report no change however much
+    // the head moved.
+    contractChange: contractChange({
+      baseEntries,
+      headEntries: manifest?.entries ?? null,
+      loadAt: (side) => (side === 'head' ? headContract : baseContract),
+      // Carried into the envelope, not only logged. A supplied-but-unreadable
+      // base tree and an absent one are different facts, and the second is a
+      // harness misconfiguration worth seeing on the result itself.
+      baseTreeError,
+      paths: contractScope,
+    }),
+    // HOW THE PRODUCT WAS LAUNCHED, reported separately from everything else.
+    //
+    // These keys are head-authored by decision — `install`, `provision`,
+    // `build`, `launch.command`, `env` must match the pull request's own tree or
+    // nothing runs. That makes them untrusted execution inputs, not verdict
+    // authority, and it makes their movement worth seeing on its own: a reviewer
+    // must be able to tell that this pull request changed how Watson launched
+    // the product, without that fact being buried inside a whole-contract digest.
+    operationalConfig: operationalConfigChange(baseContract?.config, headContract.config),
+    governance,
     // Recorded on EVERY result, pass or fail. A run that reports a SHA it did not
     // actually verify is worse than one that reports nothing.
-    workingTree: workingTreeState(repoRoot),
+    workingTree: productIdentity({
+      repoRoot, manifest, expectedSha: headSha,
+      generatedRoots: contract.config.generated_roots ?? [],
+    }),
+    manifest: manifest ? { schema: manifest.schema, sha: manifest.sha, built_at: manifest.built_at,
+      entries: Object.keys(manifest.entries ?? {}).length } : null,
     repoRoot,
+    manifestObject: manifest, generatedRoots: contract.config.generated_roots ?? [],
     profile, selection, startedAt, shadow: true, outPath,
     execution: {
       ...env.executionProvenance(policy),
@@ -551,15 +740,29 @@ async function cmdVerify(args) {
   // Alongside it, refuse a contract that tries to redefine an engine-owned key.
   // Both are pure contract checks, so they run BEFORE a database is created or a
   // single provisioning command is executed.
+  // ONE profile object, read once and passed everywhere.
+  //
+  // This is not tidiness. `validateDenialProofs` credits a declared trusted proof
+  // as evidence that an entity exists, and that credit is only honest because
+  // `doctor` EXECUTES the proof and fails the run when it is not established. If
+  // the pre-flight and doctor could be handed different profiles, the credit
+  // would be extended against an obligation nobody discharges.
+  const fixtureProfile = contract.fixtures.profiles?.[contract.config.launch.fixture_profile];
   const varProblems = [
+    // An unattributed contract key is a contract error, not a default.
+    ...governance.problems,
     ...validateContractVersion(contract.config),
     ...validateStepOrder(plan.map((p) => p.feature)),
     ...validateEnvOwnership(contract.config),
-    ...validateBrowserOwnership(contract.config),
-    ...validateFeatureVars(
-      plan.map((p) => p.feature),
-      contract.fixtures.profiles?.[contract.config.launch.fixture_profile],
+    ...validateProofDeclarations(
+      fixtureProfile,
+      normaliseChosen(fixtureProfile?.verifier_chosen ?? []).map(([n]) => n),
     ),
+    ...validateAssertionOperands(plan.map((p) => p.feature), fixtureProfile),
+    ...validateDenialProofs(plan.map((p) => p.feature), fixtureProfile),
+    ...validateReachedConditions(plan.map((p) => p.feature)),
+    ...validateBrowserOwnership(contract.config),
+    ...validateFeatureVars(plan.map((p) => p.feature), fixtureProfile),
   ];
   if (varProblems.length) {
     log('');
@@ -638,8 +841,10 @@ async function cmdVerify(args) {
       adminToken: up.tokens[adminIdentity?.id], expectSeasons: contract.config.launch.expect_seasons,
       identity: up.identity,
       // W5: what the seeded rows must RESOLVE TO through the product's own read
-      // paths, declared by the profile that seeded them.
-      preconditions: contract.fixtures.profiles?.[contract.config.launch.fixture_profile]?.preconditions,
+      // paths — and F1: the trusted proofs that the entities behind the
+      // verifier's own values were actually built. Both are declared by the
+      // profile that seeded them, and the same object the pre-flight read.
+      fixtureProfile,
       tokens: up.tokens,
       vars: up.vars,
     });
@@ -690,12 +895,22 @@ async function cmdVerify(args) {
     // Recorded AND acted on. Recording that the browser said it was not
     // sandboxed, and then producing a verdict anyway, is the shape of a control
     // that exists only on paper.
-    if (base.execution.browser_sandbox_probe.effective === false) {
+    //
+    // POSITIVE, not merely `!== false`. The earlier form let a build that will
+    // not render `chrome://sandbox` — `available: false`, `effective`
+    // undefined — through to a product verdict with no layer-1 evidence at all.
+    // "An unprovable sandbox is not one this design gets to claim" was written
+    // in the README and not implemented here. A run that reaches this point has
+    // already opened a browser (a NOT_APPLICABLE run returns terminally before
+    // bring-up), so there is no legitimate case that needs the softer test.
+    if (base.execution.browser_sandbox_probe.effective !== true) {
       await browser.close();
       return finish(runDir, {
         ...base, dbName: up.dbName, baseUrl: up.baseUrl,
         verdict: 'BLOCKED_ENVIRONMENT',
-        verdictReason: 'Chromium reports it is not adequately sandboxed; the browser is part of the verifier and the pages it loads come from the product',
+        verdictReason: base.execution.browser_sandbox_probe.available
+          ? 'Chromium reports it is not adequately sandboxed; the browser is part of the verifier and the pages it loads come from the product'
+          : 'this browser build will not report its sandbox state, so the layer-1 sandbox cannot be established; the browser is part of the verifier and the pages it loads come from the product',
         doctor: dr, features: [], findings: [], qualitySignals: zeroSignals(),
         evidence: { bundle: path.relative(ROOT, runDir), retention_days: 7 },
         timings: { ...up.timings, total_ms: Date.now() - t0 },
@@ -771,18 +986,19 @@ async function cmdVerify(args) {
 
     await browser.close();
 
-    const verified = features.filter((f) => f.role === 'verified');
-    const verdict = rollUp(verified.length ? verified : features);
-    const failed = features.filter((f) => f.verdict === 'FAIL_PRODUCT');
+    // The run-level verdict, decided in one place that has its own tests.
+    // `plan` is what was SELECTED; `features` is what actually executed.
+    const roll = runVerdict({ executed: features, plan, applicable: selection.applicable });
+    const { notAttempted } = roll;
+
+    if (notAttempted.length) {
+      log(`\n  ⚠ ${notAttempted.length} selected journey(s) never ran: ${notAttempted.join(', ')}`);
+    }
     return finish(runDir, {
       ...base, dbName: up.dbName, baseUrl: up.baseUrl,
-      verdict,
-      verdictReason: (() => {
-        const drift = features.filter((f) => f.verdict === 'FAIL_CONTRACT');
-        if (failed.length) return `${failed.length} of ${features.length} feature(s) failed their proof`;
-        if (drift.length) return `${drift.length} feature(s) could not be verified — the map names something that no longer exists`;
-        return `${features.length} feature(s) met their proof`;
-      })(),
+      verdict: roll.verdict,
+      verdictReason: roll.reason,
+      notAttempted,
       doctor: dr, features, findings, qualitySignals: signals,
       evidence: {
         bundle: path.relative(ROOT, runDir),
@@ -824,6 +1040,26 @@ function accumulate(sig, evidence, pageText) {
 }
 
 function finish(runDir, run) {
+  // GOVERNING-CONTRACT GATE (ADR-049 D1).
+  //
+  // Runs BEFORE the exact-head gate, and both apply: a verdict about a commit
+  // requires that the commit is what was driven AND that the semantics used to
+  // judge it were not supplied by the thing being judged. Either one missing
+  // makes the verdict INDETERMINATE.
+  //
+  // FAIL_PRODUCT is withheld here as well as PASS, and that is deliberate. An
+  // accusation reached on semantics nobody trusted is not a better outcome than
+  // an unearned pass; it is the same defect pointed the other way.
+  if (run.verdict && run.governance) {
+    const gov = downgradeForUngovernedContract(run.verdict, run.governance, WITHHELD_WITHOUT_GOVERNANCE);
+    if (gov.verdict !== run.verdict) {
+      log('');
+      log(`  ⚠ ${gov.reason}`);
+      run.verdictReason = gov.reason;
+      run.verdict = gov.verdict;
+    }
+  }
+
   // EXACT-HEAD GATE (W2). The last thing that happens before a verdict is written:
   // re-read the working tree and refuse to make a claim ABOUT THE COMMIT unless the
   // checkout still is that commit.
@@ -834,7 +1070,10 @@ function finish(runDir, run) {
   // and ended dirty drove some mixture of the two, and cannot honestly speak for
   // either.
   if (run.repoRoot && run.verdict) {
-    const at_end = workingTreeState(run.repoRoot);
+    const at_end = productIdentity({
+      repoRoot: run.repoRoot, manifest: run.manifestObject ?? null,
+      expectedSha: run.headSha ?? null, generatedRoots: run.generatedRoots ?? [],
+    });
     const at_start = run.workingTree ?? at_end;
     const changed_mid_run =
       at_start.exact_head !== at_end.exact_head
@@ -883,9 +1122,9 @@ async function cmdDoctor(args) {
       baseUrl: up.baseUrl, dbName: up.dbName, databaseUrl: up.databaseUrl,
       adminToken: up.tokens[adminIdentity?.id], expectSeasons: contract.config.launch.expect_seasons,
       identity: up.identity,
-      // W5: what the seeded rows must RESOLVE TO through the product's own read
-      // paths, declared by the profile that seeded them.
-      preconditions: contract.fixtures.profiles?.[contract.config.launch.fixture_profile]?.preconditions,
+      // W5 read-path preconditions and F1 trusted proofs, from the profile that
+      // seeded the world.
+      fixtureProfile: contract.fixtures.profiles?.[contract.config.launch.fixture_profile],
       tokens: up.tokens,
       vars: up.vars,
     });
@@ -922,6 +1161,18 @@ try {
     process.exit(envlp.check?.obligation === 'satisfied' ? 0 : 1);
   } else if (cmd === 'doctor') {
     process.exit(await cmdDoctor(args));
+  } else if (cmd === 'manifest') {
+    // RUN THIS ON THE TRUSTED SIDE, against a checkout the product has not run
+    // in, before handing that tree to anything untrusted. A manifest built after
+    // the product has touched the tree describes the product's work, not the
+    // commit's.
+    //
+    // The implementation lives in `manifest-cli.mjs`, which imports node
+    // built-ins only, and CI invokes that file directly — the trusted runner has
+    // no `node_modules`, so it cannot load this file at all. Delegating keeps
+    // one implementation rather than two that drift.
+    runManifest(process.argv.slice(3));
+    process.exit(0);
   } else if (cmd === 'plane') {
     // The product plane. Runs in the UNTRUSTED container, as an unprivileged
     // user, and executes only what the verifier hands it. It never sees the
@@ -946,7 +1197,7 @@ try {
     for (const k of kept) log(`  kept ${k.datname} — ${k.why}`);
     process.exit(0);
   } else {
-    log(`watson ${VERSION}\n\n  watson verify --repo <path> [--sha <ref>] [--base <ref>] [--profile poc] [--pr N] [--out <file>]\n               [--plane <url> --product-base-url <url>]\n  watson doctor --repo <path>\n  watson plane --repo <path> [--port 8079]\n  watson reap\n`);
+    log(`watson ${VERSION}\n\n  watson verify --repo <path> [--sha <ref>] [--base <ref>] [--profile poc] [--pr N] [--out <file>]\n               [--plane <url> --product-base-url <url>]\n               [--manifest <file>] [--base-contract <dir>] [--base-tree <dir>]\n  watson manifest --repo <path> [--sha <ref>] [--out <file>]   (TRUSTED side, before product code runs)\n  watson doctor --repo <path>\n  watson plane --repo <path> [--port 8079]\n  watson reap\n`);
     process.exit(cmd ? 1 : 0);
   }
 } catch (err) {

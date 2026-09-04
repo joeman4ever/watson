@@ -15,6 +15,7 @@
 import { chromium } from 'playwright';
 import fs from 'node:fs';
 import path from 'node:path';
+import { degenerateOperand } from './contract.mjs';
 
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
@@ -62,6 +63,36 @@ export async function launchBrowser({ executablePath, cdpPort, headless = true, 
   return chromium.launch({
     executablePath,
     headless,
+    // THE FLAG WAS COMING FROM THE LIBRARY, NOT FROM US.
+    //
+    // Playwright's default is `chromiumSandbox: false`, and playwright-core
+    // implements that as, verbatim:
+    //
+    //     if (options.chromiumSandbox !== true) chromeArguments.push('--no-sandbox');
+    //
+    // So every browser Watson has ever launched ran with `--no-sandbox`, added by
+    // the dependency. "`--no-sandbox` appears nowhere in `src/`" was true, and it
+    // was measuring the wrong thing: the absence of a string in our source says
+    // nothing about the argv of the process we start. Measured as an unprivileged
+    // user against Chromium 131:
+    //
+    //     launch({})                       Layer 1 Sandbox  None
+    //                                      NOT adequately sandboxed
+    //                                      every renderer carries --no-sandbox
+    //     launch({ chromiumSandbox: true}) Layer 1 Sandbox  Namespace
+    //                                      PID/net namespaces yes, seccomp-bpf yes
+    //                                      adequately sandboxed
+    //                                      no renderer carries --no-sandbox
+    //
+    // One variable, nothing else changed — no container option, no seccomp edit,
+    // no privilege added. The container was never the problem.
+    //
+    // This is NOT a convenience default to be dropped when a launch is awkward.
+    // The pages Chromium loads are served by the product under verification, so a
+    // renderer outside the sandbox is a hole in the boundary that protects the
+    // evidence. If a browser will not start with this true, the run is
+    // BLOCKED_ENVIRONMENT — that is the gate working.
+    chromiumSandbox: true,
     // Explicit, so a caller that needs to know WHICH build it measured can say
     // so — and so nothing silently falls back to the headless shell.
     ...(channel ? { channel } : {}),
@@ -92,8 +123,23 @@ export async function probeSandbox(browser) {
     const text = (await page.evaluate(() => document.body.innerText)).trim();
     return {
       available: true,
-      // Chromium prints "You are adequately sandboxed." when layer 1 is effective.
-      effective: /adequately sandboxed/i.test(text),
+      // THE SUBSTRING TRAP, and why the negative is checked first.
+      //
+      // Chromium prints "You are adequately sandboxed." when layer 1 is
+      // effective and "You are NOT adequately sandboxed." when it is not. The
+      // second CONTAINS the first as a substring, so `/adequately sandboxed/`
+      // matched both and this field could never be false.
+      //
+      // Everything downstream was therefore decoration: the BLOCKED_ENVIRONMENT
+      // gate in `cli.mjs`, the trusted validator's `effective === false` check,
+      // and `test/browser-sandbox-proof.mjs`'s per-commit layer-1 claim. Three
+      // gates, none of which could fire, on the one runtime statement Watson
+      // makes about its OWN integrity — and every run bundle on disk carried
+      // `effective: true` beside a report reading "You are NOT adequately
+      // sandboxed."
+      //
+      // Found by independent adversarial review of slice 2, in slice 1 code.
+      effective: !/not\s+adequately\s+sandboxed/i.test(text) && /adequately sandboxed/i.test(text),
       report: text.slice(0, 2000),
     };
   } catch (err) {
@@ -153,11 +199,30 @@ export async function openIdentity(browser, { baseUrl, token, viewport }) {
  */
 export const STEPS = [
   'goto', 'reload', 'back', 'click', 'fill', 'select', 'wait_for_text',
-  'expect_text', 'expect_no_text', 'expect_no_uuid', 'expect_url_contains',
-  'expect_api', 'expect_denied', 'expect_allowed', 'expect_json',
+  'expect_text', 'expect_text_in', 'expect_no_text', 'expect_no_uuid', 'expect_url_contains',
+  'expect_api', 'expect_denied', 'expect_allowed', 'expect_reached', 'expect_json',
   'expect_count_at_most', 'expect_count_at_least',
   'set_viewport', 'expect_no_overflow',
 ];
+
+/**
+ * Steps whose operands are PROOF, not input.
+ *
+ * The distinction decides who is allowed to choose a value. A `fill` operand is
+ * something Watson types into the product; the product may well have chosen it,
+ * and nothing rests on it. An `expect_text` operand is the thing that makes the
+ * assertion true — so if the product picks it, the product decides whether it
+ * passes its own test.
+ *
+ * `wait_for_text` is here deliberately: it asserts what the application
+ * eventually says, and a journey that waits for a string the product chose has
+ * proved only that the product can echo itself.
+ */
+export const ASSERTION_STEPS = new Set([
+  'wait_for_text', 'expect_text', 'expect_text_in', 'expect_no_text', 'expect_url_contains',
+  'expect_api', 'expect_denied', 'expect_allowed', 'expect_reached', 'expect_json',
+  'expect_count_at_most', 'expect_count_at_least',
+]);
 
 function locator(page, sel) {
   if (typeof sel !== 'string') throw new Error(`selector must be a string, got ${JSON.stringify(sel)}`);
@@ -182,7 +247,24 @@ export async function runStep(step, ctx) {
   const kind = Object.keys(step).find((k) => STEPS.includes(k));
   if (!kind) throw new Error(`unknown step: ${JSON.stringify(step)}`);
   const raw = step[kind];
-  const arg = typeof raw === 'string' ? interp(raw, vars) : raw;
+  // INTERPOLATE THE WHOLE ARGUMENT, not only the string-shaped ones.
+  //
+  // This used to be `typeof raw === 'string' ? interp(raw, vars) : raw`, so an
+  // object-shaped step got its fields raw and each handler had to remember to
+  // interpolate its own. `expect_text_in` did not, and the consequence is the
+  // reason this is a property fix rather than a one-line one:
+  //
+  //     expect_text_in: { selector: "testid=prospective-cohort",
+  //                       text: "${grantedCohortSize}" }
+  //
+  // compared the element's text against the LITERAL `${grantedCohortSize}`. The
+  // assertion could never pass. It had been an `expect_text` string — correctly
+  // interpolated — until a commit on this branch scoped it to an element, and
+  // from that commit Watson accused a correct product on every run.
+  //
+  // Interpolating at the boundary means no future step kind can forget, and an
+  // unresolved `${name}` still throws rather than asserting against a literal.
+  const arg = interpDeep(raw, vars);
   const note = step.note ? ` (${step.note})` : '';
 
   switch (kind) {
@@ -252,6 +334,33 @@ export async function runStep(step, ctx) {
       }
       if (!(await seen())) throw new Error(`expected page text to contain "${arg}"${note}`);
       return `page contains "${arg}"`;
+    }
+    case 'expect_text_in': {
+      // The same assertion as `expect_text`, SCOPED to one element.
+      //
+      // It exists because a journey in the product's own map said the quiet part
+      // out loud: "searching for the bare count as a string matches any
+      // incidental digit and proves nothing." That is true of every short
+      // operand — a grade, a cohort size, a threshold — and page-wide
+      // `expect_text` cannot distinguish "the stat shows 7" from "a 7 appears
+      // somewhere on the page".
+      //
+      // Polls, for the same reason `expect_text` does: this is a claim about
+      // eventual state, and sampling once races the render.
+      const el = locator(page, arg.selector);
+      const want = String(arg.text);
+      const seen = async () => {
+        try { return ((await el.first().innerText({ timeout: 1000 })) ?? '').includes(want); }
+        catch { return false; }
+      };
+      const deadline = Date.now() + timeout;
+      while (!(await seen()) && Date.now() < deadline) {
+        await page.waitForTimeout(100);
+      }
+      if (!(await seen())) {
+        throw new Error(`expected ${arg.selector} to contain "${want}"${note}`);
+      }
+      return `${arg.selector} contains "${want}"`;
     }
     case 'expect_no_text': {
       // Deliberately does NOT poll, unlike `expect_text` above. The asymmetry is
@@ -331,6 +440,54 @@ export async function runStep(step, ctx) {
       }
       return `${want} allowed ${res.status()}`;
     }
+    case 'expect_reached': {
+      // AUTHORIZATION PASSED, PROVED BY A CONDITION ONLY REACHABLE AFTER IT.
+      //
+      // A weaker claim than `expect_allowed`, made deliberately, for routes where
+      // a 200 would require building data the fixture has no business building.
+      // `/reporting/session-comparison` needs two DISTINCT sessions; seeding a
+      // second only so a control can be green changes the world under test to
+      // suit the checker.
+      //
+      // WHAT IT MUST NOT BE. An earlier version of this step passed on anything
+      // that was not 401/403/404/405/5xx. That is a vacuous proof: it accepts a
+      // status the caller never reasoned about, and "not denied" is not the same
+      // as "authorized". Not all 400s prove authorization succeeded.
+      //
+      // So the contract states the EXACT downstream condition, per route: the
+      // status, and — wherever the product exposes one — the stable error code
+      // that identifies the downstream validation. Both are base-governed. A
+      // declaration with neither is refused by `validateReachedConditions`
+      // before anything runs, unless it carries a written justification that a
+      // reviewer can check against the product's own middleware order.
+      const want = interp(arg.path ?? arg, vars);
+      const res = await page.request.get(want, { failOnStatusCode: false });
+      const status = res.status();
+      evidence.requests.push({ path: want, status, method: 'GET' });
+
+      const wantStatus = arg.status;
+      if (status !== wantStatus) {
+        throw new Error(
+          `expected ${want} to answer ${wantStatus} downstream of authorization, got ${status}${note}`,
+        );
+      }
+      // The status alone can be produced by things other than the condition
+      // named — so where the contract declares body fields, they are checked.
+      const wantBody = arg.body ?? null;
+      if (wantBody) {
+        let body = null;
+        try { body = await res.json(); } catch { /* not JSON — reported below */ }
+        const bad = Object.entries(wantBody).filter(([k, v]) => String(body?.[k]) !== String(v));
+        if (bad.length) {
+          throw new Error(
+            `${want} answered ${status} but not the declared downstream condition: `
+            + `${bad.map(([k, v]) => `${k} wanted ${JSON.stringify(v)}, got ${JSON.stringify(body?.[k])}`).join('; ')}${note}`,
+          );
+        }
+        return `${want} reached — ${status} ${Object.entries(wantBody).map(([k, v]) => `${k}=${v}`).join(' ')}`;
+      }
+      return `${want} reached — ${status} (status-only, justified in the contract)`;
+    }
     case 'expect_json': {
       // Assert on what a route RESOLVED TO, not merely that it answered.
       //
@@ -403,8 +560,52 @@ export async function runStep(step, ctx) {
   }
 }
 
+/**
+ * Substitute `${name}` from the run's variables.
+ *
+ * FAIL-CLOSED on an unknown name. It used to leave the literal `${name}` in
+ * place, which turns a map typo into an assertion against a string no page will
+ * ever contain — reported as a product failure. And it is one small step from
+ * the sibling bug the engine also had, where an unknown name became the EMPTY
+ * string and the assertion became vacuously true.
+ *
+ * There is no safe default here. An expectation whose operand could not be
+ * resolved is not an expectation, so the run says so.
+ */
+/**
+ * `interp` over every string in a value, at any depth.
+ *
+ * Non-strings pass through untouched, so `max: 0` stays a number and a selector
+ * with no `${}` in it is unchanged. There is no shape a step can take that this
+ * misses, which is the point: the previous rule was per-handler and a handler
+ * forgot.
+ */
+export function interpDeep(value, vars) {
+  if (typeof value === 'string') return interp(value, vars);
+  if (Array.isArray(value)) return value.map((v) => interpDeep(v, vars));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, interpDeep(v, vars)]));
+  }
+  return value;
+}
+
 export function interp(str, vars) {
-  return String(str).replace(/\$\{(\w+)\}/g, (_, k) => (vars?.[k] ?? `\${${k}}`));
+  return String(str).replace(/\$\{(\w+)\}/g, (_, k) => {
+    const v = vars?.[k];
+    if (v === undefined) {
+      throw new Error(
+        `\${${k}} could not be resolved to a value. An unresolved operand is not an ` +
+          'expectation; refusing to assert against it.',
+      );
+    }
+    // The SAME predicate `validateSeedValues` applies at the source. Two rules
+    // for one variable namespace is how a value rejected in one place arrives
+    // through the other — which is what happened when this accepted `" "` and
+    // the source check rejected it.
+    const bad = degenerateOperand(v);
+    if (bad) throw new Error(`\${${k}} ${bad}`);
+    return String(v);
+  });
 }
 
 // ------------------------------------------------------------------- evidence

@@ -34,10 +34,93 @@ writes it during a run.
 ```bash
 watson verify --repo /path/to/product [--sha <ref>] [--base <ref>] [--profile poc] [--pr 123] [--out <file>]
              [--plane <url> --product-base-url <url>]   # run the product in its own plane
+             [--manifest <file>]                        # trusted product identity
+             [--base-contract <dir>]                    # the contract that GOVERNS the verdict
+             [--base-tree <dir>]                        # trusted base revision, for base-side content
+watson manifest --repo /path/to/product [--out <file>]  # TRUSTED side, before product code runs
 watson doctor --repo /path/to/product     # bring up, probe, tear down
 watson plane  --repo /path/to/product     # the UNTRUSTED side, inside the product container
 watson reap                               # drop orphaned watson_* databases
 ```
+
+### Three things the trusted side must supply
+
+All three have the same shape, and it is the shape that matters: **exactly one
+authority, handed in by the trusted plane, with no fallback to asking the
+product.** In every case the fallback *was* the vulnerability.
+
+| flag | supplies | without it |
+| --- | --- | --- |
+| `--manifest` | what the product source IS | product identity cannot be established |
+| `--base-contract` | what PASS MEANS | no contract governed the run |
+| `--base-tree` | what the base revision CONTAINED | the base→head comparison is unavailable |
+
+The first two missing withholds the product claim: the run executes, reports
+everything it observed, and returns `INDETERMINATE` rather than `PASS` or
+`FAIL_PRODUCT`. A verdict about a commit needs both that the commit is what was
+driven and that the thing being judged did not choose the semantics used to judge
+it.
+
+`--base-contract` names a directory the trusted side materialised from the base
+revision — not a path inside the product tree, and never `git archive` out of the
+product's own `.git` (ADR-049 F3). The head's contract is still loaded,
+fingerprinted, diffed and reported; it is a proposal, not the authority for its
+own verdict.
+
+`--base-tree` is the same principle applied to **content**, and it closes the
+last place the engine asked the product repository a base-side question.
+`contractChange` and `changedPaths` used to run `git rev-parse <baseSha>:<path>`
+and `git diff` inside the product clone. That clone is `refs/pull/N/head`; the
+base SHA is the base branch tip, and it is in that clone only when it happens to
+be an ancestor. When it was not, every scoped path digested as the string
+`absent`, **every path read as changed**, and the result asserted a contract
+change nothing had established — while `base_contract_available` said `true`.
+
+Two defects, and the second is the worse: base-side facts asked of the untrusted
+repository, and *"could not read"* reported as *"absent"*. Both sides of both
+comparisons now come from trusted material — the base tree above, and the head
+side from the manifest, which the trusted plane builds before a line of product
+code runs. Neither function takes a repository root any more, and a test asserts
+that neither can be handed one.
+
+**Missing base material is `unavailable`, never `changed` and never `clean`.**
+`contract_change` reports `comparison: 'unavailable'` with an empty
+`paths_changed` and `base_contract_available: false`; selection keeps its
+existing fail-conservative behaviour and escalates. Manufacturing either answer
+out of information nobody has is the specific thing this design exists to refuse.
+
+**One honest change of meaning, and the wording that follows from it.** The old
+diff was `merge-base(base, head)..head` — *what this pull request changed*. A
+merge base needs both histories in one repository, and neither trusted
+materialisation has the other's; that separation is the point. So the diff is now
+base-tip vs head: *how head differs from the revision whose contract governs it.*
+Paths that moved on the base branch since the fork point now appear. The effect is
+strictly conservative — a larger changed set escalates to more verification, never
+less — and it is the question ADR-049 actually asks, since the base contract is
+what governs the verdict.
+
+It also makes one old sentence false, so it is gone. Watson no longer says *"this
+PR changes the verification contract"*: a contract change landing on the base
+branch diverges from a stale head without the pull request having authored
+anything. The heading is now **"the head differs from the governing verification
+contract"**, and the note under it says so explicitly.
+
+`contract_change` keeps its name — renaming a field in the envelope the trusted
+validator reads is churn for nothing — but its documented semantics are:
+
+> whether verdict-bearing contract material in the EVALUATED HEAD differs from the
+> GOVERNING TRUSTED BASE contract
+
+not historical authorship. `changedPaths` reads the same way: paths differing
+between the governing base revision and the evaluated head.
+
+**Three states reach the envelope, because a boolean cannot carry three.**
+`contract_comparison` is `diverged`, `equivalent` or `unavailable`, and
+`contract_change` is true only for `diverged`. This is not decoration: the first
+version of the D1 fix left `contract_change` as `!!contractChange`, and since an
+unavailable comparison returns a truthy object, an unobtainable base reported
+`contract_change: true` — the collapse the fix existed to prevent, reintroduced
+one layer above the function that was fixed.
 
 Exit code is `0` for `PASS` / `PASS_WITH_ADVISORIES`, `1` otherwise. Every run
 writes `runs/<runId>/result.json` (machine) and `runs/<runId>/summary.md`
@@ -204,35 +287,166 @@ The pages Chromium loads are served by the product under verification, so an
 unsandboxed browser is a hole in the same boundary that protects the evidence.
 Chromium refuses to start as root with its sandbox on; the response is to refuse
 to be root, never to pass `--no-sandbox`. `launchBrowser` throws as root, the
-flag appears nowhere in `src/`, and a test greps for it.
+flag appears nowhere in `src/`, and a test greps for it. Those parts hold.
 
-`test/browser-sandbox-proof.mjs` proves the sandbox rather than asserting it. It
-launches the real browser as an unprivileged user in the pinned container image
-and establishes both of Chromium's layers, which fail independently:
+> **THE SANDBOX WAS NOT ENGAGED FOR THE WHOLE LIFE OF THIS PROJECT, AND THIS
+> SECTION USED TO SAY IT WAS.** The cause is found, fixed, and established by an
+> executed proof in the real container topology — see *Established* below. The
+> history is kept because the way it was claimed matters more than the fix.
+
+#### What was claimed, what was true, and why
+
+`probeSandbox` decided the layer-1 question with
+`/adequately sandboxed/i.test(text)`. Chromium's negative verdict — *"You are
+**NOT** adequately sandboxed."* — contains the positive one as a substring, so
+the field was `true` for both answers and **could never be false**. Three gates
+read it (the `BLOCKED_ENVIRONMENT` gate, the trusted validator, and this repo's
+own per-commit proof); none could fire.
+
+With the predicate corrected, the proof job ran for the first time as a real
+assertion, and reported:
+
+```text
+chromium proper (channel: chromium): 2 renderer(s), seccomp=2 on 2,
+namespace-isolated 0, chrome://sandbox NOT effective
+
+Sandbox Status
+Layer 1 Sandbox                      None
+Seccomp-BPF sandbox                  No
+You are NOT adequately sandboxed.
+```
+
+**The cause was not the container.** It was one option Watson never passed.
+playwright-core, at the version this repository pins, contains:
+
+```js
+if (options.chromiumSandbox !== true) chromeArguments.push('--no-sandbox');
+```
+
+Playwright's default is `chromiumSandbox: false`, so **the library added the flag
+Watson was careful never to write**. Measured as an unprivileged user, one
+variable changed and nothing else — no container option, no seccomp edit, no
+privilege added:
+
+| `chromium.launch(…)` | Layer 1 | renderer argv |
+| --- | --- | --- |
+| `{}` — what the engine did | `None`, *NOT adequately sandboxed* | every renderer carries `--no-sandbox` |
+| `{ chromiumSandbox: true }` | `Namespace`, PID + net namespaces, seccomp-bpf, *adequately sandboxed* | none does |
+
+Two checks stood between this and being noticed, and both were vacuous. The
+first is the substring bug above. The second is worse, because it was the one
+aimed straight at the cause: the proof printed *"Chromium started with no
+`--no-sandbox` flag"* on the strength of a browser having started at all — it
+never read a command line. Beside it, a unit test grepped `src/` for the string
+and passed, truthfully, while every renderer carried the flag. **The absence of a
+string in our source is not a property of the process we start**, and both checks
+now read the argv of the processes actually launched.
+
+Two measurements that were being conflated:
+
+| measured | says |
+| --- | --- |
+| `/proc/<renderer>/status` → `Seccomp: 2` | a seccomp filter is attached |
+| `chrome://sandbox` → `Seccomp-BPF sandbox: No` | **Chromium's own** sandbox is not engaged |
+
+Both are true. The attached filter is the one **Docker applies to the whole
+container**, not Chromium's per-renderer sandbox. Counting the first as evidence
+of the second is what made this section wrong.
+
+| | state |
+| --- | --- |
+| browser runs as a non-root uid | **true, measured** |
+| `--no-sandbox` absent | **true, measured** |
+| container-level seccomp filter attached | **true, measured** |
+| Chromium layer-1 / namespace sandbox | **NOT engaged** |
+| Chromium seccomp-BPF sandbox | **NOT engaged** |
+
+#### Where this stands
+
+The browser sandbox is part of the frozen Phase-1 trust claim, not a deferred
+promotion gate: the browser consumes product-controlled content inside the
+verifier plane, so an unsandboxed browser bears directly on *the untrusted pull
+request cannot alter the verifier or fabricate its evidence*.
+
+So the corrected probe stays and the gate stays — and it is now **stronger** than
+it was. It used to fire only on `effective === false`, which let a browser build
+that will not render `chrome://sandbox` through to a product verdict with no
+layer-1 evidence at all. "An unprovable sandbox is not one this design gets to
+claim" was written here and not implemented; the gate now demands
+`effective === true`, and the trusted validator does the same.
+
+`seccomp/` and `tools/seccomp-profile.mjs` still derive a profile from Docker's
+default with an asserted two-edit delta, and that machinery is deliberately
+**unchanged**. It was not the cause, and one variable was changed at a time. What
+is now unsupported is the *reason* it was adopted: the earlier claim that Docker's
+default profile was the thing forbidding Chromium's namespace sandbox rested on
+the same vacuous measurement. Whether it is necessary is a separate question, to
+be answered by measurement rather than by removing it and seeing.
+
+#### Established
+
+A sandbox proven somewhere else is not a sandbox, so the diagnosis measurement
+above settles nothing on its own. `.github/workflows/ci.yml` runs the same proof
+in the pinned image, under the observer's own container options, as uid 1000.
+At `0963a53` (watson#9), verbatim:
+
+```text
+Watson browser sandbox proof — uid 1000, linux
+
+  ✓ running unprivileged (uid 1000)
+  ✓ the container PERMITS unprivileged user namespaces
+  · headless shell (Playwright default): 1 renderer(s), seccomp=2 on 1,
+    namespace-isolated 1 (by user+pid+net), chrome://sandbox not reportable
+  · chromium proper (channel: chromium): 2 renderer(s), seccomp=2 on 2,
+    namespace-isolated 2 (by user+pid+net), chrome://sandbox EFFECTIVE
+  ✓ no renderer of any measured build carries --no-sandbox (3 renderer(s) inspected)
+  ✓ 2/2 renderer(s) report Seccomp: 2 (seccomp-bpf) [chromium proper]
+  ✓ every renderer reports NoNewPrivs: 1
+  ✓ chrome://sandbox reports the layer-1 sandbox EFFECTIVE [chromium proper]
+  ✓ corroborated: 2/2 renderer(s) namespace-isolated by user+pid+net
+
+  SANDBOX PROVEN: non-root browser; namespace sandbox and seccomp-bpf both engaged.
+```
+
+Same image, same seccomp profile, same `no-new-privileges`, same
+`--cap-drop=NET_RAW`, same non-root uid as before the fix. **Nothing was
+weakened to get here**, and the run is the per-commit gate, so a regression is a
+red build rather than a conversation nobody has.
+
+#### What the proof does establish
+
+`test/browser-sandbox-proof.mjs` launches the real browser as an unprivileged
+user in the pinned container image and measures, independently:
 
 | layer | how it is established |
 | --- | --- |
-| seccomp-bpf | `Seccomp: 2` and `NoNewPrivs: 1` in the renderer's `/proc/<pid>/status` |
-| namespace sandbox | `chrome://sandbox` reporting *adequately sandboxed*, corroborated by the renderer's `/proc/<pid>/ns/{user,pid,net}` |
+| non-root | the verifier's uid |
+| no `--no-sandbox` | the **argv of every renderer it started**, read from `/proc/<pid>/cmdline` — not a grep of our source, which is what made this check vacuous |
+| seccomp filter attached | `Seccomp: 2` and `NoNewPrivs: 1` in the renderer's `/proc/<pid>/status` — **supporting telemetry, not proof of Chromium's own sandbox** |
+| Chromium's own sandbox | `chrome://sandbox` reporting *adequately sandboxed* — **authoritative** |
+| corroboration | the renderer's `/proc/<pid>/ns/{user,pid,net}` differing from the verifier's — read as corroboration, never as the test |
 
-Chromium's own status page is authoritative for layer 1 because Chromium knows
-which mechanism it chose. An earlier version of this proof demanded a separate
-*user* namespace and reported the sandbox missing on a browser Chromium itself
-called adequately sandboxed — the check was wrong, not the browser.
+Chromium's self-report is authoritative because Chromium knows which mechanism
+it chose and whether it came up. An earlier version of this proof demanded a
+separate *user* namespace and reported the sandbox missing on a browser Chromium
+called adequately sandboxed; the lesson taken from that was to trust the
+self-report, which was right — the error was reading a field derived from it
+with a predicate that could not express "no".
 
-Two things this proof had to learn the hard way, both now permanent:
+**Watson drives Chromium proper, not Playwright's default headless shell.** In
+the pinned build the headless shell still does not answer `chrome://sandbox`
+(`not reportable` in the transcript above), and a sandbox this design cannot
+prove is not one it gets to claim. A newer build was observed to answer it
+elsewhere; the channel stays explicit regardless, because the point is that the
+engine drives a build whose sandbox it can *read*, not that one particular build
+is mute.
 
-- **Docker's default seccomp profile forbids the namespace sandbox.** Measured on
-  the runners: not AppArmor, not `no-new-privileges`. `seccomp/` and
-  `tools/seccomp-profile.mjs` derive the smallest profile that permits it, and a
-  test asserts the delta from Docker's default is exactly two documented edits.
-- **Watson drives Chromium proper, not Playwright's default headless shell.** The
-  headless shell does not answer `chrome://sandbox` at all, and a sandbox this
-  design cannot prove is not one it gets to claim.
-
-CI runs the proof on every change. If an image or runner cannot give us a
-sandboxed non-root browser, the right outcome is a red build and a conversation,
-not a quietly weakened threat model.
+The proof reads `/proc/<pid>/cmdline` **tokenised on NUL *and* whitespace**.
+Chromium rewrites its own process title, so a renderer's whole command line
+arrives as a single element; splitting on NUL alone produced one token that
+matched nothing, and the flag check reported "clean" on a browser demonstrably
+started with `--no-sandbox`. That was caught by running the negative control, not
+by reading the code.
 
 ### Within one process, when that is what you have
 
@@ -271,16 +485,31 @@ asserts the fail-closed contract instead and says so **in its own name** — it
 never silently skips, because a green tick on a security test that did nothing is
 read as proof.
 
-### What this slice does NOT close
+### What is still open
 
-Product **identity** is unchanged by this work. The exact-HEAD gate still asks the
-product's own `.git` whether the product's own tree is the commit, and three
-adversarial reviews have found four ways past that question. It is replaced
-wholesale — by a trusted content manifest, base-branch contract authority and
-verifier-chosen assertion operands — in the verification-policy slice that
-follows, under `nsc-eval` ADR-049. Splitting it out is deliberate: this slice is
-reviewable on its own, and mixing a second architectural rewrite into it is what
-made the combined change too large to review well.
+Product identity and contract authority were open when the execution-isolation
+slice merged; the verification-policy slice replaced both, under `nsc-eval`
+ADR-049 — a trusted content manifest, base-branch contract authority, and
+verifier-chosen assertion operands.
+
+What that does **not** close, stated because a verifier silent about its blind
+spots invites people to assume it has none:
+
+- **The base contract governs the semantics, not the code that builds the world.**
+  `server/scripts/watson-fixture.ts` is head-authored and is told every value the
+  verifier chose. A product that denies exactly those values and allows every
+  other one satisfies every base-governed assertion. That is ADR-049 F1: the
+  trusted proofs narrow it — the entity a denial is asserted against must be shown
+  to exist in the engine's own database — and they do not close it.
+- **Operational config keys are head-supplied.** `install`, `provision`, `build`,
+  `launch.command` and `env` must match the head's own tree or nothing runs at
+  all. They are fingerprinted and reported rather than base-governed, and the
+  keys that would reach the verifier's own side are refused outright.
+- **D1 buys "not in the same commit", not "cannot happen".** The sanctioned
+  two-step workflow — merge the contract change, then verify the product change
+  under it — is the same attack spread across two pull requests, resting on human
+  review of a `.watson/` diff. That is a real increase in cost, and it is the
+  accurate statement of what is closed (ADR-049 F12).
 
 ## Deliberately not built yet
 
@@ -294,7 +523,9 @@ Each is earned by Phase-0/1 evidence rather than assumed up front.
 
 ```text
 src/
-  cli.mjs          verify | doctor | plane | reap
+  cli.mjs          verify | manifest | doctor | plane | reap
+  governance.mjs   which contract governs the verdict (base, never head)
+  proofs.mjs       trusted precondition evidence, read from the run's own database
   plane.mjs        the untrusted side's server — executes, never decides
   exec.mjs         command execution, uid drop, environment scrubbing
   contract.mjs     .watson loader + validation + profile selection

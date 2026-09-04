@@ -3,75 +3,204 @@
   "$id": "https://github.com/joeman4ever/watson/schemas/watson-result.schema.json",
   "title": "Watson verification result",
   "type": "object",
-  "required": ["schema_version", "run_id", "repository", "head_sha", "verdict", "check", "environment", "features"],
+  "required": [
+    "schema_version",
+    "run_id",
+    "repository",
+    "head_sha",
+    "verdict",
+    "check",
+    "environment",
+    "features"
+  ],
   "properties": {
-    "schema_version": { "const": "watson-result/v1" },
-    "run_id": { "type": "string" },
+    "schema_version": {
+      "const": "watson-result/v1"
+    },
+    "run_id": {
+      "type": "string"
+    },
     "watson": {
       "type": "object",
       "description": "Which VERIFIER produced this result. A result names the product revision it judged; without this it does not name the code that judged it.",
       "properties": {
-        "version": { "type": "string" },
+        "version": {
+          "type": "string"
+        },
         "commit": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "pattern": "^[0-9a-f]{40}$",
           "description": "The engine's own commit, resolved from its checkout. Null when it could not be determined."
         },
         "clean": {
-          "type": ["boolean", "null"],
+          "type": [
+            "boolean",
+            "null"
+          ],
           "description": "False means the engine had uncommitted changes, so `commit` names a revision the running code is not."
         }
       }
     },
-    "repository": { "type": "string" },
-    "pull_request": { "type": ["integer", "null"] },
-    "head_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
-    "base_sha": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
-    "product_fingerprint": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
-    "contract_fingerprint": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
-    "contract_version": { "type": ["integer", "null"], "description": "The contract generation the engine negotiated against, beside the fingerprint that pins its exact bytes." },
+    "repository": {
+      "type": "string"
+    },
+    "pull_request": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "head_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "base_sha": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "product_fingerprint": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "contract_fingerprint": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "contract_version": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "description": "The contract generation the engine negotiated against, beside the fingerprint that pins its exact bytes."
+    },
     "carried_forward_from": {
-      "type": ["string", "null"],
+      "type": [
+        "string",
+        "null"
+      ],
       "description": "Always null in phase 0/1: a new HEAD is always re-verified."
     },
-    "contract_change": { "type": "boolean" },
+    "contract_change": {
+      "type": "boolean"
+    },
+    "contract_comparison": {
+      "type": "string",
+      "enum": [
+        "diverged",
+        "equivalent",
+        "unavailable"
+      ],
+      "description": "Three states, because a boolean cannot carry three. Whether verdict-bearing contract material in the EVALUATED HEAD differs from the GOVERNING TRUSTED BASE contract (diverged), matches it (equivalent), or could not be compared because trusted material for one side was unobtainable (unavailable). Not a claim about who authored a difference."
+    },
     "contract_evaluation": {
       "type": "object",
       "description": "Anticipates dual-contract evaluation without a schema redesign.",
       "properties": {
-        "model": { "enum": ["head-product-x-head-contract", "head-product-x-both-contracts"] },
-        "base_contract_available": { "type": "boolean" },
-        "features_added": { "type": "array", "items": { "type": "string" } },
-        "features_removed": { "type": "array", "items": { "type": "string" } },
-        "expectations_weakened": { "type": "array", "items": { "type": "object" } },
-        "changed_sign": { "type": "array", "items": { "type": "object" } }
+        "model": {
+          "enum": [
+            "head-product-x-head-contract",
+            "head-product-x-both-contracts",
+            "trusted-base-x-trusted-head",
+            "comparison-unavailable"
+          ]
+        },
+        "base_contract_available": {
+          "type": "boolean"
+        },
+        "features_added": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "features_removed": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "expectations_weakened": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "changed_sign": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        }
       }
     },
-    "profile": { "type": "string" },
-    "verdict": {
-      "enum": ["PASS", "PASS_WITH_ADVISORIES", "NOT_APPLICABLE", "FAIL_PRODUCT",
-               "FAIL_CONTRACT", "BLOCKED_ENVIRONMENT", "INDETERMINATE",
-               "STALE_CONTRACT", "CONTRACT_CHANGE_REVIEW_REQUIRED"]
+    "profile": {
+      "type": "string"
     },
-    "verdict_reason": { "type": "string" },
+    "verdict": {
+      "enum": [
+        "PASS",
+        "PASS_WITH_ADVISORIES",
+        "NOT_APPLICABLE",
+        "FAIL_PRODUCT",
+        "FAIL_CONTRACT",
+        "BLOCKED_ENVIRONMENT",
+        "INDETERMINATE",
+        "STALE_CONTRACT",
+        "CONTRACT_CHANGE_REVIEW_REQUIRED"
+      ]
+    },
+    "verdict_reason": {
+      "type": "string"
+    },
     "check": {
       "type": "object",
-      "required": ["obligation", "conclusion", "shadow"],
+      "required": [
+        "obligation",
+        "conclusion",
+        "shadow"
+      ],
       "description": "The SECOND axis: whether the verification obligation was met. Never derived from the verdict by the consumer.",
       "properties": {
-        "obligation": { "enum": ["satisfied", "failed", "not_satisfied"] },
-        "conclusion": { "type": "string" },
-        "shadow": { "type": "boolean" }
+        "obligation": {
+          "enum": [
+            "satisfied",
+            "failed",
+            "not_satisfied"
+          ]
+        },
+        "conclusion": {
+          "type": "string"
+        },
+        "shadow": {
+          "type": "boolean"
+        }
       }
     },
     "environment": {
       "type": "object",
-      "required": ["mode", "not_proven_by_this_run", "auth_seam"],
+      "required": [
+        "mode",
+        "not_proven_by_this_run",
+        "auth_seam"
+      ],
       "properties": {
-        "mode": { "type": "string" },
-        "auth_seam": { "type": "string" },
+        "mode": {
+          "type": "string"
+        },
+        "auth_seam": {
+          "type": "string"
+        },
         "not_proven_by_this_run": {
-          "type": "array", "items": { "type": "string" },
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
           "description": "Stated in every result: a verifier silent about its blind spots invites people to assume it has none."
         }
       }
@@ -80,21 +209,59 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["id", "verdict", "steps"],
+        "required": [
+          "id",
+          "verdict",
+          "steps"
+        ],
         "properties": {
-          "id": { "type": "string" },
-          "verdict": { "type": "string" },
-          "verdict_reason": { "type": ["string", "null"] },
-          "role": { "enum": ["verified", "setup"] },
-          "contract_ref": { "enum": ["head", "base"] },
-          "steps": { "type": "array" },
-          "evidence": { "type": "array", "items": { "type": "string" } }
+          "id": {
+            "type": "string"
+          },
+          "verdict": {
+            "type": "string"
+          },
+          "verdict_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "role": {
+            "enum": [
+              "verified",
+              "setup"
+            ]
+          },
+          "contract_ref": {
+            "enum": [
+              "head",
+              "base"
+            ]
+          },
+          "steps": {
+            "type": "array"
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
         }
       }
     },
-    "runtime_findings": { "type": "array" },
-    "quality_signals": { "type": "object" },
-    "evidence": { "type": "object" },
-    "timings": { "type": "object" }
+    "runtime_findings": {
+      "type": "array"
+    },
+    "quality_signals": {
+      "type": "object"
+    },
+    "evidence": {
+      "type": "object"
+    },
+    "timings": {
+      "type": "object"
+    }
   }
 }

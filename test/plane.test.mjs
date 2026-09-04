@@ -153,7 +153,12 @@ describe('the plane costs the untrusted side nothing to start', () => {
   // writable dependency surface on the wrong side of the boundary.
   const IMPORT_RE = /^\s*import\s+(?:[^'"]*?\sfrom\s+)?['"]([^'"]+)['"]/gm;
 
-  for (const file of ['../src/plane.mjs', '../src/exec.mjs', '../src/fingerprint.mjs']) {
+  for (const file of ['../src/plane.mjs', '../src/exec.mjs', '../src/fingerprint.mjs',
+    // The TRUSTED side has no node_modules either: CI runs the manifest build on
+    // the runner, from the engine's source, before any container starts. Same
+    // rule, opposite side of the boundary — and it is here because that step
+    // silently could not run for want of `yaml` until a review executed it.
+    '../src/manifest-cli.mjs', '../src/manifest.mjs']) {
     test(`${file} imports only node built-ins and engine-local modules`, () => {
       const src = fs.readFileSync(new URL(file, import.meta.url), 'utf8');
       const specifiers = [...src.matchAll(IMPORT_RE)].map((m) => m[1]);
@@ -181,6 +186,7 @@ describe('the plane costs the untrusted side nothing to start', () => {
       }
     };
     visit(new URL('../src/plane.mjs', import.meta.url));
+    visit(new URL('../src/manifest-cli.mjs', import.meta.url));
     assert.ok(seen.size >= 3, `expected to walk several modules, saw ${seen.size}`);
     assert.deepEqual(foreign, [], `third-party imports reached the untrusted plane: ${foreign.join(', ')}`);
   });

@@ -16,7 +16,7 @@ import { isAuthorized } from './driver.mjs';
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
 /** Rules that are blocking regardless of shadow mode. */
-const SECURITY_RULES = new Set(['unauthorized-route-200', 'unexpected-5xx', 'wrong-season-context']);
+export const SECURITY_RULES = new Set(['unauthorized-route-200', 'unexpected-5xx', 'wrong-season-context']);
 
 function severityOf(rule, invariants) {
   const declared = invariants.find((i) => i.rule === rule);
@@ -27,6 +27,24 @@ function severityOf(rule, invariants) {
 function isEnabled(rule, invariants, featureId) {
   const declared = invariants.find((i) => i.rule === rule);
   if (!declared) return SECURITY_RULES.has(rule);
+  // A SECURITY RULE CANNOT BE SWITCHED OFF BY A CONTRACT, only by editing this
+  // set — which is a change to the engine, reviewed as one.
+  //
+  // `severityOf` already forces these to `blocking` whatever the contract says,
+  // so the intent was there; enablement was not, and enablement is what decides
+  // whether the finding exists at all. Measured before the fix, on evidence
+  // containing a real 500:
+  //
+  //     undeclared                    -> unexpected-5xx:blocking
+  //     severity: off                 -> NO FINDING
+  //     except_features: [thisOne]    -> NO FINDING
+  //     applies_to_features: [other]  -> NO FINDING
+  //
+  // Three ways to silence a rule whose severity could not be lowered. Not a
+  // pull-request-exploitable hole — `invariants` come from the BASE contract —
+  // but `.watson/invariants.yaml` states that these cannot be switched off, and
+  // a claim in a shipped file is either true or it is a defect.
+  if (SECURITY_RULES.has(rule)) return true;
   if (declared.severity === 'off') return false;
   const only = declared.applies_to_features;
   if (Array.isArray(only) && only.length && !only.includes(featureId)) return false;

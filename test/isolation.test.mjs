@@ -81,26 +81,68 @@ describe('a hostile repository cannot execute code through the verifier\'s git',
     assert.equal(fs.existsSync(marker), false, 'the product executed a command as the verifier');
   });
 
-  test('a .gitattributes content filter neither runs nor hides a modification', () => {
-    // The concession in the hardened wrapper is that a deny-list of config keys
-    // cannot cover content filters, because the product names those in its own
-    // `.gitattributes`. This establishes that the concession is not load-bearing:
-    // the identity check never asks git to compare content, so no filter is
-    // invoked and none can launder a modified file into looking unchanged.
-    const r = gitRepo();
-    const marker = path.join(tmpdir('filter'), 'ran');
-    const filter = path.join(r.dir, 'filter.sh');
-    fs.writeFileSync(filter, `#!/bin/sh\necho ran > ${JSON.stringify(marker).slice(1, -1)}\ncat > /dev/null; echo 'console.log(1);'\n`);
-    fs.chmodSync(filter, 0o755);
-    fs.writeFileSync(path.join(r.dir, '.gitattributes'), 'app.js filter=launder\n');
-    r.git('add', '-A');
-    r.git('commit', '-qm', 'attributes');
-    r.git('config', 'filter.launder.clean', filter);
-    r.git('config', 'filter.launder.smudge', filter);
-    fs.writeFileSync(path.join(r.dir, 'app.js'), 'console.log("tampered");\n');
+  // A `.gitattributes` content filter is the one thing the hardened wrapper's
+  // deny-list provably cannot cover: filters are named by the product's own
+  // attributes file, so there is no finite set of `-c` overrides that stops them.
+  //
+  // The test that used to sit here asserted the concession was "not load-bearing"
+  // and PASSED BY ACCIDENT. It tampered with `console.log(1);` (15 bytes) by
+  // writing `console.log("tampered");` (25 bytes); git decides "modified" from
+  // stat data when the size differs and never converts the content, so the filter
+  // never ran. At equal length it runs — reproduced, as uid 0:
+  //
+  //     shipped tampering (15 -> 25 bytes):  filter ran? no
+  //     equal length      (15 -> 15 bytes):  filter ran? YES  ("ran as uid 0")
+  //
+  // It is closed here by construction rather than by another deny-list entry: no
+  // trusted-side call reads the working tree any more, because product identity
+  // comes from the manifest. This test asserts that property directly, so it fails
+  // the moment someone reintroduces a working-tree read — which is the only way
+  // the filter vector can come back.
+  test('no trusted-side git call reads the working tree', () => {
+    // Verbs that make git convert file content (and therefore run a clean filter).
+    // `status`, `diff` without two commits, `add`, `stash`, `checkout`, `archive`
+    // of a worktree — all read what is on disk.
+    const WORKTREE_READING = /git\(\[\s*'(status|add|stash|checkout|commit)'/;
+    for (const file of ['../src/fingerprint.mjs', '../src/contract.mjs', '../src/cli.mjs',
+      '../src/environment.mjs', '../src/exec.mjs']) {
+      const src = fs.readFileSync(new URL(file, import.meta.url), 'utf8');
+      assert.doesNotMatch(src, WORKTREE_READING,
+        `${file} runs a working-tree-reading git verb against a product-controlled tree; `
+        + 'a `.gitattributes` filter would execute as the verifier');
+    }
+  });
 
-    safeGit(['status', '--porcelain'], { cwd: r.dir });
-    assert.equal(fs.existsSync(marker), false, 'a product-named filter ran as the verifier');
+  test('the surviving git verbs are object-store reads only', () => {
+    const src = fs.readFileSync(new URL('../src/fingerprint.mjs', import.meta.url), 'utf8');
+    const verbs = [...src.matchAll(/git\(\[\s*'([a-z-]+)'/g)].map((m) => m[1]);
+    assert.ok(verbs.length > 0, 'expected to find git invocations');
+    const OBJECT_STORE = new Set(['rev-parse', 'merge-base', 'diff', 'ls-tree', 'cat-file', 'archive']);
+    const worktree = verbs.filter((v) => !OBJECT_STORE.has(v));
+    assert.deepEqual(worktree, [], `non-object-store git verbs reached the product tree: ${worktree.join(', ')}`);
+  });
+
+  test('the governing contract cannot be read out of the product\'s .git', () => {
+    // ADR-049 F3, structurally. `loadContractAt` used `git archive` against a
+    // repository mounted read-write into the product container, and D1 turned
+    // that from descriptive into verdict-bearing. The base contract now arrives
+    // as a trusted materialisation, and the way to keep it that way is for the
+    // module that loads contracts to have no git at all — not for a reviewer to
+    // notice the next time somebody adds one back.
+    const src = fs.readFileSync(new URL('../src/contract.mjs', import.meta.url), 'utf8');
+    // Comments explain why the absence matters; code is what must be absent.
+    const code = src.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+    assert.doesNotMatch(code, /\bgit\(/, 'src/contract.mjs invokes git');
+    assert.doesNotMatch(code, /execFileSync|spawnSync|child_process/, 'src/contract.mjs spawns a process');
+  });
+
+  test('governance decides authority from what the TRUSTED side supplied, not from the product', () => {
+    // The whole decision has to be a function of `baseSupplied` — an argument the
+    // trusted caller passes — and never of anything read out of the product tree.
+    const src = fs.readFileSync(new URL('../src/governance.mjs', import.meta.url), 'utf8');
+    const code = src.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+    assert.doesNotMatch(code, /require\(|import\s|readFileSync|existsSync|execFileSync|process\.env/,
+      'governance.mjs reads something other than its arguments');
   });
 
   test('core.hooksPath in the product\'s own .git/config does not run', () => {
@@ -315,9 +357,61 @@ describe('the browser is part of the verifier, not a lesser concern', () => {
   test('`--no-sandbox` does not appear anywhere in the driver', () => {
     // A grep, deliberately. The flag is one edit away from coming back for a
     // plausible-sounding reason, and this is the cheapest thing that notices.
+    //
+    // ON ITS OWN THIS TEST IS NEARLY WORTHLESS, and it is worth being precise
+    // about why rather than deleting it. It passed for the entire life of the
+    // project while every browser Watson launched carried `--no-sandbox`,
+    // because Playwright was adding the flag and this only looks at OUR source.
+    // The absence of a string in a file is not a property of a process. The two
+    // tests below are what make the claim, and the container proof is what
+    // establishes it against a real browser.
     const src = fs.readFileSync(new URL('../src/driver.mjs', import.meta.url), 'utf8');
     const uses = src.split('\n').filter((l) => l.includes('--no-sandbox') && !l.trim().startsWith('*') && !l.trim().startsWith('//'));
     assert.deepEqual(uses, [], 'the browser must not be launched unsandboxed');
+  });
+
+  test('launchBrowser passes `chromiumSandbox: true` to Playwright', async () => {
+    // THE DEFECT THIS PINS. playwright-core, at the exact version this
+    // repository pins, contains:
+    //
+    //     if (options.chromiumSandbox !== true) chromeArguments.push('--no-sandbox');
+    //
+    // so omitting the option is not "leaving the default alone", it is asking
+    // for an unsandboxed browser. Measured as an unprivileged user: without the
+    // option, `chrome://sandbox` reports `Layer 1 Sandbox: None` and every
+    // renderer carries `--no-sandbox`; with it, `Layer 1 Sandbox: Namespace` and
+    // none does.
+    //
+    // The option is intercepted rather than inferred, so this fails if the call
+    // stops passing it, whatever the source happens to look like.
+    const { chromium } = await import('playwright');
+    const real = chromium.launch;
+    let seen = null;
+    chromium.launch = async (opts) => { seen = opts; throw new Error('intercepted'); };
+    try {
+      await launchBrowser({ cdpPort: 0 }).catch(() => {});
+    } finally {
+      chromium.launch = real;
+    }
+    if (IS_ROOT) {
+      // launchBrowser refuses before it ever calls launch(), which is its own
+      // (separately tested) property. Nothing to intercept.
+      assert.equal(seen, null);
+      return;
+    }
+    assert.ok(seen, 'launchBrowser did not call chromium.launch');
+    assert.equal(seen.chromiumSandbox, true);
+  });
+
+  test('the pinned Playwright really does add `--no-sandbox` without it', async () => {
+    // R4, applied to a dependency: who controls this input? The claim above is
+    // about playwright-core's behaviour, so it is checked against playwright-core
+    // rather than believed. If an upgrade changes the default, this fails and the
+    // comment above stops being true — which is the point.
+    const url = new URL('../node_modules/playwright-core/lib/server/chromium/chromium.js', import.meta.url);
+    const src = fs.readFileSync(url, 'utf8');
+    assert.match(src, /options\.chromiumSandbox !== true.*--no-sandbox/,
+      'playwright-core no longer gates --no-sandbox on chromiumSandbox; re-read the launch path');
   });
 });
 
