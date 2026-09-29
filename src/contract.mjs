@@ -1094,6 +1094,7 @@ export function validateEnvOwnership(config) {
 const REQUIRES_A_LOADED_PAGE = new Set([
   'expect_api', 'expect_text', 'expect_no_text', 'expect_no_uuid',
   'expect_count_at_most', 'expect_count_at_least', 'expect_url_contains',
+  'expect_option', 'expect_no_option',
   'wait_for_text', 'click', 'fill', 'select', 'expect_no_overflow',
 ]);
 const NAVIGATES = new Set(['goto', 'reload', 'back']);

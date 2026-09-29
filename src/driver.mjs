@@ -202,6 +202,7 @@ export const STEPS = [
   'expect_text', 'expect_text_in', 'expect_no_text', 'expect_no_uuid', 'expect_url_contains',
   'expect_api', 'expect_denied', 'expect_allowed', 'expect_reached', 'expect_json',
   'expect_count_at_most', 'expect_count_at_least',
+  'expect_option', 'expect_no_option',
   'set_viewport', 'expect_no_overflow',
 ];
 
@@ -222,7 +223,46 @@ export const ASSERTION_STEPS = new Set([
   'wait_for_text', 'expect_text', 'expect_text_in', 'expect_no_text', 'expect_url_contains',
   'expect_api', 'expect_denied', 'expect_allowed', 'expect_reached', 'expect_json',
   'expect_count_at_most', 'expect_count_at_least',
+  'expect_option', 'expect_no_option',
 ]);
+
+/**
+ * Does this option list offer EXACTLY this label? (defect W7)
+ *
+ * `expect_no_text` asks whether a string appears anywhere in `document.body.innerText`,
+ * using raw substring containment. For a privacy assertion that is right: a leaked value
+ * is leaked wherever it appears. For "this choice must not be OFFERED" it is wrong, and
+ * the difference is not cosmetic.
+ *
+ * Observed, not reasoned about. On nsc-eval #547 and #554 the journey
+ * `withdrawn-access-is-gone` asserted `expect_no_text: "Grade ${revokedGrade}"` with
+ * revokedGrade = 1, against a picker legitimately offering "… — Grade 10". "Grade 1" is a
+ * prefix of "Grade 10", so the assertion failed, the run reported FAIL_PRODUCT, and the
+ * product was correct — the revoked grant was absent and the trusted doctor had already
+ * proven it denied with 403. Two false FAIL_PRODUCT verdicts, on a fixture draw.
+ *
+ * The engine had already learned this for the POSITIVE case: `expect_text_in` exists
+ * because "searching for the bare count as a string matches any incidental digit and
+ * proves nothing". That lesson was never carried across to the negative. This is the
+ * missing half.
+ *
+ * EXACT equality after trimming, never substring and never a regex. A regex over a label
+ * would reintroduce the same class with more syntax: `Grade 1\b` still matches
+ * "Grade 1" inside "Grade 1A", and anchoring it requires knowing the label format, which
+ * is what the paired positive assertion is for rather than something to encode here.
+ *
+ * @param {string[]} optionTexts every option label the picker is offering
+ * @param {string} forbidden the label that must not be among them
+ * @returns {string|null} the offending label, or null when none matches
+ */
+export function offeredOptionExactly(optionTexts, forbidden) {
+  const want = String(forbidden ?? '').trim();
+  for (const t of optionTexts) {
+    const got = String(t ?? '').trim();
+    if (got === want) return got;
+  }
+  return null;
+}
 
 function locator(page, sel) {
   if (typeof sel !== 'string') throw new Error(`selector must be a string, got ${JSON.stringify(sel)}`);
@@ -372,6 +412,39 @@ export async function runStep(step, ctx) {
       const body = await page.evaluate(() => document.body.innerText);
       if (body.includes(arg)) throw new Error(`expected page text NOT to contain "${arg}"${note}`);
       return `page does not contain "${arg}"`;
+    }
+    case 'expect_option':
+    case 'expect_no_option': {
+      // "Is this choice OFFERED?" — a question about the picker's options, not about
+      // page text. See `offeredOptionExactly` above for why W7 makes the distinction
+      // load-bearing.
+      //
+      // The two directions are one case because they share the hazard that matters:
+      // an empty option list. A picker that rendered nothing would satisfy any
+      // negative assertion trivially — the same "did not error is not evidence that
+      // anything was drawn" trap `expect_count_at_least` exists to close — so
+      // enumerating zero options is a failure for BOTH directions, never a pass.
+      // `arg` is already interpolated at the boundary (see interpDeep above), so an
+      // unresolved `${name}` has thrown before reaching here.
+      const sel = arg.selector;
+      const want = String(arg.text);
+      const texts = await locator(page, sel).locator('option').allInnerTexts();
+      if (!texts.length) {
+        throw new Error(
+          `${sel} offered no options at all, so "${want}" could be neither confirmed ` +
+          `nor ruled out${note}`);
+      }
+      const hit = offeredOptionExactly(texts, want);
+      if (kind === 'expect_no_option') {
+        if (hit !== null) throw new Error(`"${hit}" is offered as an option, and must not be${note}`);
+        return `no option is exactly "${want}" (${texts.length} option(s) offered)`;
+      }
+      if (hit === null) {
+        throw new Error(
+          `no option is exactly "${want}"${note} — ${texts.length} offered: ` +
+          texts.map((t) => JSON.stringify(String(t).trim())).join(', '));
+      }
+      return `"${want}" is offered (${texts.length} option(s))`;
     }
     case 'expect_no_uuid': {
       const body = await page.evaluate(() => document.body.innerText);
