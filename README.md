@@ -17,8 +17,15 @@ Watson answers one question — *does the running application actually behave
 correctly on this exact SHA?* — and deliberately does not answer any other. It
 never reviews code, and it never modifies the product it verifies.
 
-> **Status: Phase 0.** Enough to prove the architecture, and no more. See
-> [Deliberately not built yet](#deliberately-not-built-yet).
+> **New here?** This README is the reference manual and assumes the vocabulary.
+> For what Watson is, whether to use it, how to set it up and where to find its
+> results, in plain English, read **[Using Watson](docs/using-watson.md)** first.
+
+> **Status: Phase 1, shadow mode.** In use on one product, gating nothing. Seven
+> of the nine Phase-1 exit criteria are met; the two outstanding are the
+> false-failure rate and the open-defect criterion. See
+> [Deliberately not built yet](#deliberately-not-built-yet), and the Phase-1 log
+> in the product repository for the live scoreboard.
 
 ## Design in one paragraph
 
