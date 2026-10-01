@@ -259,3 +259,94 @@ export function readManifest(file) {
   if (m?.schema !== MANIFEST_SCHEMA) throw new Error(`\`${file}\` is not a ${MANIFEST_SCHEMA} manifest`);
   return m;
 }
+
+/**
+ * Digest a BUILD ARTIFACT directory — the generated output that is actually
+ * served, which the trusted manifest does not measure (defect C4, g1).
+ *
+ * The manifest proves "the materialised committed SOURCE matched the trusted
+ * manifest for product HEAD X". The bundle a browser loads is built from that
+ * source, not copied from it, so nothing in the manifest describes it. For a
+ * verifier whose product claims rest on what the browser actually executed,
+ * that is a real hole.
+ *
+ * Same walk semantics as `contractDirFingerprint`, and for the same reasons: a
+ * symlink is RECORDED as a symlink and never followed (following one digests
+ * whatever it points at rather than what the directory contains), entries are
+ * sorted so the digest is order-independent, and the path separator is
+ * normalised so a digest is comparable across platforms.
+ *
+ * Returns the per-file digests as well as the aggregate, because the aggregate
+ * alone cannot answer the only question that makes this control worth having:
+ * whether a specific byte sequence the running application served came from
+ * this directory. See `servedBytesMatch`.
+ *
+ * @returns {{root: string, digest: string, file_count: number, files: Record<string,string>}|null}
+ *          null when the directory does not exist — an absent artifact is
+ *          reported as absent, never as an empty-but-present one.
+ */
+export function buildArtifactDigest(root) {
+  if (!fs.existsSync(root)) return null;
+  const files = {};
+  const entries = [];
+  const walk = (rel) => {
+    const abs = rel === '' ? root : path.join(root, rel);
+    let st;
+    try { st = fs.lstatSync(abs); } catch { return; }
+    if (st.isSymbolicLink()) { entries.push([rel, 'symlink', fs.readlinkSync(abs)]); return; }
+    if (st.isDirectory()) {
+      for (const name of fs.readdirSync(abs).sort()) walk(rel === '' ? name : path.join(rel, name));
+      return;
+    }
+    if (!st.isFile()) return;
+    const d = crypto.createHash('sha256').update(fs.readFileSync(abs)).digest('hex');
+    const key = rel.split(path.sep).join('/');
+    files[key] = d;
+    entries.push([rel, 'file', d]);
+  };
+  walk('');
+  const h = crypto.createHash('sha256');
+  for (const [rel, kind, digest] of entries) {
+    h.update(`${rel.split(path.sep).join('/')}\0${kind}\0${digest}\0`);
+  }
+  return {
+    root,
+    digest: `sha256:${h.digest('hex')}`,
+    file_count: Object.keys(files).length,
+    files,
+  };
+}
+
+/**
+ * Does a byte sequence the RUNNING APPLICATION served come from this artifact?
+ *
+ * This is the step that makes the digest evidence rather than decoration.
+ * Hashing a build directory proves nothing about what was served: the
+ * application might serve a different directory, a cached copy, or content
+ * generated at request time, and a control that looks like evidence without
+ * being evidence is worse than a stated gap.
+ *
+ * Fetching a known asset over the product's real serving path and comparing it
+ * to the digested file binds *what was measured* to *what was served* — through
+ * the application itself, rather than through a human's declaration of which
+ * directory it serves.
+ *
+ * FAILS CLOSED. Any outcome other than a positive match returns `matched:
+ * false` with a reason, and the caller must record g1 as OPEN for that
+ * artifact rather than reporting a control it did not exercise.
+ */
+export function servedBytesMatch(artifact, relPath, receivedBytes) {
+  if (!artifact) return { matched: false, reason: 'no build artifact was digested' };
+  const want = artifact.files?.[relPath];
+  if (!want) return { matched: false, reason: `\`${relPath}\` is not in the digested artifact` };
+  if (!receivedBytes) return { matched: false, reason: 'the application served no bytes to compare' };
+  const got = crypto.createHash('sha256').update(receivedBytes).digest('hex');
+  if (got !== want) {
+    return {
+      matched: false,
+      reason: `served bytes for \`${relPath}\` do not match the digested artifact ` +
+        `(served ${got.slice(0, 12)}…, artifact ${want.slice(0, 12)}…)`,
+    };
+  }
+  return { matched: true, reason: `served \`${relPath}\` matches the digested artifact` };
+}

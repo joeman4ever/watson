@@ -219,7 +219,18 @@
             "type": "string"
           },
           "verdict": {
-            "type": "string"
+            "type": "string",
+            "enum": [
+              "PASS",
+              "PASS_WITH_ADVISORIES",
+              "NOT_APPLICABLE",
+              "FAIL_PRODUCT",
+              "FAIL_CONTRACT",
+              "BLOCKED_ENVIRONMENT",
+              "INDETERMINATE",
+              "STALE_CONTRACT",
+              "CONTRACT_CHANGE_REVIEW_REQUIRED"
+            ]
           },
           "verdict_reason": {
             "type": [
@@ -247,12 +258,81 @@
             "items": {
               "type": "string"
             }
+          },
+          "title": {
+            "type": "string"
+          },
+          "persona": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "duration_ms": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "attempts": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "api_calls": {
+            "type": [
+              "array",
+              "number",
+              "null"
+            ]
+          },
+          "requirements": {
+            "type": "array"
+          },
+          "adrs": {
+            "type": "array"
           }
         }
       }
     },
     "runtime_findings": {
-      "type": "array"
+      "type": "array",
+      "description": "Findings raised by the verifier about the run. `severity: advisory` CANNOT move a verdict and must never block.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "rule": {
+            "type": "string"
+          },
+          "severity": {
+            "type": "string",
+            "enum": [
+              "advisory",
+              "blocking"
+            ]
+          },
+          "feature": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "summary": {
+            "type": "string"
+          },
+          "required_action": {
+            "type": "string"
+          },
+          "detail": {
+            "type": "array"
+          }
+        },
+        "required": [
+          "rule",
+          "severity"
+        ]
+      }
     },
     "quality_signals": {
       "type": "object"
@@ -262,6 +342,361 @@
     },
     "timings": {
       "type": "object"
+    },
+    "product_identity": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "Whether the tree executed WAS the commit reported. A merge gate cannot accept a product claim without this: `exact_head` false means the bytes verified are not the bytes under review. Emitted since v1 but never declared, so a gate reading it depended on undocumented behaviour that could change without a version bump.",
+      "properties": {
+        "exact_head": {
+          "type": "boolean",
+          "description": "The tree matched the expected commit exactly. FALSE INVALIDATES EVERY PRODUCT CLAIM \u2014 see downgradeForInexactHead."
+        },
+        "head_matches": {
+          "type": "boolean"
+        },
+        "clean": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "No uncommitted changes. Null when undeterminable."
+        },
+        "contract_dirty": {
+          "type": "boolean",
+          "description": "The .watson/ contract itself had uncommitted changes."
+        },
+        "changed_mid_run": {
+          "type": "boolean",
+          "description": "The tree changed WHILE the run executed, so no single revision describes it."
+        },
+        "at_start_exact_head": {
+          "type": "boolean"
+        },
+        "dirty_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "dirty_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "generated_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "generated_roots": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "head_sha": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "expected_sha": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "method": {
+          "type": "string"
+        },
+        "counts": {
+          "type": "object"
+        },
+        "note": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "exact_head",
+        "head_matches",
+        "changed_mid_run"
+      ]
+    },
+    "selection": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "What the run chose to execute and why. `applicable` is NOT sufficient for a gate to skip: an adversarial head contract can make every change non-runtime and so produce applicable=false with a satisfied obligation. See governing_contract.",
+      "properties": {
+        "method": {
+          "type": "string"
+        },
+        "profile": {
+          "type": "string"
+        },
+        "applicable": {
+          "type": "boolean"
+        },
+        "escalated": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "escalation_reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "HUMAN-READABLE ONLY, shaped `path: reason (class)`. A gate must NOT parse these \u2014 read `classifications` or `coverage` instead."
+        },
+        "changed_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "classifications": {
+          "type": "array",
+          "description": "The structured per-path classification a gate should read.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "class": {
+                "type": "string",
+                "enum": [
+                  "ignorable",
+                  "governance",
+                  "mapped",
+                  "governing",
+                  "cross_cutting",
+                  "unmapped_runtime",
+                  "unclassified"
+                ]
+              },
+              "reason": {
+                "type": "string"
+              },
+              "features": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "path",
+              "class"
+            ]
+          }
+        },
+        "selected": {
+          "type": "array"
+        },
+        "setup": {
+          "type": "array"
+        },
+        "deferred": {
+          "type": "array"
+        }
+      },
+      "required": [
+        "applicable",
+        "classifications"
+      ]
+    },
+    "coverage": {
+      "type": "object",
+      "description": "Derived coverage FACTS for a merge gate. Deliberately carries no `meaningful` or `disposition_required` flag: those depend on the consuming repository's ignore globs and chosen conservatism, which are policy read from that repo's base branch. A verifier asserting a merge rule would be the wrong boundary.",
+      "properties": {
+        "mapped_verified": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Journeys with role `verified` that ran (ADR-044 D1 counter B)."
+        },
+        "classified_paths": {
+          "type": "object",
+          "properties": {
+            "cross_cutting": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "unmapped_runtime": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Runtime code claimed by no feature."
+            },
+            "unclassified": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "The selector could not decide. Distinct from cross_cutting: undecided, not declared-global."
+            }
+          },
+          "required": [
+            "cross_cutting",
+            "unmapped_runtime",
+            "unclassified"
+          ]
+        },
+        "counts": {
+          "type": "object",
+          "properties": {
+            "cross_cutting": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "unmapped_runtime": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "unclassified": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "cross_cutting",
+            "unmapped_runtime",
+            "unclassified"
+          ]
+        },
+        "classified_total": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Lets a gate distinguish `nothing was unmapped` from `nothing was classified at all`."
+        }
+      },
+      "required": [
+        "mapped_verified",
+        "classified_paths",
+        "counts",
+        "classified_total"
+      ]
+    },
+    "governing_contract": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "WHICH contract governed the verdict (ADR-049). A gate must treat NOT_APPLICABLE with authority != `base` as ungoverned and refuse to read it as green: a head contract declaring `ignorable: [\"**\"]` yields zero journeys, NOT_APPLICABLE and a satisfied obligation, with the product choosing the semantics that cleared it.",
+      "properties": {
+        "authority": {
+          "type": "string",
+          "enum": [
+            "base",
+            "head"
+          ]
+        },
+        "product_claims_permitted": {
+          "type": "boolean"
+        },
+        "head_only_features": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "sha": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "fingerprint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "note": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "authority",
+        "product_claims_permitted"
+      ]
+    },
+    "not_attempted": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Selected journeys that produced no result at all. Non-empty means the run reported on a SUBSET of what it selected."
+    },
+    "doctor": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "Trusted precondition probes, run before any journey. `ok: false` is BLOCKED_ENVIRONMENT, not a product accusation.",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "probes": {
+          "type": "array"
+        }
+      },
+      "required": [
+        "ok"
+      ]
+    },
+    "working_tree": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "Retained alongside product_identity for compatibility; same content."
+    },
+    "manifest": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "The manifest that established product identity. NOTE C4: it measures committed SOURCE, not the bytes loaded into the running process."
+    },
+    "contract_scope": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      },
+      "description": "The paths the contract declares as its own scope. Verified against real artifacts rather than assumed."
+    },
+    "operational_config": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "started_at": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "finished_at": {
+      "type": [
+        "string",
+        "null"
+      ]
     }
   }
 }

@@ -233,6 +233,56 @@ export function runVerdict({ executed = [], plan = [], applicable = true } = {})
   };
 }
 
+/**
+ * What the run COVERED, and what it did not — as facts, for a merge gate.
+ *
+ * A gate has to answer "did this change touch runtime code that no feature
+ * claims?" That answer already exists inside `selection.classifications[]`,
+ * which carries `{path, class, reason, features}` per changed path. What did not
+ * exist was a place to read it from without walking the whole classification
+ * list, and — worse — the only *summarised* form was
+ * `selection.escalation_reasons`, free text shaped `"path: reason (class)"`.
+ *
+ * A gate that parsed those strings would be deriving a merge decision from
+ * prose. This block exists so it never has to.
+ *
+ * FACTS ONLY, DELIBERATELY. This reports which paths fell in which class and
+ * how many journeys actually verified. It does NOT report whether that is
+ * "meaningful", or whether a human must dispose of it, because those are
+ * POLICY — they depend on a repository's ignore globs and on how conservative
+ * that repository chooses to be, both of which live in the consuming repo's
+ * base-branch policy rather than in the verifier. The engine saying "a
+ * disposition is required" would be the verifier deciding a merge rule.
+ *
+ * `unclassified` is reported separately from `cross_cutting` rather than folded
+ * in with it. They are different statements: `cross_cutting` means "this path
+ * was DECLARED to affect everything", `unclassified` means "the selector could
+ * not decide what this path was". A gate may reasonably treat the second more
+ * conservatively than the first, and cannot if they arrive merged.
+ */
+export function coverageFrom(selection, features = []) {
+  const classifications = selection?.classifications ?? [];
+  const paths = { cross_cutting: [], unmapped_runtime: [], unclassified: [] };
+  for (const c of classifications) {
+    const cls = c?.class;
+    if (cls in paths) paths[cls].push(c.path);
+  }
+  return {
+    // Counter B in ADR-044 D1 terms: journeys that actually verified, not
+    // merely journeys that were selected.
+    mapped_verified: features.filter((f) => f?.role === 'verified').length,
+    classified_paths: paths,
+    counts: {
+      cross_cutting: paths.cross_cutting.length,
+      unmapped_runtime: paths.unmapped_runtime.length,
+      unclassified: paths.unclassified.length,
+    },
+    // Total changed paths the selector examined, so a gate can tell "nothing
+    // was unmapped" from "nothing was classified at all".
+    classified_total: classifications.length,
+  };
+}
+
 export function buildEnvelope(run) {
   const verdict = run.verdict;
   return {
@@ -411,6 +461,9 @@ export function buildEnvelope(run) {
     },
 
     selection: run.selection,
+    // Derived from `selection.classifications` — see `coverageFrom`. Emitted so
+    // a merge gate never has to parse `escalation_reasons` prose.
+    coverage: coverageFrom(run.selection, run.features ?? []),
     // Selected journeys that produced no result at all — a prerequisite failed
     // and the loop stopped. Named, because a run that quietly reports on the
     // subset which happened to execute is under-verifying without saying so.
