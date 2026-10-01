@@ -253,9 +253,10 @@ accusations need the same scepticism as anyone else's.
 **It does not prove the code that ran was the code you committed.** It proves
 the *source files* matched the commit. What gets built from that source, the
 libraries it loads, and the machine it runs on are outside what it measures.
-That limitation is written down deliberately rather than glossed over, in an
-architecture decision record kept in this repository, rather than left for
-someone to discover.
+That limitation is written down deliberately rather than glossed over — see
+[ADR-001](adr/ADR-001-c4-executed-bytes-and-accepted-residual-risk.md), which
+says plainly what is and is not covered rather than leaving someone to find
+out.
 
 ---
 
